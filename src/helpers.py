@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader, Subset
+from torchvision.models.feature_extraction import create_feature_extractor
 
-
-def one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
+def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
     """
     Perform one run through the DataLoader.
 
@@ -103,6 +103,78 @@ def one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=No
         return average_loss, accuracy.item(), high_count
 
     return average_loss, accuracy
+
+
+
+def fe_nn_one_run(fe_model, hf_model, lf_model, dataloader, criterion, optimizer=None, scheduler=None):
+    # device = next(hf_model.parameters()).device
+
+    # lf_body = create_feature_extractor(
+    #     lf_model, {"7": "body"}
+    # ).to(device)
+
+    # for hf_data, lf_data, target in dataloader:
+    #     target = target.type(torch.LongTensor)
+    #     hf_data = hf_data.to(device)
+    #     lf_data = lf_data.to(device)
+    #     target = target.to(device)
+
+    #     lf_embeddings = lf_body(lf_data)
+    #     lf_output = lf_model(lf_data)
+    #     hf_output = hf_model(hf_data)
+
+    #     fe_output = fe_model(lf_embeddings)
+        
+    #     loss = criterion(target, preds, outputs)
+    #     if optimizer:
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         optimizer.step()
+    pass
+
+def fe_svm_one_run(fe_model, hf_model, lf_model, dataloader, mode="train"):
+    device = next(hf_model.parameters()).device
+
+    lf_body = create_feature_extractor(
+        lf_model, {"7": "body"}
+    ).to(device)
+
+    num_samples = len(dataloader.dataset)
+    batch_size = dataloader.batch_size
+
+    lf_embeddings = np.zeros((num_samples, 32))
+    lf_outputs = np.zeros((num_samples, 2))
+    hf_outputs = np.zeros((num_samples, 2))
+    targets = np.zeros(num_samples)
+
+    for i, (hf_data, lf_data, target) in enumerate(dataloader):
+        target = target.type(torch.LongTensor) 
+        hf_data = hf_data.to(device, torch.float)
+        lf_data = lf_data.to(device, torch.float)
+        target = target.to(device)
+
+        lf_embs_tmp = lf_body(lf_data).cpu().numpy()
+        lf_output_tmp = lf_model(lf_data).cpu().numpy()
+        hf_output_tmp = hf_model(hf_data).cpu().numpy()
+
+        offset = len(lf_embs_tmp)
+
+        lf_embeddings[i*batch_size:(i*batch_size+offset)] = lf_embs_tmp
+        lf_outputs[i*batch_size:(i*batch_size+offset)] = lf_output_tmp
+        hf_outputs[i*batch_size:(i*batch_size+offset)] = hf_output_tmp
+        targets[i*batch_size:(i*batch_size+offset)] = target.cpu().numpy()
+
+    
+
+    # lf_correct = np.argmax(lf_preds, axis=1) == labels
+    # hf_correct = np.argmax(hf_preds, axis=1) == labels
+
+    # best_choices = np.logical_and(~lf_correct, hf_correct).astype(int)
+
+    # if mode=="train":
+    #     weights = 
+    #     fe_model.fit(lf_embeddings, )
+
 
 def build_qe_model(num_classes: int=2):
     qe_model = nn.Sequential(

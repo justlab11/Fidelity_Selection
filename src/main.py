@@ -2,7 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
-from torchvision.models.feature_extraction import create_feature_extractor
 import torch.nn as nn
 from typing import *
 from sklearn.svm import SVC
@@ -51,9 +50,9 @@ for run_num in range(NUM_RERUNS):
 
 
     for epoch in range(NUM_FIDELITY_EPOCHS):
-        train_loss, train_acc = one_run(lf_model, train_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
-        test_loss, test_acc = one_run(lf_model, test_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
-        val_loss, val_acc = one_run(lf_model, val_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
+        train_loss, train_acc = classifier_one_run(lf_model, train_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
+        test_loss, test_acc = classifier_one_run(lf_model, test_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
+        val_loss, val_acc = classifier_one_run(lf_model, val_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
 
         print(train_acc, val_acc)
         if early_stopper.early_stop(val_loss):
@@ -80,61 +79,63 @@ for run_num in range(NUM_RERUNS):
     early_stopper = EarlyStopper(patience=5)
 
     for epoch in range(NUM_FIDELITY_EPOCHS):
-        train_loss, train_acc = one_run(hf_model, train_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
-        test_loss, test_acc = one_run(hf_model, test_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
-        val_loss, val_acc = one_run(hf_model, val_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
+        train_loss, train_acc = classifier_one_run(hf_model, train_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
+        test_loss, test_acc = classifier_one_run(hf_model, test_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
+        val_loss, val_acc = classifier_one_run(hf_model, val_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
 
         print(train_acc, val_acc)
         if early_stopper.early_stop(val_loss):
             break
 
-    
-    qe_train_loader, qe_test_loader, qe_val_loader = build_qe_dataloaders(lf_model, hf_model, train_loader, test_loader, val_loader)
+    svm_model = SVC(kernel="rbf", class_weight="balanced")
+    fe_svm_one_run(svm_model, hf_model, lf_model, train_loader)
 
-    dataloaders = {
-        "train": qe_train_loader,
-        "test": qe_test_loader,
-        "val": qe_val_loader
-    }
+    # qe_train_loader, qe_test_loader, qe_val_loader = build_qe_dataloaders(lf_model, hf_model, train_loader, test_loader, val_loader)
 
-    test_positions = qe_test_loader.inputs
+    # dataloaders = {
+    #     "train": qe_train_loader,
+    #     "test": qe_test_loader,
+    #     "val": qe_val_loader
+    # }
 
-    svm_model = None
-    for r, r_val in enumerate(R_VALS):
-        print(f"r: {r_val} ({round((r+1)/len(R_VALS)*100, 2)}%)")
-        for loader_name in dataloaders.keys():
-            loader = dataloaders[loader_name]
+    # test_positions = qe_test_loader.inputs
 
-            lf_embeds = loader.dataset.lf_embeddings
-            lf_preds = loader.dataset.lf_preds
-            hf_preds = loader.dataset.hf_preds
-            labels = loader.dataset.labels
+    # svm_model = None
+    # for r, r_val in enumerate(R_VALS):
+    #     print(f"r: {r_val} ({round((r+1)/len(R_VALS)*100, 2)}%)")
+    #     for loader_name in dataloaders.keys():
+    #         loader = dataloaders[loader_name]
 
-            lf_correct = np.argmax(lf_preds, axis=1) == labels
-            hf_correct = np.argmax(hf_preds, axis=1) == labels
+    #         lf_embeds = loader.dataset.lf_embeddings
+    #         lf_preds = loader.dataset.lf_preds
+    #         hf_preds = loader.dataset.hf_preds
+    #         labels = loader.dataset.labels
 
-            best_choices = np.logical_and(~lf_correct, hf_correct).astype(int)
+    #         lf_correct = np.argmax(lf_preds, axis=1) == labels
+    #         hf_correct = np.argmax(hf_preds, axis=1) == labels
+
+    #         best_choices = np.logical_and(~lf_correct, hf_correct).astype(int)
         
-            if loader_name == "train":
-                weights = np.where(best_choices==1, r_val, 1)
-                svm_model = SVC(kernel="rbf", class_weight="balanced")
-                svm_model.fit(lf_embeds, best_choices, sample_weight=weights)
+    #         if loader_name == "train":
+    #             weights = np.where(best_choices==1, r_val, 1)
+    #             svm_model = SVC(kernel="rbf", class_weight="balanced")
+    #             svm_model.fit(lf_embeds, best_choices, sample_weight=weights)
 
-            outputs = svm_model.predict(lf_embeds)
-            acc = np.sum(lf_correct[outputs==0]) + np.sum(hf_correct[outputs==1]) / len(outputs)
-            usage = np.sum(outputs) / len(outputs)
+    #         outputs = svm_model.predict(lf_embeds)
+    #         acc = np.sum(lf_correct[outputs==0]) + np.sum(hf_correct[outputs==1]) / len(outputs)
+    #         usage = np.sum(outputs) / len(outputs)
 
-            if loader_name == "train":
-                qe_train_acc[run_num, r] = acc
-                qe_train_use[run_num, r] = usage
+    #         if loader_name == "train":
+    #             qe_train_acc[run_num, r] = acc
+    #             qe_train_use[run_num, r] = usage
 
-            elif loader_name == "test":
-                qe_test_acc[run_num, r] = acc
-                qe_test_use[run_num, r] = usage
+    #         elif loader_name == "test":
+    #             qe_test_acc[run_num, r] = acc
+    #             qe_test_use[run_num, r] = usage
 
-            else:
-                qe_val_acc[run_num, r] = acc
-                qe_val_use[run_num, r] = usage
+    #         else:
+    #             qe_val_acc[run_num, r] = acc
+    #             qe_val_use[run_num, r] = usage
 
-            print(f"\tAcc: {round(acc, 2) * 100}%", end="\t\t")
-            print(f"\tUse: {round(usage, 2) * 100}%")
+    #         print(f"\tAcc: {round(acc, 2) * 100}%", end="\t\t")
+    #         print(f"\tUse: {round(usage, 2) * 100}%")
