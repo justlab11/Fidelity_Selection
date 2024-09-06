@@ -132,7 +132,7 @@ def fe_nn_one_run(fe_model, hf_model, lf_model, dataloader, criterion, optimizer
     #         optimizer.step()
     pass
 
-def fe_svm_one_run(fe_model, hf_model, lf_model, dataloader, mode="train"):
+def fe_svm_one_run(fe_model, hf_model, lf_model, dataloader, hf_weight, mode="train"):
     device = next(hf_model.parameters()).device
 
     lf_body = create_feature_extractor(
@@ -143,9 +143,9 @@ def fe_svm_one_run(fe_model, hf_model, lf_model, dataloader, mode="train"):
     batch_size = dataloader.batch_size
 
     lf_embeddings = np.zeros((num_samples, 32))
-    lf_outputs = np.zeros((num_samples, 2))
-    hf_outputs = np.zeros((num_samples, 2))
-    targets = np.zeros(num_samples)
+    lf_preds = np.zeros((num_samples, 2))
+    hf_preds = np.zeros((num_samples, 2))
+    labels = np.zeros(num_samples)
 
     for i, (hf_data, lf_data, target) in enumerate(dataloader):
         target = target.type(torch.LongTensor) 
@@ -153,27 +153,26 @@ def fe_svm_one_run(fe_model, hf_model, lf_model, dataloader, mode="train"):
         lf_data = lf_data.to(device, torch.float)
         target = target.to(device)
 
-        lf_embs_tmp = lf_body(lf_data).cpu().numpy()
-        lf_output_tmp = lf_model(lf_data).cpu().numpy()
-        hf_output_tmp = hf_model(hf_data).cpu().numpy()
+        lf_embs_tmp = lf_body(lf_data)["body"].detach().cpu().numpy()
+        lf_output_tmp = lf_model(lf_data).detach().cpu().numpy()
+        hf_output_tmp = hf_model(hf_data).detach().cpu().numpy()
 
         offset = len(lf_embs_tmp)
 
         lf_embeddings[i*batch_size:(i*batch_size+offset)] = lf_embs_tmp
-        lf_outputs[i*batch_size:(i*batch_size+offset)] = lf_output_tmp
-        hf_outputs[i*batch_size:(i*batch_size+offset)] = hf_output_tmp
-        targets[i*batch_size:(i*batch_size+offset)] = target.cpu().numpy()
+        lf_preds[i*batch_size:(i*batch_size+offset)] = lf_output_tmp
+        hf_preds[i*batch_size:(i*batch_size+offset)] = hf_output_tmp
+        labels[i*batch_size:(i*batch_size+offset)] = target.cpu().numpy()
 
-    
+    lf_correct = np.argmax(lf_preds, axis=1) == labels
+    hf_correct = np.argmax(hf_preds, axis=1) == labels
 
-    # lf_correct = np.argmax(lf_preds, axis=1) == labels
-    # hf_correct = np.argmax(hf_preds, axis=1) == labels
+    best_choices = np.logical_and(~lf_correct, hf_correct).astype(int)
 
-    # best_choices = np.logical_and(~lf_correct, hf_correct).astype(int)
-
-    # if mode=="train":
-    #     weights = 
-    #     fe_model.fit(lf_embeddings, )
+    if mode=="train":
+        weights = np.where(best_choices==1, hf_weight, 1)
+        fe_model.fit(lf_embeddings, labels, sample_weights=weights)
+        
 
 
 def build_qe_model(num_classes: int=2):
