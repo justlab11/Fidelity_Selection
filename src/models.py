@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torchvision import models
+from sklearn.svm import SVC
 
 def build_mlp(input_size, num_layers, output_size, hidden_size=64, device='cpu'):
     layers = []
@@ -60,3 +61,17 @@ def build_resnet(resnet_size, latent_size, output_size, pretrained=True, device=
     full_model = full_model.to(device)
     
     return full_model
+
+def build_svm(C=1.0, kernel='rbf'):
+    valid_kernels = ['linear', 'poly', 'rbf', 'sigmoid', 'precomputed']
+    
+    if kernel not in valid_kernels and not callable(kernel):
+        raise ValueError(f"Invalid kernel. Choose from {valid_kernels} or provide a callable.")
+    
+    if C <= 0:
+        raise ValueError("C must be strictly positive.")
+    
+    svm_model = SVC(C=C, kernel=kernel)
+    
+    return svm_model
+
