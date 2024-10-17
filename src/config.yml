@@ -1,0 +1,39 @@
+dataset:
+  dataset_name: mnist
+  augmentation: noise
+  augmentation_level: 3
+
+model:
+  lf_classifier_model: resnet18
+  hf_classifier_model: resnet18
+
+  # optional
+  pretrained: true
+  hidden_size: 64
+  regularization: 1
+  kernel: rbf
+
+stage1:
+  hf_model:
+    train: true
+    validate: true
+    save_location: ./hf_models
+    load_location: 
+
+  lf_model:
+    train: true
+    validate: true
+    save_location: ./lf_models
+    load_location: 
+
+
+  
+
+
+stage2:
+  start_r: 0
+  stop_r: 1
+  num_steps: 100
+  scale: linear
+
+

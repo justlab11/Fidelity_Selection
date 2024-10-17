@@ -3,6 +3,7 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader, Subset
 from torchvision.models.feature_extraction import create_feature_extractor
+from models import build_mlp, build_resnet
 
 def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
     """
@@ -103,6 +104,22 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
         return average_loss, accuracy.item(), high_count
 
     return average_loss, accuracy
+
+def train_hf_model(dataset):
+    build_functions = {
+        "hybercube": build_mlp,
+        "mnist": build_resnet,
+        "cifar10": build_resnet,
+        "cifar100": build_resnet 
+    }
+
+    if dataset not in build_functions.keys():
+        raise ValueError("Invalid value for dataset parameter. Valid options are 'hypercube', 'mnist', 'cifar10', 'cifar100'.")
+    
+    build_function = build_functions[dataset]
+
+    
+    
 
 
 

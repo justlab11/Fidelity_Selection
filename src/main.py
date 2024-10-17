@@ -17,78 +17,82 @@ NUM_RERUNS = 1
 NUM_FIDELITY_EPOCHS = 50
 NUM_QE_EPOCHS = 200
 
-qe_train_acc = np.zeros((NUM_RERUNS, len(R_VALS)))
-qe_train_use = np.zeros((NUM_RERUNS, len(R_VALS)))
-
-qe_test_acc = np.zeros((NUM_RERUNS, len(R_VALS)))
-qe_test_use = np.zeros((NUM_RERUNS, len(R_VALS)))
-
-qe_val_acc = np.zeros((NUM_RERUNS, len(R_VALS)))
-qe_val_use = np.zeros((NUM_RERUNS, len(R_VALS)))
-
-full_dataset = BinaryHypercubeDataset(4000, noise_level=1.1)
-
-for run_num in range(NUM_RERUNS):
-    lf_model = torch.nn.Sequential(
-        torch.nn.Linear(2, 64),
-        torch.nn.ReLU(),
-        torch.nn.Linear(64, 128),
-        torch.nn.ReLU(),
-        torch.nn.Linear(128, 64),
-        torch.nn.ReLU(),
-        torch.nn.Linear(64, 32),
-        torch.nn.ReLU(),
-        torch.nn.Linear(32, 2)
-    ).to(DEVICE)
-
-    lf_optimizer = torch.optim.Adam(lf_model.parameters(), lr=3e-3, weight_decay=1e-5)
-    criterion = torch.nn.CrossEntropyLoss()
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(lf_optimizer, gamma=0.99)
-    early_stopper = EarlyStopper(patience=5)
-
-    train_loader, test_loader, val_loader = build_dataloaders(full_dataset)
 
 
-    for epoch in range(NUM_FIDELITY_EPOCHS):
-        train_loss, train_acc = classifier_one_run(lf_model, train_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
-        test_loss, test_acc = classifier_one_run(lf_model, test_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
-        val_loss, val_acc = classifier_one_run(lf_model, val_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
 
-        print(train_acc, val_acc)
-        if early_stopper.early_stop(val_loss):
-            break
-        # scheduler.step(
 
-    print("\n\n\n")
+# qe_train_acc = np.zeros((NUM_RERUNS, len(R_VALS)))
+# qe_train_use = np.zeros((NUM_RERUNS, len(R_VALS)))
 
-    hf_model = torch.nn.Sequential(
-        torch.nn.Linear(2, 64),
-        torch.nn.ReLU(),
-        torch.nn.Linear(64, 128),
-        torch.nn.ReLU(),
-        torch.nn.Linear(128, 64),
-        torch.nn.ReLU(),
-        torch.nn.Linear(64, 32),
-        torch.nn.ReLU(),
-        torch.nn.Linear(32, 2)
-    ).to(DEVICE)
+# qe_test_acc = np.zeros((NUM_RERUNS, len(R_VALS)))
+# qe_test_use = np.zeros((NUM_RERUNS, len(R_VALS)))
 
-    hf_optimizer = torch.optim.Adam(hf_model.parameters(), lr=3e-3, weight_decay=1e-5)
-    criterion = torch.nn.CrossEntropyLoss()
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(hf_optimizer, gamma=0.99)
-    early_stopper = EarlyStopper(patience=5)
+# qe_val_acc = np.zeros((NUM_RERUNS, len(R_VALS)))
+# qe_val_use = np.zeros((NUM_RERUNS, len(R_VALS)))
 
-    for epoch in range(NUM_FIDELITY_EPOCHS):
-        train_loss, train_acc = classifier_one_run(hf_model, train_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
-        test_loss, test_acc = classifier_one_run(hf_model, test_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
-        val_loss, val_acc = classifier_one_run(hf_model, val_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
+# full_dataset = BinaryHypercubeDataset(4000, noise_level=1.1)
 
-        print(train_acc, val_acc)
-        if early_stopper.early_stop(val_loss):
-            break
+# for run_num in range(NUM_RERUNS):
+#     lf_model = torch.nn.Sequential(
+#         torch.nn.Linear(2, 64),
+#         torch.nn.ReLU(),
+#         torch.nn.Linear(64, 128),
+#         torch.nn.ReLU(),
+#         torch.nn.Linear(128, 64),
+#         torch.nn.ReLU(),
+#         torch.nn.Linear(64, 32),
+#         torch.nn.ReLU(),
+#         torch.nn.Linear(32, 2)
+#     ).to(DEVICE)
 
-    svm_model = SVC(kernel="rbf", class_weight="balanced")
-    fe_svm_one_run(svm_model, hf_model, lf_model, train_loader)
+#     lf_optimizer = torch.optim.Adam(lf_model.parameters(), lr=3e-3, weight_decay=1e-5)
+#     criterion = torch.nn.CrossEntropyLoss()
+#     scheduler = torch.optim.lr_scheduler.ExponentialLR(lf_optimizer, gamma=0.99)
+#     early_stopper = EarlyStopper(patience=5)
+
+#     train_loader, test_loader, val_loader = build_dataloaders(full_dataset)
+
+
+#     for epoch in range(NUM_FIDELITY_EPOCHS):
+#         train_loss, train_acc = classifier_one_run(lf_model, train_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
+#         test_loss, test_acc = classifier_one_run(lf_model, test_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
+#         val_loss, val_acc = classifier_one_run(lf_model, val_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=scheduler)
+
+#         print(train_acc, val_acc)
+#         if early_stopper.early_stop(val_loss):
+#             break
+#         # scheduler.step(
+
+#     print("\n\n\n")
+
+#     hf_model = torch.nn.Sequential(
+#         torch.nn.Linear(2, 64),
+#         torch.nn.ReLU(),
+#         torch.nn.Linear(64, 128),
+#         torch.nn.ReLU(),
+#         torch.nn.Linear(128, 64),
+#         torch.nn.ReLU(),
+#         torch.nn.Linear(64, 32),
+#         torch.nn.ReLU(),
+#         torch.nn.Linear(32, 2)
+#     ).to(DEVICE)
+
+#     hf_optimizer = torch.optim.Adam(hf_model.parameters(), lr=3e-3, weight_decay=1e-5)
+#     criterion = torch.nn.CrossEntropyLoss()
+#     scheduler = torch.optim.lr_scheduler.ExponentialLR(hf_optimizer, gamma=0.99)
+#     early_stopper = EarlyStopper(patience=5)
+
+#     for epoch in range(NUM_FIDELITY_EPOCHS):
+#         train_loss, train_acc = classifier_one_run(hf_model, train_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
+#         test_loss, test_acc = classifier_one_run(hf_model, test_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
+#         val_loss, val_acc = classifier_one_run(hf_model, val_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=scheduler)
+
+#         print(train_acc, val_acc)
+#         if early_stopper.early_stop(val_loss):
+#             break
+
+#     svm_model = SVC(kernel="rbf", class_weight="balanced")
+#     fe_svm_one_run(svm_model, hf_model, lf_model, train_loader)
 
     # qe_train_loader, qe_test_loader, qe_val_loader = build_qe_dataloaders(lf_model, hf_model, train_loader, test_loader, val_loader)
 
