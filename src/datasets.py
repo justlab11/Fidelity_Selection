@@ -7,7 +7,7 @@ from PIL import Image, ImageFilter
 from sklearn.model_selection import train_test_split
 
 class HypercubeDataset:
-    def __init__(self, N_dim, N_samples, N_classes, radius=1.0, noise_level=0.1, 
+    def __init__(self, N_dim, N_samples, N_classes=4, radius=1.0, noise_level=0.1, 
                  wrong_class_prob=0.1, val_split=0.2, test_split=0.2, random_seed=42):
         self.N_dim = N_dim
         self.N_samples = N_samples

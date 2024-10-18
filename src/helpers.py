@@ -4,6 +4,10 @@ import numpy as np
 from torch.utils.data import DataLoader, Subset
 from torchvision.models.feature_extraction import create_feature_extractor
 from models import build_mlp, build_resnet
+from custom_types import Options
+import yaml
+from os import path
+
 
 def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
     """
@@ -105,20 +109,93 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
 
     return average_loss, accuracy
 
-def train_hf_model(dataset):
-    build_functions = {
-        "hybercube": build_mlp,
-        "mnist": build_resnet,
-        "cifar10": build_resnet,
-        "cifar100": build_resnet 
-    }
+class Builder:
+    def __init__(self, config: Options, device: torch.device):
+        self.config = config
+        self.device = device
 
-    if dataset not in build_functions.keys():
-        raise ValueError("Invalid value for dataset parameter. Valid options are 'hypercube', 'mnist', 'cifar10', 'cifar100'.")
-    
-    build_function = build_functions[dataset]
+        self.input_sizes = {
+            "toy": self.config.dataset.toy_dataset_parameters.num_dims,
+            "mnist": None,
+            "cifar10": None,
+            "cifar100": None,
+        }
 
-    
+        self.output_sizes = {
+            "toy": self.config.dataset.toy_dataset_parameters.num_classes,
+            "mnist": 10,
+            "cifar10": 10,
+            "cifar100": 100,
+        }
+
+    def __build_model__(self, model_type, dataset_name, pretrained=None):
+        input_size = self.input_sizes[dataset_name]
+        output_size = self.output_sizes[dataset_name]
+        latent_size = self.config.parameters.latent_representation_size
+
+        if "resnet" in model_type:
+            model = build_resnet(
+                resnet_size=model_type,
+                latent_size=latent_size,
+                output_size=output_size,
+                pretrained=pretrained,
+                device=self.device
+            )
+        
+        else:
+            num_layers = self.config.stage1.hf_model.classifier.num_layers
+
+            model = build_mlp(
+                input_size=input_size,
+                num_layers=num_layers,
+                output_size=output_size
+            )
+
+        return model
+
+    def build_classifiers(self):
+        dataset_name = self.config.dataset.name
+
+        hf_model_type = self.config.stage1.hf_model.classifier.type
+        lf_model_type = self.config.stage1.lf_model.classifier.type
+
+        if dataset_name == "toy" and hf_model_type != "mlp":
+            raise ValueError("stage1.hf_model.classifier.type must be 'mlp' with the 'toy' dataset")
+        
+        if dataset_name == "toy" and lf_model_type != "mlp":
+            raise ValueError("stage1.lf_model.classifier.type must be 'mlp' with the 'toy' dataset")
+        
+        hf_pretrained = self.config.stage1.hf_model.classifier.pretrained
+        lf_pretrained = self.config.stage1.lf_model.classifier.pretrained
+
+        hf_model = self.__build_model__(
+            model_type=hf_model_type,
+            dataset_name=dataset_name,
+            pretrained=hf_pretrained
+        )
+
+        lf_model = self.__build_model__(
+            model_type=lf_model_type,
+            dataset_name=dataset_name,
+            pretrained=lf_pretrained
+        )
+
+        hf_model_path = str(self.config.stage1.hf_model.load_file)
+        if path.exists(hf_model_path):
+            torch.load(hf_model_path)
+
+        lf_model_path = str(self.config.stage1.lf_model.load_file)
+        if path.exists(lf_model_path):
+            torch.load(lf_model_path)
+
+
+
+
+def load_yaml_options(config_file: str) -> Options:
+    with open(config_file, 'r') as file:
+        yaml_data = yaml.safe_load(file)
+
+    return Options.model_validate(yaml_data)
     
 
 

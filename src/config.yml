@@ -1,39 +1,95 @@
 dataset:
-  dataset_name: mnist
+  name: mnist
   augmentation: noise
   augmentation_level: 3
+  toy_dataset_parameters:
+    radius: 1
+    num_dims: 2
+    num_samples: 4000
+    num_classes: 4
+    wrong_class_prob: 0.2
 
-model:
-  lf_classifier_model: resnet18
-  hf_classifier_model: resnet18
-
-  # optional
-  pretrained: true
-  hidden_size: 64
-  regularization: 1
-  kernel: rbf
+parameters:
+  latent_representation_size: 64
+  random_seed: 42
+  num_reruns: 1
 
 stage1:
+  epochs: 200
+  batch_size: 32
+
   hf_model:
+    classifier:
+      type: resnet18 # options: resnet18, resnet34, resnet50, resnet101, resnet152, mlp
+      pretrained: true # only for type == 'resnet'
+      num_layers: 8 # only for type == 'mlp'
+
     train: true
     validate: true
+
     save_location: ./hf_models
-    load_location: 
+    load_file:
+
+    optimizer:
+      lr: 3e-3
+      weight_decay: 1e-5
+
+    scheduler:
+      gamma: .99
+
+    early_stop:
+      patience: 5
+      min_delta: 0
 
   lf_model:
+    classifier:
+      type: resnet18 # options: resnet18, resnet34, resnet50, resnet101, resnet152, mlp
+      pretrained: true # only for type == 'resnet'
+      num_layers: 8 # only for type == 'mlp'
+
     train: true
     validate: true
+
     save_location: ./lf_models
-    load_location: 
+    load_file:
 
+    optimizer:
+      lr: 3e-3
+      weight_decay: 1e-5
 
-  
+    scheduler:
+      gamma: .99
 
+    early_stop:
+      patience: 5
+      min_delta: 0
 
 stage2:
-  start_r: 0
-  stop_r: 1
-  num_steps: 100
-  scale: linear
+  epochs: 200
+  save_location: ./stage2
+
+  fe_model:
+    type: mlp # options: mlp or svm
+    regularization: 1 # not used if type != svm
+    kernel: rbg # not used if type != svm
+
+    optimizer:
+      lr: 3e-3
+      weight_decay: 1e-5
+
+    scheduler:
+      gamma: .99
+
+    early_stop:
+      patience: 5
+      min_delta: 0
+
+  r_range:
+    start: 0
+    stop: 1
+    num_steps: 100
+    scale: linear
+    direction: reversed # normal: 0 -> 1, reversed 1 -> 0
+
 
 

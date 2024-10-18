@@ -5,18 +5,24 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import torch.nn as nn
 from typing import *
 from sklearn.svm import SVC
+import yaml
 
-from datasets import BinaryHypercubeDataset
+from datasets import *
 from helpers import *
+from custom_types import Options
 
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-R_VALS = np.linspace(0.01, 3, 200)
-NUM_RERUNS = 1
-NUM_FIDELITY_EPOCHS = 50
-NUM_QE_EPOCHS = 200
+# R_VALS = np.linspace(0.01, 3, 200)
+# NUM_RERUNS = 1
+# NUM_FIDELITY_EPOCHS = 50
+# NUM_QE_EPOCHS = 200
 
+def main(config_file):
+    options = load_yaml_options(config_file)
+
+    
 
 
 
