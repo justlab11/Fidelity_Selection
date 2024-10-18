@@ -16,6 +16,7 @@ parameters:
 
 stage1:
   epochs: 200
+  save_location: ./stage1
   batch_size: 32
 
   hf_model:
@@ -67,6 +68,7 @@ stage1:
 stage2:
   epochs: 200
   save_location: ./stage2
+  batch_size: 128
 
   fe_model:
     type: mlp # options: mlp or svm

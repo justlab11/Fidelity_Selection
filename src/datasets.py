@@ -5,20 +5,26 @@ import numpy as np
 from torch.utils.data import Dataset, Subset
 from PIL import Image, ImageFilter
 from sklearn.model_selection import train_test_split
+from torchvision.models import ResNet18_Weights
+from custom_types import Options
 
 class HypercubeDataset:
-    def __init__(self, N_dim, N_samples, N_classes=4, radius=1.0, noise_level=0.1, 
-                 wrong_class_prob=0.1, val_split=0.2, test_split=0.2, random_seed=42):
-        self.N_dim = N_dim
-        self.N_samples = N_samples
-        self.N_classes = N_classes
-        self.radius = radius
-        self.noise_level = noise_level
-        self.wrong_class_prob = wrong_class_prob
+    def __init__(self, config: Options, val_split=0.2, test_split=0.2, random_seed=42):
+        
+        self.config: Options = config
+
+        toy_dataset_parameters = self.config.dataset.toy_dataset_parameters
+
+        self.N_dim = toy_dataset_parameters.num_dims
+        self.N_samples = toy_dataset_parameters.num_samples
+        self.N_classes = toy_dataset_parameters.num_classes
+        self.radius = toy_dataset_parameters.radius
+        self.noise_level = self.config.dataset.augmentation_level
+        self.wrong_class_prob = toy_dataset_parameters.wrong_class_prob
+
         self.val_split = val_split
         self.test_split = test_split
         self.random_seed = random_seed
-        self.mode = 'train'
 
         np.random.seed(self.random_seed)
         torch.manual_seed(self.random_seed)
@@ -75,49 +81,15 @@ class HypercubeDataset:
         )
 
     def train(self):
-        self.mode = 'train'
-        return self
+        return HypercubeSubset(self.train_data, self.train_labels, self.noise_level)
 
     def val(self):
-        self.mode = 'val'
-        return self
+        return HypercubeSubset(self.val_data, self.val_labels, self.noise_level)
 
     def test(self):
-        self.mode = 'test'
-        return self
-
-    def get_high_fidelity(self):
-        if self.mode == 'train':
-            return HypercubeSubset(self.train_data, self.train_labels)
-        elif self.mode == 'val':
-            return HypercubeSubset(self.val_data, self.val_labels)
-        elif self.mode == 'test':
-            return HypercubeSubset(self.test_data, self.test_labels)
-        else:
-            raise ValueError("Invalid mode. Use train(), val(), or test() to set the mode.")
-
-    def get_low_fidelity(self):
-        if self.mode == 'train':
-            return NoisyHypercubeSubset(self.train_data, self.train_labels, self.noise_level)
-        elif self.mode == 'val':
-            return NoisyHypercubeSubset(self.val_data, self.val_labels, self.noise_level)
-        elif self.mode == 'test':
-            return NoisyHypercubeSubset(self.test_data, self.test_labels, self.noise_level)
-        else:
-            raise ValueError("Invalid mode. Use train(), val(), or test() to set the mode.")
+        return HypercubeSubset(self.test_data, self.test_labels, self.noise_level)
 
 class HypercubeSubset(Dataset):
-    def __init__(self, data, labels):
-        self.data = torch.FloatTensor(data)
-        self.labels = torch.LongTensor(labels)
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx], self.labels[idx]
-
-class NoisyHypercubeSubset(Dataset):
     def __init__(self, data, labels, noise_level):
         self.data = torch.FloatTensor(data)
         self.labels = torch.LongTensor(labels)
@@ -127,26 +99,28 @@ class NoisyHypercubeSubset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        noisy_data = self.data[idx] + torch.randn_like(self.data[idx]) * self.noise_level
-        return noisy_data, self.data[idx], self.labels[idx]
+        clean_sample = self.data[idx]
+        noisy_sample = clean_sample + torch.randn_like(clean_sample) * self.noise_level
+        return self.labels[idx], clean_sample, noisy_sample
 
 
 class DualFidelityDataset:
-    def __init__(self, dataset_name, augmentation, augmentation_degree, 
-                 data_folder="./data", val_split=0.5, random_seed=42):
-        self.dataset_name = dataset_name.lower()
-        self.augmentation = augmentation.lower()
-        self.augmentation_degree = augmentation_degree
+    def __init__(self, config, data_folder="./data", 
+                 val_split=0.5, random_seed=42):
+        
+
+        self.dataset_name = config.dataset.name.lower()
+        self.augmentation = config.dataset.augmentation.lower()
+        self.augmentation_level = config.dataset.augmentation_level
         self.val_split = val_split
         self.random_seed = random_seed
-        self.mode = 'train'  # Default mode
 
         valid_dataset_names = ["mnist", "cifar10", "cifar100"]
         valid_aug_names = ["noise", "blur", "random_rotation"]
 
         if self.dataset_name not in valid_dataset_names:
             valid_dataset_str = ", ".join(valid_dataset_names) 
-            raise ValueError(f"Unsupported dataset. Choose {valid_dataset_str}")
+            raise ValueError(f"Unsupported dataset. Choose {valid_dataset_str}.")
         
         if self.augmentation not in valid_aug_names:
             valid_aug_str = ", ".join(valid_aug_names) 
@@ -182,42 +156,23 @@ class DualFidelityDataset:
         self.test_data = torch.utils.data.Subset(self.test_dataset, test_indices)
 
     def train(self):
-        self.mode = 'train'
-        return self
+        return AugmentedDataset(self.train_data, self.augmentation, self.augmentation_level)
 
     def val(self):
-        self.mode = 'val'
-        return self
+        return AugmentedDataset(self.val_data, self.augmentation, self.augmentation_level)
 
     def test(self):
-        self.mode = 'test'
-        return self
-
-    def get_high_fidelity(self):
-        if self.mode == 'train':
-            return self.train_data
-        elif self.mode == 'val':
-            return self.val_data
-        elif self.mode == 'test':
-            return self.test_data
-        else:
-            raise ValueError("Invalid mode. Use train(), val(), or test() to set the mode.")
-
-    def get_low_fidelity(self):
-        if self.mode == 'train':
-            return AugmentedDataset(self.train_data, self.augmentation, self.augmentation_degree)
-        elif self.mode == 'val':
-            return AugmentedDataset(self.val_data, self.augmentation, self.augmentation_degree)
-        elif self.mode == 'test':
-            return AugmentedDataset(self.test_data, self.augmentation, self.augmentation_degree)
-        else:
-            raise ValueError("Invalid mode. Use train(), val(), or test() to set the mode.")
+        return AugmentedDataset(self.test_data, self.augmentation, self.augmentation_level)
 
 class AugmentedDataset(Dataset):
     def __init__(self, base_dataset, augmentation, degree):
         self.base_dataset = base_dataset
         self.augmentation = augmentation
         self.degree = degree
+
+        # ResNet18 preprocessing
+        weights = ResNet18_Weights.DEFAULT
+        self.preprocess = weights.transforms()
 
     def __len__(self):
         return len(self.base_dataset)
@@ -232,6 +187,10 @@ class AugmentedDataset(Dataset):
             else:
                 image = Image.fromarray(np.uint8(image))
         
+        # Convert grayscale to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
         # Apply augmentation
         if self.augmentation == 'noise':
             augmented_image = self.add_noise(image)
@@ -240,16 +199,15 @@ class AugmentedDataset(Dataset):
         elif self.augmentation == 'random_rotation':
             augmented_image = self.random_rotate(image)
         
-        # Convert back to tensor
-        to_tensor = transforms.ToTensor()
-        augmented_image = to_tensor(augmented_image)
-        original_image = to_tensor(image)
+        # Apply ResNet18 preprocessing
+        original_image = self.preprocess(image)
+        augmented_image = self.preprocess(augmented_image)
         
-        return augmented_image, original_image, label
+        return label, original_image, augmented_image
 
     def add_noise(self, image):
         np_image = np.array(image)
-        noise = np.random.normal(0, self.degree, np_image.shape)
+        noise = np.random.normal(0, self.degree * 255, np_image.shape)
         noisy_image = np.clip(np_image + noise, 0, 255).astype(np.uint8)
         return Image.fromarray(noisy_image)
 
@@ -259,7 +217,7 @@ class AugmentedDataset(Dataset):
     def random_rotate(self, image):
         angle = np.random.uniform(-self.degree, self.degree)
         return image.rotate(angle)
-
+    
 
 class QE_Dataset(Dataset):
     def __init__(self, lf_embeddings, lf_preds, hf_preds, labels):

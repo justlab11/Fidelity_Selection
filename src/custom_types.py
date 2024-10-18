@@ -47,6 +47,7 @@ class ModelConfig(BaseModel):
 
 class Stage1(BaseModel):
     epochs: int
+    save_location: Optional[str] = None
     batch_size: int
     hf_model: ModelConfig
     lf_model: ModelConfig
@@ -69,6 +70,7 @@ class RRange(BaseModel):
 class Stage2(BaseModel):
     epochs: int
     save_location: Optional[str] = None
+    batch_size: int
     fe_model: FeModel
     r_range: RRange
 

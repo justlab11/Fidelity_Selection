@@ -9,6 +9,7 @@ import yaml
 
 from datasets import *
 from helpers import *
+
 from custom_types import Options
 
 
@@ -20,8 +21,22 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # NUM_QE_EPOCHS = 200
 
 def main(config_file):
-    options = load_yaml_options(config_file)
+    config = load_yaml_options(config_file)
 
+    dataset_builder: DatasetBuilder = DatasetBuilder(
+        config=config
+    )
+
+    model_builder: ModelBuilder = ModelBuilder(
+        config=config,
+        device=DEVICE
+    )
+
+    train_loader, test_loader, val_loader = dataset_builder.build_dataset()
+
+    hf_model, lf_model = model_builder.build_classifiers()
+
+    
     
 
 

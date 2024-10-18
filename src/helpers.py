@@ -7,6 +7,7 @@ from models import build_mlp, build_resnet
 from custom_types import Options
 import yaml
 from os import path
+from datasets import *
 
 
 def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
@@ -109,7 +110,46 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
 
     return average_loss, accuracy
 
-class Builder:
+class DatasetBuilder:
+    def __init__(self, config: Options):
+        self.config = config
+
+    def __make_dataloader__(self, dataset, stage):
+        train_set = dataset.train()
+        test_set = dataset.test()
+        val_set = dataset.val()
+
+        if stage == 1:
+            batch_size = self.config.stage1.batch_size
+        else:
+            batch_size = self.config.stage2.batch_size
+
+        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+        test_loader = DataLoader(test_set, batch_size=batch_size)
+        val_loader = DataLoader(val_set, batch_size=batch_size)
+
+        return train_loader, test_loader, val_loader
+
+    def build_dataset(self, stage=1):
+        dataset_name = self.config.dataset.name
+        if dataset_name == "toy":
+            dataset = HypercubeDataset(
+                config=self.config,
+            )
+
+        else:
+            dataset = DualFidelityDataset(
+                config=self.config
+            )
+
+        train_loader, test_loader, val_loader = self.__make_dataloader_(
+            dataset=dataset,
+            stage=stage
+        )
+
+        return train_loader, test_loader, val_loader
+
+class ModelBuilder:
     def __init__(self, config: Options, device: torch.device):
         self.config = config
         self.device = device
@@ -182,13 +222,15 @@ class Builder:
 
         hf_model_path = str(self.config.stage1.hf_model.load_file)
         if path.exists(hf_model_path):
-            torch.load(hf_model_path)
+            hf_state_dict = torch.load(hf_model_path)
+            hf_model.load_state_dict(hf_state_dict)
 
         lf_model_path = str(self.config.stage1.lf_model.load_file)
         if path.exists(lf_model_path):
-            torch.load(lf_model_path)
+            lf_state_dict = torch.load(lf_model_path)
+            lf_model.load_state_dict(lf_state_dict)
 
-
+        return hf_model, lf_model
 
 
 def load_yaml_options(config_file: str) -> Options:
