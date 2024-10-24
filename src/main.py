@@ -53,16 +53,17 @@ def main(config_file):
             
         classifier_epochs = config.stage1.epochs
 
-        hf_loss_curves = {
-            "train": [],
-            "test": [],
-            "val": [],
-        }
-
-        hf_acc_curves = {
-            "train": [],
-            "test": [],
-            "val": [],
+        hf_metadata = {
+            "loss": {
+                "train": [],
+                "test": [],
+                "val": [],
+            },
+            "acc": {
+                "train": [],
+                "test": [],
+                "val": [],
+            }
         }
 
         for epoch in range(classifier_epochs):
@@ -70,20 +71,27 @@ def main(config_file):
             test_loss, test_acc = classifier_one_run(hf_model, test_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=hf_scheduler)
             val_loss, val_acc = classifier_one_run(hf_model, val_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=hf_scheduler)
 
-            hf_loss_curves["train"].append(train_loss)
-            hf_loss_curves["test"].append(test_loss)
-            hf_loss_curves["val"].append(val_loss)
+            hf_metadata["loss"]["train"].append(train_loss)
+            hf_metadata["loss"]["test"].append(test_loss)
+            hf_metadata["loss"]["val"].append(val_loss)
 
-            hf_acc_curves["train"].append(train_acc)
-            hf_acc_curves["test"].append(test_acc)
-            hf_acc_curves["val"].append(val_acc)
+            hf_metadata["acc"]["train"].append(train_acc)
+            hf_metadata["acc"]["test"].append(test_acc)
+            hf_metadata["acc"]["val"].append(val_acc)
 
             print(train_acc, val_acc)
             if hf_early_stopper.early_stop(val_loss):
                 break
         
         hf_save_location = config.stage1.hf_model.save_location
-        torch.save(hf_model.state_dict(), hf_save_location)
+        final_acc = round(val_acc*100, 2)
+
+        hf_model_file = f"hf_model_{final_acc}.pt"
+        hf_metadata_file = f"hf_model_{final_acc}_meta.json"
+
+        torch.save(hf_model.state_dict(), path.join(hf_save_location, hf_model_file))
+        with open(path.join(hf_save_location, hf_metadata_file), "w") as json_file:
+            json.dump(hf_metadata, json_file, indent=4)
 
 
     ##### LOW FIDELITY TRAINING
@@ -101,20 +109,47 @@ def main(config_file):
             gamma=config.stage1.lf_model.scheduler.gamma
         )
 
+        lf_metadata = {
+            "loss": {
+                "train": [],
+                "test": [],
+                "val": [],
+            },
+            "acc": {
+                "train": [],
+                "test": [],
+                "val": [],
+            }
+        }
+
         for epoch in range(classifier_epochs):
             train_loss, train_acc = classifier_one_run(lf_model, train_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=lf_scheduler)
             test_loss, test_acc = classifier_one_run(lf_model, test_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=lf_scheduler)
             val_loss, val_acc = classifier_one_run(lf_model, val_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=lf_scheduler)
+
+            lf_metadata["loss"]["train"].append(train_loss)
+            lf_metadata["loss"]["test"].append(test_loss)
+            lf_metadata["loss"]["val"].append(val_loss)
+
+            lf_metadata["acc"]["train"].append(train_acc)
+            lf_metadata["acc"]["test"].append(test_acc)
+            lf_metadata["acc"]["val"].append(val_acc)
 
             print(train_acc, val_acc)
             if lf_early_stopper.early_stop(val_loss):
                 break
 
         lf_save_location = config.stage1.lf_model.save_location
-        torch.save(lf_model.state_dict(), lf_save_location)
+        final_acc = round(val_acc*100, 2)
+
+        lf_model_file = f"lf_model_{final_acc}.pt"
+        lf_metadata_file = f"lf_model_{final_acc}_meta.json"
+
+        torch.save(lf_model.state_dict(), path.join(lf_save_location, lf_model_file))
+        with open(path.join(lf_save_location, lf_metadata_file), "w") as json_file:
+            json.dump(lf_metadata, json_file, indent=4)
 
 if __name__ == "__main__":
-    print("yes")
     main("./src/config.yml")
 
 
