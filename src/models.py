@@ -38,7 +38,7 @@ def build_resnet(resnet_size, latent_size, output_size, pretrained=True, device=
         raise ValueError(f"Invalid ResNet size. Choose from {list(resnet_models.keys())}")
     
     # Get the appropriate ResNet model
-    model = resnet_models[resnet_size](pretrained=pretrained)
+    model = resnet_models[resnet_size](weights="DEFAULT")
     
     # Remove the original fully connected layer
     num_ftrs = model.fc.in_features

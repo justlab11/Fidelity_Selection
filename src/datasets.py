@@ -203,7 +203,7 @@ class AugmentedDataset(Dataset):
         original_image = self.preprocess(image)
         augmented_image = self.preprocess(augmented_image)
         
-        return label, original_image, augmented_image
+        return augmented_image, original_image, label
 
     def add_noise(self, image):
         np_image = np.array(image)

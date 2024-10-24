@@ -12,7 +12,6 @@ from helpers import *
 
 from custom_types import Options
 
-
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def main(config_file):
