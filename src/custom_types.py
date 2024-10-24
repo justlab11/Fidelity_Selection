@@ -1,8 +1,8 @@
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
 
-class ToyDatasetParameters:
-    radius: int
+class ToyDatasetParameters(BaseModel):
+    radius: float
     num_dims: int
     num_samples: int
     num_classes: int
@@ -38,17 +38,18 @@ class EarlyStop(BaseModel):
 class ModelConfig(BaseModel):
     classifier: Classifier
     train: bool
-    validate: bool
+    evaluate: bool
     save_location: str
     load_file: Optional[str] = None
     optimizer: Optimizer
     scheduler: Scheduler
-    early_stop: EarlyStop
 
 class Stage1(BaseModel):
     epochs: int
     save_location: Optional[str] = None
     batch_size: int
+    loss_fun: str
+    early_stop: EarlyStop
     hf_model: ModelConfig
     lf_model: ModelConfig
 

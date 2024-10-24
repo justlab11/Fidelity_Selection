@@ -15,13 +15,8 @@ from custom_types import Options
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# R_VALS = np.linspace(0.01, 3, 200)
-# NUM_RERUNS = 1
-# NUM_FIDELITY_EPOCHS = 50
-# NUM_QE_EPOCHS = 200
-
 def main(config_file):
-    config = load_yaml_options(config_file)
+    config: Options = load_yaml_options(config_file)
 
     dataset_builder: DatasetBuilder = DatasetBuilder(
         config=config
@@ -36,10 +31,60 @@ def main(config_file):
 
     hf_model, lf_model = model_builder.build_classifiers()
 
-    
-    
+    ##### HIGH FIDELITY TRAINING
 
+    hf_early_stopper = config_early_stop(config)
+    hf_optimizer = torch.optim.Adam(
+        hf_model.parameters(),
+        lr=config.stage1.hf_model.optimizer.lr,
+        weight_decay=config.stage1.hf_model.optimizer.weight_decay
+    )
+    hf_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        hf_optimizer, 
+        gamma=config.stage1.hf_model.scheduler.gamma
+    )
 
+    if config.stage1.loss_fun == "CE":
+        criterion = torch.nn.CrossEntropyLoss()
+    else:
+        criterion = torch.nn.MSELoss()
+        
+    classifier_epochs = config.stage1.epochs
+
+    for epoch in range(classifier_epochs):
+        train_loss, train_acc = classifier_one_run(hf_model, train_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=hf_scheduler)
+        test_loss, test_acc = classifier_one_run(hf_model, test_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=hf_scheduler)
+        val_loss, val_acc = classifier_one_run(hf_model, val_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=hf_scheduler)
+
+        print(train_acc, val_acc)
+        if hf_early_stopper.early_stop(val_loss):
+            break
+
+    ##### LOW FIDELITY TRAINING
+
+    lf_early_stopper = config_early_stop(config)
+    lf_optimizer = torch.optim.Adam(
+        hf_model.parameters(),
+        lr=config.stage1.lf_model.optimizer.lr,
+        weight_decay=config.stage1.lf_model.optimizer.weight_decay
+    )
+    lf_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        lf_optimizer, 
+        gamma=config.stage1.lf_model.scheduler.gamma
+    )
+
+    for epoch in range(classifier_epochs):
+        train_loss, train_acc = classifier_one_run(lf_model, train_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=lf_scheduler)
+        test_loss, test_acc = classifier_one_run(lf_model, test_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=lf_scheduler)
+        val_loss, val_acc = classifier_one_run(lf_model, val_loader, criterion, fidelity="lf", optimizer=lf_optimizer, scheduler=lf_scheduler)
+
+        print(train_acc, val_acc)
+        if lf_early_stopper.early_stop(val_loss):
+            break
+
+if __name__ == "__main__":
+    print("yes")
+    main("./src/config.yml")
 
 
 # qe_train_acc = np.zeros((NUM_RERUNS, len(R_VALS)))

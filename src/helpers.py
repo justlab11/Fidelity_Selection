@@ -142,7 +142,7 @@ class DatasetBuilder:
                 config=self.config
             )
 
-        train_loader, test_loader, val_loader = self.__make_dataloader_(
+        train_loader, test_loader, val_loader = self.__make_dataloader__(
             dataset=dataset,
             stage=stage
         )
@@ -168,14 +168,16 @@ class ModelBuilder:
             "cifar100": 100,
         }
 
-    def __build_model__(self, model_type, dataset_name, pretrained=None):
+    def __build_classifier__(self, model_type, dataset_name, pretrained=None):
         input_size = self.input_sizes[dataset_name]
         output_size = self.output_sizes[dataset_name]
         latent_size = self.config.parameters.latent_representation_size
 
         if "resnet" in model_type:
+            num_layers = int(model_type[6:])
+
             model = build_resnet(
-                resnet_size=model_type,
+                resnet_size=num_layers,
                 latent_size=latent_size,
                 output_size=output_size,
                 pretrained=pretrained,
@@ -208,13 +210,13 @@ class ModelBuilder:
         hf_pretrained = self.config.stage1.hf_model.classifier.pretrained
         lf_pretrained = self.config.stage1.lf_model.classifier.pretrained
 
-        hf_model = self.__build_model__(
+        hf_model = self.__build_classifier__(
             model_type=hf_model_type,
             dataset_name=dataset_name,
             pretrained=hf_pretrained
         )
 
-        lf_model = self.__build_model__(
+        lf_model = self.__build_classifier__(
             model_type=lf_model_type,
             dataset_name=dataset_name,
             pretrained=lf_pretrained
@@ -240,7 +242,16 @@ def load_yaml_options(config_file: str) -> Options:
     return Options.model_validate(yaml_data)
     
 
+def config_early_stop(config: Options):
+    patience = config.stage1.early_stop.patience
+    min_delta = config.stage1.early_stop.min_delta
 
+    early_stopper = EarlyStopper(
+        patience=patience,
+        min_delta=min_delta
+    )
+
+    return early_stopper
 
 def fe_nn_one_run(fe_model, hf_model, lf_model, dataloader, criterion, optimizer=None, scheduler=None):
     # device = next(hf_model.parameters()).device

@@ -18,6 +18,11 @@ stage1:
   epochs: 200
   save_location: ./stage1
   batch_size: 32
+  loss_fun: CE
+
+  early_stop:
+    patience: 5
+    min_delta: 0
 
   hf_model:
     classifier:
@@ -26,7 +31,7 @@ stage1:
       num_layers: 8 # only for type == 'mlp'
 
     train: true
-    validate: true
+    evaluate: true
 
     save_location: ./hf_models
     load_file:
@@ -38,10 +43,6 @@ stage1:
     scheduler:
       gamma: .99
 
-    early_stop:
-      patience: 5
-      min_delta: 0
-
   lf_model:
     classifier:
       type: resnet18 # options: resnet18, resnet34, resnet50, resnet101, resnet152, mlp
@@ -49,7 +50,7 @@ stage1:
       num_layers: 8 # only for type == 'mlp'
 
     train: true
-    validate: true
+    evaluate: true
 
     save_location: ./lf_models
     load_file:
@@ -60,10 +61,6 @@ stage1:
 
     scheduler:
       gamma: .99
-
-    early_stop:
-      patience: 5
-      min_delta: 0
 
 stage2:
   epochs: 200
