@@ -3,3 +3,5 @@ venv
 src/__pycache__
 data
 models
+src/hf_models
+src/lf_models
