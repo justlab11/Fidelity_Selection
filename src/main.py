@@ -88,10 +88,10 @@ def main(config_file):
         
         hf_save_location = config.stage1.hf_model.save_location
         final_acc = round(val_acc*100, 2)
-        final_acc_str = str(final_acc).replace(".", "_")
+        # final_acc_str = str(final_acc).replace(".", "_")
 
-        hf_model_file = f"hf_model_{final_acc_str}.pt"
-        hf_metadata_file = f"hf_model_{final_acc_str}_meta.json"
+        hf_model_file = f"hf_model_{final_acc}.pt"
+        hf_metadata_file = f"hf_model_{final_acc}_meta.json"
 
         torch.save(hf_model.state_dict(), path.join(hf_save_location, hf_model_file))
         with open(path.join(hf_save_location, hf_metadata_file), "w") as json_file:
