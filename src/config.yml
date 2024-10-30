@@ -21,7 +21,7 @@ stage1:
   loss_fun: CE
 
   early_stop:
-    patience: 5
+    patience: 2
     min_delta: 0
 
   hf_model:

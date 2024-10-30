@@ -6,6 +6,7 @@ import torch.nn as nn
 from typing import *
 from sklearn.svm import SVC
 import json
+import click
 import os.path as path
 
 from datasets import *
@@ -15,6 +16,8 @@ from custom_types import Options
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+@click.command()
+@click.option("--config_file", default="./config.yml")
 def main(config_file):
     config: Options = load_yaml_options(config_file)
 
@@ -32,7 +35,7 @@ def main(config_file):
     hf_model, lf_model = model_builder.build_classifiers()
 
     ##### HIGH FIDELITY TRAINING
-    hf_load_location = config.stage1.hf_model.load_file
+    hf_load_location = str(config.stage1.hf_model.load_file)
 
     if not path.exists(hf_load_location):
         hf_early_stopper = config_early_stop(config)
@@ -85,9 +88,10 @@ def main(config_file):
         
         hf_save_location = config.stage1.hf_model.save_location
         final_acc = round(val_acc*100, 2)
+        final_acc_str = str(final_acc).replace(".", "_")
 
-        hf_model_file = f"hf_model_{final_acc}.pt"
-        hf_metadata_file = f"hf_model_{final_acc}_meta.json"
+        hf_model_file = f"hf_model_{final_acc_str}.pt"
+        hf_metadata_file = f"hf_model_{final_acc_str}_meta.json"
 
         torch.save(hf_model.state_dict(), path.join(hf_save_location, hf_model_file))
         with open(path.join(hf_save_location, hf_metadata_file), "w") as json_file:
@@ -95,7 +99,7 @@ def main(config_file):
 
 
     ##### LOW FIDELITY TRAINING
-    lf_load_location = config.stage1.lf_model.load_file
+    lf_load_location = str(config.stage1.lf_model.load_file)
 
     if not path.exists(lf_load_location):
         lf_early_stopper = config_early_stop(config)
@@ -150,7 +154,7 @@ def main(config_file):
             json.dump(lf_metadata, json_file, indent=4)
 
 if __name__ == "__main__":
-    main("./src/config.yml")
+    main()
 
 
 # qe_train_acc = np.zeros((NUM_RERUNS, len(R_VALS)))
