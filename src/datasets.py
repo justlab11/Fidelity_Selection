@@ -218,6 +218,13 @@ class AugmentedDataset(Dataset):
         angle = np.random.uniform(-self.degree, self.degree)
         return image.rotate(angle)
     
+class CropClassificationDataset(Dataset):
+    def __init__(self, config):
+        self.config = config
+
+        
+
+
 
 class QE_Dataset(Dataset):
     def __init__(self, lf_embeddings, lf_preds, hf_preds, labels):

@@ -12,7 +12,7 @@ import os.path as path
 from datasets import *
 from helpers import *
 
-from custom_types import Options
+from custom_types import Options, MetaData
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -56,18 +56,7 @@ def main(config_file):
             
         classifier_epochs = config.stage1.epochs
 
-        hf_metadata = {
-            "loss": {
-                "train": [],
-                "test": [],
-                "val": [],
-            },
-            "acc": {
-                "train": [],
-                "test": [],
-                "val": [],
-            }
-        }
+        hf_metadata = build_metadata(config)
 
         for epoch in range(classifier_epochs):
             train_loss, train_acc = classifier_one_run(hf_model, train_loader, criterion, fidelity="hf", optimizer=hf_optimizer, scheduler=hf_scheduler)

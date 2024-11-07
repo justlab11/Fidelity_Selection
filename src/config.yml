@@ -1,7 +1,19 @@
 dataset:
   name: mnist
-  augmentation: noise
-  augmentation_level: 3
+
+  augmentations:
+    high_fidelity:
+      type: none
+      strength: 0
+      steps: 0
+      schedule: linear
+
+    low_fidelity:
+      type: none
+      strength: 0
+      steps: 0
+      schedule: linear
+
   toy_dataset_parameters:
     radius: 1
     num_dims: 2
@@ -26,8 +38,8 @@ stage1:
 
   hf_model:
     classifier:
-      type: resnet18 # options: resnet18, resnet34, resnet50, resnet101, resnet152, mlp
-      pretrained: true # only for type == 'resnet'
+      type: resnet18 # options: default, mlp, resnet, unet
+      pretrained: true # for type == 'resnet' or type == 'unet'
       num_layers: 8 # only for type == 'mlp'
 
     train: true
@@ -45,8 +57,8 @@ stage1:
 
   lf_model:
     classifier:
-      type: resnet18 # options: resnet18, resnet34, resnet50, resnet101, resnet152, mlp
-      pretrained: true # only for type == 'resnet'
+      type: resnet18 # options: default, mlp, resnet, unet
+      pretrained: true # for type == 'resnet' or type == 'unet'
       num_layers: 8 # only for type == 'mlp'
 
     train: true

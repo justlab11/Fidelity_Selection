@@ -1,5 +1,18 @@
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, List
+
+class PerformanceData(BaseModel):
+    train: List[float]
+    test: List[float]
+    val: List[float]
+
+class MetaData(BaseModel):
+    file_name: Optional[str] = None
+    loss: PerformanceData
+    acc: PerformanceData
+    augmentation: str
+    augmentation_degree: float
+    dataset: str
 
 class ToyDatasetParameters(BaseModel):
     radius: float
@@ -8,10 +21,15 @@ class ToyDatasetParameters(BaseModel):
     num_classes: int
     wrong_class_prob: float
 
+class Augmentation(BaseModel):
+    type: Literal["none", "noise", "blur", "rotation", "degradation"]
+    strength: float
+    steps: int
+    schedule: Literal["linear", "decay"]
+
 class DatasetSettings(BaseModel):
     name: str
-    augmentation: str
-    augmentation_level: int
+    augmentations: dict[Literal["high_fidelity", "low_fidelity"], Augmentation]
     toy_dataset_parameters: Optional[ToyDatasetParameters] = None
 
 class Parameters(BaseModel):
@@ -20,7 +38,7 @@ class Parameters(BaseModel):
     num_reruns: int
 
 class Classifier(BaseModel):
-    type: Literal["resnet18", "resnet34", "resnet50", "resnet101", "resnet152", "mlp"]
+    type: Literal["default", "mlp", "resnet", "unet"]
     pretrained: bool
     num_layers: Optional[int] = None
 
