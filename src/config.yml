@@ -1,18 +1,18 @@
 dataset:
   name: mnist
-
+  folder: ./data
   augmentations:
     high_fidelity:
-      type: none
+      augmentation: none
       strength: 0
       steps: 0
       schedule: linear
 
     low_fidelity:
-      type: none
-      strength: 0
-      steps: 0
-      schedule: linear
+      augmentation: noise
+      strength: 0.5
+      steps: 5
+      schedule: decay
 
   toy_dataset_parameters:
     radius: 1
@@ -36,43 +36,7 @@ stage1:
     patience: 2
     min_delta: 0
 
-  hf_model:
-    classifier:
-      type: resnet18 # options: default, mlp, resnet, unet
-      pretrained: true # for type == 'resnet' or type == 'unet'
-      num_layers: 8 # only for type == 'mlp'
-
-    train: true
-    evaluate: true
-
-    save_location: ./hf_models
-    load_file:
-
-    optimizer:
-      lr: 3e-3
-      weight_decay: 1e-5
-
-    scheduler:
-      gamma: .99
-
-  lf_model:
-    classifier:
-      type: resnet18 # options: default, mlp, resnet, unet
-      pretrained: true # for type == 'resnet' or type == 'unet'
-      num_layers: 8 # only for type == 'mlp'
-
-    train: true
-    evaluate: true
-
-    save_location: ./lf_models
-    load_file:
-
-    optimizer:
-      lr: 3e-3
-      weight_decay: 1e-5
-
-    scheduler:
-      gamma: .99
+# Removed classifier information from stage1 and stage2
 
 stage2:
   epochs: 200
@@ -81,9 +45,9 @@ stage2:
 
   fe_model:
     type: mlp # options: mlp or svm
-    regularization: 1 # not used if type != svm
-    kernel: rbg # not used if type != svm
-
+    regularization: Optional[float] = Field(None, description="not used if type != svm")
+    kernel: Optional[str] = Field(None, description="not used if type != svm")
+    
     optimizer:
       lr: 3e-3
       weight_decay: 1e-5
@@ -101,6 +65,3 @@ stage2:
     num_steps: 100
     scale: linear
     direction: reversed # normal: 0 -> 1, reversed 1 -> 0
-
-
-

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, Literal, List
+from typing import Optional, Literal, List, Dict
 
 class PerformanceData(BaseModel):
     train: List[float]
@@ -21,26 +21,22 @@ class ToyDatasetParameters(BaseModel):
     num_classes: int
     wrong_class_prob: float
 
-class Augmentation(BaseModel):
-    type: Literal["none", "noise", "blur", "rotation", "degradation"]
+class AugmentationSettings(BaseModel):
+    augmentation: Literal["none", "noise", "blur", "rotation", "degradation"]
     strength: float
     steps: int
     schedule: Literal["linear", "decay"]
 
 class DatasetSettings(BaseModel):
-    name: str
-    augmentations: dict[Literal["high_fidelity", "low_fidelity"], Augmentation]
+    name: Literal["toy", "mnist", "cifar10", "cifar100", "crop"]
+    folder: Optional[str] = None
+    augmentations: Dict[Literal["high_fidelity", "low_fidelity"], AugmentationSettings]
     toy_dataset_parameters: Optional[ToyDatasetParameters] = None
 
 class Parameters(BaseModel):
     latent_representation_size: int
     random_seed: int
     num_reruns: int
-
-class Classifier(BaseModel):
-    type: Literal["default", "mlp", "resnet", "unet"]
-    pretrained: bool
-    num_layers: Optional[int] = None
 
 class Optimizer(BaseModel):
     lr: float
@@ -53,48 +49,32 @@ class EarlyStop(BaseModel):
     patience: int
     min_delta: int
 
-class ModelConfig(BaseModel):
-    classifier: Classifier
-    train: bool
-    evaluate: bool
-    save_location: str
-    load_file: Optional[str] = None
-    optimizer: Optimizer
-    scheduler: Scheduler
-
-class Stage1(BaseModel):
-    epochs: int
-    save_location: Optional[str] = None
-    batch_size: int
-    loss_fun: str
-    early_stop: EarlyStop
-    hf_model: ModelConfig
-    lf_model: ModelConfig
-
 class FeModel(BaseModel):
     type: Literal["mlp", "svm"]
-    regularization: Optional[float] = Field(None, description="not used if type != svm")
-    kernel: Optional[str] = Field(None, description="not used if type != svm")
-    optimizer: Optimizer
-    scheduler: Scheduler
+    
+class Stage1(BaseModel):
+    epochs: int 
+    save_location: Optional[str] = None 
+    batch_size: int 
+    loss_fun: str 
     early_stop: EarlyStop
 
 class RRange(BaseModel):
-    start: int
-    stop: int
-    num_steps: int
-    scale: Literal["linear", "logarithmic"]
-    direction: Literal["reversed", "normal"]
+   start: int 
+   stop: int 
+   num_steps: int 
+   scale: Literal["linear", "logarithmic"] 
+   direction: Literal["reversed", "normal"]
 
 class Stage2(BaseModel):
-    epochs: int
-    save_location: Optional[str] = None
-    batch_size: int
-    fe_model: FeModel
-    r_range: RRange
+   epochs: int 
+   save_location: Optional[str] = None 
+   batch_size: int 
+   fe_model : FeModel 
+   r_range : RRange 
 
 class Options(BaseModel):
-    dataset: DatasetSettings
-    parameters: Parameters
-    stage1: Stage1
-    stage2: Stage2
+   dataset : DatasetSettings 
+   parameters : Parameters 
+   stage1 : Stage1 
+   stage2 : Stage2 
