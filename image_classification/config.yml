@@ -1,0 +1,44 @@
+dataset:
+  name: crop
+  dataset_folder: ../data/multi-temporal-crop-classification
+
+parameters:
+  random_seed: 42
+  num_reruns: 1
+
+stage1:
+  epochs: 200
+  hf_save_location: ../saved_models/hf_models
+  lf_save_location: ../saved_models/lf_models
+  results_save_location: ../results/stage1
+  batch_size: 8
+  loss_fun: CE
+
+  early_stop:
+    patience: 2
+    min_delta: 0
+
+stage2:
+  epochs: 200
+  fe_save_location: ../saved_models/fe_models
+  results_save_location: ../results/stage2
+  batch_size: 128
+
+  fe_model:
+    optimizer:
+      lr: 3e-3
+      weight_decay: 1e-5
+
+    scheduler:
+      gamma: .99
+
+    early_stop:
+      patience: 5
+      min_delta: 0
+
+  r_range:
+    start: 0
+    stop: 1
+    num_steps: 100
+    scale: linear
+    direction: reversed # normal: 0 -> 1, reversed 1 -> 0

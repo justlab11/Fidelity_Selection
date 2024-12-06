@@ -1,6 +1,6 @@
 dataset:
   name: mnist
-  folder: ./data
+  folder: ../data
   augmentations:
     high_fidelity:
       augmentation: none
@@ -14,13 +14,6 @@ dataset:
       steps: 5
       schedule: decay
 
-  toy_dataset_parameters:
-    radius: 1
-    num_dims: 2
-    num_samples: 4000
-    num_classes: 4
-    wrong_class_prob: 0.2
-
 parameters:
   latent_representation_size: 64
   random_seed: 42
@@ -28,8 +21,10 @@ parameters:
 
 stage1:
   epochs: 200
-  save_location: ./stage1
-  batch_size: 32
+  hf_save_location: ../saved_models/hf_models
+  lf_save_location: ../saved_models/lf_models
+  results_save_location: ../results/stage1
+  batch_size: 16
   loss_fun: CE
 
   early_stop:
@@ -40,14 +35,11 @@ stage1:
 
 stage2:
   epochs: 200
-  save_location: ./stage2
+  fe_save_location: ../saved_models/fe_models
+  results_save_location: ../results/stage2
   batch_size: 128
 
   fe_model:
-    type: mlp # options: mlp or svm
-    regularization: Optional[float] = Field(None, description="not used if type != svm")
-    kernel: Optional[str] = Field(None, description="not used if type != svm")
-    
     optimizer:
       lr: 3e-3
       weight_decay: 1e-5

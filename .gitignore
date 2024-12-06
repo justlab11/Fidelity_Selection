@@ -2,7 +2,8 @@ test.ipynb
 venv
 src/__pycache__
 data
-models
+saved_models
 src/hf_models
 src/lf_models
 src/datasets_copy.py
+tests
