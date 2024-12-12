@@ -2,7 +2,7 @@ dataset:
   name: toy
   folder: ../data
 
-  parameters:
+  settings:
     radius: 1
     num_dims: 2
     num_samples: 4000
@@ -27,9 +27,9 @@ parameters:
 
 stage1:
   epochs: 50
-  hf_save_location: ../saved_models/hf_models
-  lf_save_location: ../saved_models/lf_models
-  results_save_location: ../results/stage1
+  hf_save_location: saved_models/hf_models
+  lf_save_location: saved_models/lf_models
+  results_save_location: results/stage1
   batch_size: 128
   loss_fun: CE
 
@@ -39,8 +39,8 @@ stage1:
 
 stage2:
   epochs: 200
-  fe_save_location: ../saved_models/fe_models
-  results_save_location: ../results/stage2
+  fe_save_location: saved_models/fe_models
+  results_save_location: results/stage2
   batch_size: 128
 
   fe_model:

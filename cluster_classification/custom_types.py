@@ -6,11 +6,23 @@ class Augmentation(BaseModel):
     strength: float
     steps: int
 
+class Settings(BaseModel):
+    radius: int
+    num_dims: int
+    num_samples: int
+    num_classes: int
+    wrong_class_prob: float
+
 class Dataset(BaseModel):
     name: str
     folder: str
-    parameters: dict
+    settings: Settings
     augmentations: dict[str, Augmentation]
+
+class Parameters(BaseModel):
+  latent_representation_size: int
+  random_seed: int
+  num_reruns: int
 
 class EarlyStop(BaseModel):
     patience: int
@@ -55,8 +67,8 @@ class Stage2(BaseModel):
     fe_model: FeModel
     r_range: RRange
 
-class Config(BaseModel):
+class ClusterClassificationConfig(BaseModel):
     dataset: Dataset
-    parameters: dict
+    parameters: Parameters
     stage1: Stage1
     stage2: Stage2

@@ -49,7 +49,7 @@ class Stage2(BaseModel):
     fe_model: FeModel
     r_range: RRange
 
-class Config(BaseModel):
+class ImageClassificationConfig(BaseModel):
     dataset: Dataset
     parameters: Parameters
     stage1: Stage1

@@ -2,20 +2,20 @@ import numpy as np
 import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, Subset
-
+from custom_types import ClusterClassificationConfig, Augmentation
 
 class HypercubeDataset:
-    def __init__(self, config: Options, val_split=0.2, test_split=0.2, random_seed=42):
+    def __init__(self, config: ClusterClassificationConfig, val_split=0.2, test_split=0.2, random_seed=42):
         
-        self.config: Options = config
+        self.config: ClusterClassificationConfig = config
 
-        toy_dataset_parameters = self.config.dataset.toy_dataset_parameters
+        toy_dataset_parameters = self.config.dataset.settings
 
         self.N_dim = toy_dataset_parameters.num_dims
         self.N_samples = toy_dataset_parameters.num_samples
         self.N_classes = toy_dataset_parameters.num_classes
         self.radius = toy_dataset_parameters.radius
-        self.noise_level = self.config.dataset.augmentation_level
+        self.noise_level = self.config.dataset.augmentations["low_fidelity"].strength
         self.wrong_class_prob = toy_dataset_parameters.wrong_class_prob
 
         self.val_split = val_split
@@ -97,4 +97,4 @@ class HypercubeSubset(Dataset):
     def __getitem__(self, idx):
         clean_sample = self.data[idx]
         noisy_sample = clean_sample + torch.randn_like(clean_sample) * self.noise_level
-        return self.labels[idx], clean_sample, noisy_sample
+        return noisy_sample, clean_sample, self.labels[idx]
