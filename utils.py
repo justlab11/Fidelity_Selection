@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader, Subset
 from torchvision.models.feature_extraction import create_feature_extractor
-from cluster_classification.custom_types import ClusterClassificationConfig
+from cluster_classification.custom_types import ClusterClassificationConfig, EarlyStop
 from image_classification.custom_types import ImageClassificationConfig
 from image_segmentation.custom_types import ImageSegmentationConfig
 import yaml
@@ -80,19 +80,19 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
             target = target.type(torch.LongTensor)
             target = target.to(device)
 
-            outputs = model(lf_embeddings)
-            preds = torch.stack([
-                lf_preds,
-                hf_preds
-            ])
+            fe_output = model(lf_embeddings)
+            # preds = torch.stack([
+            #     lf_preds,
+            #     hf_preds
+            # ])
 
-            loss = criterion(target, preds, outputs)
+            loss = criterion(fe_output, lf_preds, hf_preds, target)
             if optimizer:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-            choices = torch.argmax(outputs, dim=1)
+            choices = torch.argmax(fe_output, dim=1)
             lf_acc = torch.argmax(lf_preds, dim=1) == target
             hf_acc = torch.argmax(hf_preds, dim=1) == target
 
@@ -146,9 +146,9 @@ class EarlyStopper:
                 return True
         return False
 
-def config_early_stop(config: Union[ClusterClassificationConfig, ImageClassificationConfig, ImageSegmentationConfig]):
-    patience = config.stage1.early_stop.patience
-    min_delta = config.stage1.early_stop.min_delta
+def config_early_stop(early_stop: EarlyStop):
+    patience = early_stop.patience
+    min_delta = early_stop.min_delta
 
     early_stopper = EarlyStopper(
         patience=patience,
@@ -176,3 +176,37 @@ def build_mlp(input_size, num_layers, output_size, hidden_size=64, device='cpu')
     model = nn.Sequential(*layers).to(device)
     
     return model
+
+def generate_r_range(start, stop, num_steps, scale="linear", direction="normal"):
+    """
+    Generate an array of values based on the r_range configuration.
+
+    Parameters:
+        start (float): The starting value of the range.
+        stop (float): The ending value of the range.
+        num_steps (int): The number of values in the range.
+        scale (str): The scale of the range ('linear', 'exponential', or 'logarithmic').
+        direction (str): The direction of the range ('normal' or 'reversed').
+
+    Returns:
+        numpy.ndarray: The generated range of values.
+    """
+    if scale == "linear":
+        values = np.linspace(start, stop, num_steps)
+    elif scale == "exponential":
+        # Exponential scaling: values grow exponentially between start and stop
+        values = np.logspace(np.log10(start), np.log10(stop), num_steps)
+    elif scale == "logarithmic":
+        # Logarithmic scaling: values are spaced logarithmically between start and stop
+        # Ensure start > 0 for logarithmic scaling
+        if start <= 0 or stop <= 0:
+            raise ValueError("Start and stop must be greater than 0 for logarithmic scaling.")
+        values = np.logspace(np.log10(start), np.log10(stop), num_steps)
+    else:
+        raise ValueError(f"Invalid scale: {scale}. Choose 'linear', 'exponential', or 'logarithmic'.")
+
+    # Reverse the order if direction is 'reversed'
+    if direction == "reversed":
+        values = values[::-1]
+
+    return values

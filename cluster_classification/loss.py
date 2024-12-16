@@ -40,7 +40,10 @@ class FidelityEvaluationLoss(nn.Module):
 
     def calculate_binary_accuracy(self, pred, target):
         pred_logit = torch.argmax(pred, dim=1)
-        target_logit = torch.argmax(target, dim=1)
+        try:
+            target_logit = torch.argmax(target, dim=1)
+        except:
+            target_logit = target
 
         return pred_logit == target_logit
     

@@ -13,8 +13,9 @@ from torchvision.models.feature_extraction import create_feature_extractor
 import sys
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
-from dataset import HypercubeDataset
-from utils import load_yaml_options, build_mlp, classifier_one_run, config_early_stop
+from dataset import HypercubeDataset, FidelityDataset
+from loss import FidelityEvaluationLoss
+from utils import load_yaml_options, build_mlp, classifier_one_run, config_early_stop, generate_r_range
 
 from custom_types import ClusterClassificationConfig, Augmentation
 
@@ -74,7 +75,7 @@ def main(config_file):
     print("Training LF Model...")
 
     if not path.exists(lf_model_save_name+".pt"):
-        lf_early_stopper = config_early_stop(config)
+        lf_early_stopper = config_early_stop(config.stage1.early_stop)
         lf_optimizer = torch.optim.Adam(
             lf_model.parameters(),
             lr=3e-3,
@@ -104,8 +105,6 @@ def main(config_file):
             print(train_acc, val_acc)
             if lf_early_stopper.early_stop(val_loss):
                 break
-        
-        final_acc = round(val_acc*100, 2)
 
         torch.save(lf_model.state_dict(), lf_model_save_name+".pt")
         # with open(lf_model_save_name+"_meta.json", "w") as json_file:
@@ -119,7 +118,7 @@ def main(config_file):
     print("Training HF Model...")
 
     if not path.exists(hf_model_save_name+".pt"):
-        hf_early_stopper = config_early_stop(config)
+        hf_early_stopper = config_early_stop(config.stage1.early_stop)
         hf_optimizer = torch.optim.Adam(
             hf_model.parameters(),
             lr=3e-3,
@@ -168,24 +167,89 @@ def main(config_file):
     results_save_location: str = config.stage2.results_save_location
     batch_size: int = config.stage2.batch_size
 
-    fe_model = build_mlp(
-        input_size=latent_size,
-        num_layers=4,
-        output_size=2,
-        hidden_size=latent_size
-    )
-
-    second_to_last_layer_index = 2 * 4 - 2  # Multiply by 2 because of ReLU layers
-    second_to_last_layer_name = str(second_to_last_layer_index)
-
-    return_nodes = {second_to_last_layer_name: 'output'}
+    return_nodes = {"3": 'output'}
     lf_latent_space_model = create_feature_extractor(
         lf_model,
         return_nodes=return_nodes
     )
 
-    for epoch in range(num_epochs):
+    fe_train_set = FidelityDataset(
+        lf_latent_model=lf_latent_space_model,
+        lf_model = lf_model,
+        hf_model = hf_model,
+        dataset = train_set
+    )
+    fe_test_set = FidelityDataset(
+        lf_latent_model=lf_latent_space_model,
+        lf_model = lf_model,
+        hf_model = hf_model,
+        dataset = test_set
+    )
+    fe_val_set = FidelityDataset(
+        lf_latent_model=lf_latent_space_model,
+        lf_model = lf_model,
+        hf_model = hf_model,
+        dataset = val_set
+    )
+
+    fe_train_loader: DataLoader = DataLoader(fe_train_set, batch_size=batch_size, shuffle=True)
+    fe_test_loader: DataLoader = DataLoader(fe_test_set, batch_size=batch_size)
+    fe_val_loader: DataLoader = DataLoader(fe_val_set, batch_size=batch_size)
+
+    r_values = generate_r_range(
+        start = config.stage2.r_range.start,
+        stop = config.stage2.r_range.stop,
+        num_steps = config.stage2.r_range.num_steps,
+        scale = config.stage2.r_range.scale,
+        direction = config.stage2.r_range.direction
+    )
+
+    for r_val in r_values:
+        fe_model_save_name = f"fe_model_{round(r_val, 3)}"
+        fe_model_save_name = path.join(fe_save_location, fe_model_save_name)
+
+        fe_model = build_mlp(
+            input_size=latent_size,
+            num_layers=4,
+            output_size=2,
+            hidden_size=latent_size
+        )
+
+        fe_optimizer = torch.optim.Adam(
+            fe_model.parameters(),
+            lr=config.stage2.fe_model.optimizer.lr,
+            weight_decay=config.stage2.fe_model.optimizer.weight_decay
+        )
+
+        criterion = FidelityEvaluationLoss(
+            num_classes=output_size,
+            r=r_val
+        )
+
+        fe_early_stop = config_early_stop(config.stage2.fe_model.early_stop)
+
+        for epoch in range(num_epochs):
+            train_loss, train_acc, train_use = classifier_one_run(fe_model, fe_train_loader, criterion, fidelity="gate", optimizer=fe_optimizer)
+            test_loss, test_acc, test_use = classifier_one_run(fe_model, fe_test_loader, criterion, fidelity="gate")
+            val_loss, val_acc, val_use = classifier_one_run(fe_model, fe_val_loader, criterion, fidelity="gate")
+
+            # hf_metadata["loss"]["train"].append(train_loss)
+            # hf_metadata["loss"]["test"].append(test_loss)
+            # hf_metadata["loss"]["val"].append(val_loss)
+
+            # hf_metadata["acc"]["train"].append(train_acc)
+            # hf_metadata["acc"]["test"].append(test_acc)
+            # hf_metadata["acc"]["val"].append(val_acc)
+
+            print(train_acc, val_acc, val_use)
+            if fe_early_stop.early_stop(val_loss):
+                break
         
+        final_acc = round(val_acc*100, 2)
+
+        torch.save(fe_model.state_dict(), fe_model_save_name+".pt")
+        # with open(lf_model_save_name+"_meta.json", "w") as json_file:
+        #     json.dump(lf_metadata, json_file, indent=4)
 
 if __name__ == "__main__":
     main()
