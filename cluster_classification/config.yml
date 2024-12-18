@@ -23,7 +23,7 @@ dataset:
 parameters:
   latent_representation_size: 16
   random_seed: 42
-  num_reruns: 5
+  num_reruns: 20
 
 stage1:
   epochs: 50
@@ -38,10 +38,10 @@ stage1:
     min_delta: 0
 
 stage2:
-  epochs: 200
+  epochs: 100
   fe_save_location: saved_models/fe_models
   results_save_location: results/stage2
-  batch_size: 128
+  batch_size: 4096
 
   fe_model:
     type: mlp # options: mlp or svm
@@ -56,12 +56,12 @@ stage2:
       gamma: .99
 
     early_stop:
-      patience: 5
-      min_delta: 0
+      patience: 10
+      min_delta: 1e-4
 
   r_range:
-    start: 0
-    stop: 1
-    num_steps: 100
+    start: .1
+    stop: .3
+    num_steps: 500
     scale: linear
-    direction: reversed # normal: 0 -> 1, reversed 1 -> 0
+    direction: normal # normal: 0 -> 1, reversed 1 -> 0

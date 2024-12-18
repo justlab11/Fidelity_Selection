@@ -7,3 +7,5 @@ src/hf_models
 src/lf_models
 src/datasets_copy.py
 tests
+__pycache__
+results

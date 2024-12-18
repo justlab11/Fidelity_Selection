@@ -53,8 +53,8 @@ class FeModel(BaseModel):
     early_stop: EarlyStop
 
 class RRange(BaseModel):
-    start: int
-    stop: int
+    start: float
+    stop: float
     num_steps: int
     scale: str
     direction: Literal["normal", "reversed"]

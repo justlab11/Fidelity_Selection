@@ -99,26 +99,51 @@ class HypercubeSubset(Dataset):
         noisy_sample = clean_sample + torch.randn_like(clean_sample) * self.noise_level
         return noisy_sample, clean_sample, self.labels[idx]
 
+# class FidelityDataset(Dataset):
+#     def __init__(self, lf_latent_model, lf_model, hf_model, dataset):
+#         self.lf_latent_model = lf_latent_model
+#         self.lf_model = lf_model
+#         self.hf_model = hf_model
+#         self.dataset = dataset
+#         self.device = next(lf_latent_model.parameters()).device  
+
+#     def __len__(self):
+#         return len(self.dataset)
+    
+#     def __getitem__(self, idx):
+#         noisy_sample, clean_sample, label = self.dataset[idx]
+#         noisy_sample = noisy_sample.to(self.device)
+#         clean_sample = clean_sample.to(self.device)
+#         label = label.to(self.device)
+
+#         with torch.no_grad():
+#             latent_rep = self.lf_latent_model(noisy_sample)['output']
+#             lf_output = self.lf_model(noisy_sample)
+#             hf_output = self.hf_model(clean_sample)
+
+#         return latent_rep, lf_output, hf_output, label
+    
+
 class FidelityDataset(Dataset):
     def __init__(self, lf_latent_model, lf_model, hf_model, dataset):
-        self.lf_latent_model = lf_latent_model
-        self.lf_model = lf_model
-        self.hf_model = hf_model
-        self.dataset = dataset
         self.device = next(lf_latent_model.parameters()).device
+        self.preloaded_data = []
+
+        # Preload all data
+        for noisy_sample, clean_sample, label in dataset:
+            noisy_sample = noisy_sample.to(self.device)
+            clean_sample = clean_sample.to(self.device)
+            label = label.to(self.device)
+
+            with torch.no_grad():
+                latent_rep = lf_latent_model(noisy_sample)['output']
+                lf_output = lf_model(noisy_sample)
+                hf_output = hf_model(clean_sample)
+
+            self.preloaded_data.append((latent_rep, lf_output, hf_output, label))
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.preloaded_data)
     
     def __getitem__(self, idx):
-        noisy_sample, clean_sample, label = self.dataset[idx]
-        noisy_sample = noisy_sample.to(self.device)
-        clean_sample = clean_sample.to(self.device)
-        label = label.to(self.device)
-
-        with torch.no_grad():
-            latent_rep = self.lf_latent_model(noisy_sample)['output']
-            lf_output = self.lf_model(noisy_sample)
-            hf_output = self.hf_model(clean_sample)
-
-        return latent_rep, lf_output, hf_output, label
+        return self.preloaded_data[idx]
