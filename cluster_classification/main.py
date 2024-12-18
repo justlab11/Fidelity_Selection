@@ -1,5 +1,6 @@
 import sys
 import os.path as path
+import os
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
 import matplotlib.pyplot as plt
@@ -61,6 +62,13 @@ def main(config_file):
     num_epochs: int = config.stage1.epochs
     lf_save_location: str = config.stage1.lf_save_location
     hf_save_location: str = config.stage1.hf_save_location
+
+    if not path.exists(lf_save_location):
+        os.makedirs(lf_save_location)
+
+    if not path.exists(hf_save_location):
+        os.makedirs(hf_save_location)
+
     results_save_location: str = config.stage1.results_save_location
 
     lf_model_save_name: str = f"cluster_{input_size}_{output_size}_{latent_size}-{lf_dataset_augmentation.augmentation}_{lf_dataset_augmentation.strength}_{lf_dataset_augmentation.steps}"

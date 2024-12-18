@@ -9,7 +9,6 @@ from image_segmentation.custom_types import ImageSegmentationConfig
 import yaml
 from typing import Union
 from os import path
-from datasets import *
 
 
 def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
