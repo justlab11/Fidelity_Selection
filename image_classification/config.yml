@@ -10,12 +10,12 @@ dataset:
 
     low_fidelity:
       augmentation: noise
-      strength: 0.5
+      strength: 1
       steps: 5
       schedule: decay
 
 parameters:
-  latent_representation_size: 64
+  latent_representation_size: 128
   random_seed: 42
   num_reruns: 1
 
@@ -24,7 +24,7 @@ stage1:
   hf_save_location: ../saved_models/hf_models
   lf_save_location: ../saved_models/lf_models
   results_save_location: ../results/stage1
-  batch_size: 16
+  batch_size: 32
   loss_fun: CE
 
   early_stop:

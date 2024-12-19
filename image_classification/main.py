@@ -21,7 +21,7 @@ from custom_types import ImageClassificationConfig, Augmentation
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 @click.command()
-@click.option("--config_file", default="image_classification/config.yml")
+@click.option("--config_file", default="config.yml")
 def main(config_file):
     config: ImageClassificationConfig = load_yaml_options(config_file, dataset="image_classification")
 
@@ -95,7 +95,7 @@ def main(config_file):
             criterion = torch.nn.MSELoss()
 
         # lf_metadata = build_metadata(config)
-        best_val_loss = 1000
+        best_val_loss = 100000
 
         for epoch in range(num_epochs):
             train_loss, train_acc = classifier_one_run(lf_model, train_loader, criterion, fidelity="lf", optimizer=lf_optimizer)
@@ -110,8 +110,9 @@ def main(config_file):
             # hf_metadata["acc"]["test"].append(test_acc)
             # hf_metadata["acc"]["val"].append(val_acc)
 
-            print(train_acc, val_acc)
+            print(val_loss, round(train_acc, 4)*100, round(val_acc, 4)*100)
             if (val_loss < best_val_loss):
+                best_val_loss = val_loss
                 torch.save(lf_model.state_dict(), lf_model_save_name+".pt")
 
             if lf_early_stopper.early_stop(val_loss):
@@ -158,8 +159,9 @@ def main(config_file):
             # hf_metadata["acc"]["test"].append(test_acc)
             # hf_metadata["acc"]["val"].append(val_acc)
 
-            print(train_acc, val_acc)
+            print(val_loss, round(train_acc, 4)*100, round(val_acc, 4)*100)
             if (val_loss < best_val_loss):
+                best_val_loss = val_loss
                 torch.save(hf_model.state_dict(), hf_model_save_name+".pt")
 
             if hf_early_stopper.early_stop(val_loss):
@@ -270,6 +272,7 @@ def main(config_file):
                 # hf_metadata["acc"]["val"].append(val_acc)
 
                 if (val_loss < best_val_loss):
+                    best_val_loss = val_loss
                     # print(val_loss, round(train_acc, 4)*100, round(val_acc, 4)*100, round(val_use, 4)*100)
                     r_value_ranges[r_val_str][n] = [val_loss, val_acc, val_use]
                     # torch.save(fe_model.state_dict(), fe_model_save_name+".pt")

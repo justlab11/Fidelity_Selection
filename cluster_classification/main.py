@@ -110,6 +110,7 @@ def main(config_file):
 
             print(train_acc, val_acc)
             if (val_loss < best_val_loss):
+                best_val_loss = val_loss
                 torch.save(lf_model.state_dict(), lf_model_save_name+".pt")
 
             if lf_early_stopper.early_stop(val_loss):
@@ -159,6 +160,7 @@ def main(config_file):
 
             print(train_acc, val_acc)
             if (val_loss < best_val_loss):
+                best_val_loss = val_loss
                 torch.save(hf_model.state_dict(), hf_model_save_name+".pt")
 
             if hf_early_stopper.early_stop(val_loss):
@@ -270,6 +272,7 @@ def main(config_file):
                 # hf_metadata["acc"]["val"].append(val_acc)
 
                 if (val_loss < best_val_loss):
+                    best_val_loss = val_loss
                     # print(val_loss, round(train_acc, 4)*100, round(val_acc, 4)*100, round(val_use, 4)*100)
                     r_value_ranges[r_val_str][n] = [val_loss, val_acc, val_use]
                     # torch.save(fe_model.state_dict(), fe_model_save_name+".pt")
