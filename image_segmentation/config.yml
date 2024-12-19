@@ -1,21 +1,8 @@
 dataset:
-  name: mnist
-  folder: ../data
-  augmentations:
-    high_fidelity:
-      augmentation: none
-      strength: 0
-      steps: 0
-      schedule: linear
-
-    low_fidelity:
-      augmentation: noise
-      strength: 0.5
-      steps: 5
-      schedule: decay
+  name: crop
+  dataset_folder: ../data/multi-temporal-crop-classification
 
 parameters:
-  latent_representation_size: 64
   random_seed: 42
   num_reruns: 1
 
@@ -24,14 +11,12 @@ stage1:
   hf_save_location: ../saved_models/hf_models
   lf_save_location: ../saved_models/lf_models
   results_save_location: ../results/stage1
-  batch_size: 16
+  batch_size: 8
   loss_fun: CE
 
   early_stop:
     patience: 2
     min_delta: 0
-
-# Removed classifier information from stage1 and stage2
 
 stage2:
   epochs: 200

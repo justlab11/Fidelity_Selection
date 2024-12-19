@@ -1,11 +1,19 @@
-from typing import Literal
-from pydantic import BaseModel
+from typing import Literal, Optional
+from pydantic import BaseModel, Field
+
+class Augmentation(BaseModel):
+    augmentation: str
+    strength: float
+    steps: int
+    schedule: str
 
 class Dataset(BaseModel):
     name: str
-    dataset_folder: str
+    folder: str
+    augmentations: dict[str, Augmentation]
 
 class Parameters(BaseModel):
+    latent_representation_size: int
     random_seed: int
     num_reruns: int
 
@@ -49,7 +57,7 @@ class Stage2(BaseModel):
     fe_model: FeModel
     r_range: RRange
 
-class ImageClassificationConfig(BaseModel):
+class ImageSegmentationConfig(BaseModel):
     dataset: Dataset
     parameters: Parameters
     stage1: Stage1
