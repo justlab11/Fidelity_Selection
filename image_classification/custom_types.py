@@ -43,8 +43,8 @@ class FeModel(BaseModel):
     early_stop: EarlyStop
 
 class RRange(BaseModel):
-    start: int
-    stop: int
+    start: float
+    stop: float
     num_steps: int
     scale: str
     direction: Literal["normal", "reversed"]
@@ -57,7 +57,7 @@ class Stage2(BaseModel):
     fe_model: FeModel
     r_range: RRange
 
-class ImageSegmentationConfig(BaseModel):
+class ImageClassificationConfig(BaseModel):
     dataset: Dataset
     parameters: Parameters
     stage1: Stage1

@@ -37,7 +37,7 @@ stage2:
   epochs: 200
   fe_save_location: ../saved_models/fe_models
   results_save_location: ../results/stage2
-  batch_size: 128
+  batch_size: 4096
 
   fe_model:
     optimizer:
@@ -52,8 +52,8 @@ stage2:
       min_delta: 0
 
   r_range:
-    start: 0
-    stop: 1
+    start: 0.0
+    stop: 1.0
     num_steps: 100
     scale: linear
     direction: reversed # normal: 0 -> 1, reversed 1 -> 0

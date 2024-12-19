@@ -14,15 +14,16 @@ from torchvision.models.feature_extraction import create_feature_extractor
 from dataset import DualFidelityDataset, FidelityDataset
 from loss import FidelityEvaluationLoss
 from utils import load_yaml_options, build_mlp, classifier_one_run, config_early_stop, generate_r_range
+from model import build_resnet
 
-from custom_types import ClusterClassificationConfig, Augmentation
+from custom_types import ImageClassificationConfig, Augmentation
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 @click.command()
-@click.option("--config_file", default="cluster_classification/config.yml")
+@click.option("--config_file", default="image_classification/config.yml")
 def main(config_file):
-    config: ClusterClassificationConfig = load_yaml_options(config_file, dataset="image_classification")
+    config: ImageClassificationConfig = load_yaml_options(config_file, dataset="image_classification")
 
     dataset: DualFidelityDataset = DualFidelityDataset(
         config=config,
@@ -37,25 +38,23 @@ def main(config_file):
     test_loader: DataLoader = DataLoader(test_set, batch_size=batch_size)
     val_loader: DataLoader = DataLoader(val_set, batch_size=batch_size)
 
-    input_size: int = config.dataset.settings.num_dims
-    output_size: int = config.dataset.settings.num_classes
-    latent_size: int = config.parameters.latent_representation_size
+    dataset_name = config.dataset.name
+    latent_size = config.parameters.latent_representation_size
+    if dataset_name == "cifar100":
+        output_size = 100
+    else:
+        output_size = 10
 
-    hf_dataset_augmentation: Augmentation = config.dataset.augmentations["high_fidelity"]
-    lf_dataset_augmentation: Augmentation = config.dataset.augmentations["low_fidelity"]
-
-    lf_model = build_mlp(
-        input_size=input_size,
-        num_layers=2,
+    lf_model = build_resnet(
+        latent_size=latent_size,
         output_size=output_size,
-        hidden_size=latent_size
+        device=DEVICE
     )
 
-    hf_model = build_mlp(
-        input_size=input_size,
-        num_layers=2,
+    hf_model = build_resnet(
+        latent_size=latent_size,
         output_size=output_size,
-        hidden_size=latent_size
+        device=DEVICE
     )
 
     # start training classifiers
@@ -70,11 +69,14 @@ def main(config_file):
         os.makedirs(hf_save_location)
 
     results_save_location: str = config.stage1.results_save_location
+    
+    hf_augment = config.dataset.augmentations["high_fidelity"]
+    lf_augment = config.dataset.augmentations["low_fidelity"]
 
-    lf_model_save_name: str = f"cluster_{input_size}_{output_size}_{latent_size}-{lf_dataset_augmentation.augmentation}_{lf_dataset_augmentation.strength}_{lf_dataset_augmentation.steps}"
+    lf_model_save_name: str = f"image_class_{dataset_name}_{latent_size}-{lf_augment.augmentation}_{lf_augment.strength}"
     lf_model_save_name = path.join(lf_save_location, lf_model_save_name)
 
-    hf_model_save_name: str = f"cluster_{input_size}_{output_size}_{latent_size}-{hf_dataset_augmentation.augmentation}_{hf_dataset_augmentation.strength}_{hf_dataset_augmentation.steps}"
+    hf_model_save_name: str = f"image_class_{dataset_name}_{latent_size}-{hf_augment.augmentation}_{hf_augment.strength}"
     hf_model_save_name = path.join(hf_save_location, hf_model_save_name)
 
     print("Training LF Model...")
@@ -118,10 +120,9 @@ def main(config_file):
         # with open(lf_model_save_name+"_meta.json", "w") as json_file:
         #     json.dump(lf_metadata, json_file, indent=4)
     
-    else:
-        lf_model.load_state_dict(
-            torch.load(lf_model_save_name+".pt", weights_only=True)
-        )
+    lf_model.load_state_dict(
+        torch.load(lf_model_save_name+".pt", weights_only=True)
+    )
 
     _, lf_acc = classifier_one_run(lf_model, val_loader, torch.nn.CrossEntropyLoss(), fidelity="lf")
     print(f"Final LF Accuracy: {lf_acc*100}%")
@@ -167,10 +168,9 @@ def main(config_file):
         # with open(lf_model_save_name+"_meta.json", "w") as json_file:
         #     json.dump(lf_metadata, json_file, indent=4)
 
-    else:
-        hf_model.load_state_dict(
-            torch.load(hf_model_save_name+".pt", weights_only=True)
-        )
+    hf_model.load_state_dict(
+        torch.load(hf_model_save_name+".pt", weights_only=True)
+    )
 
     _, hf_acc = classifier_one_run(hf_model, val_loader, torch.nn.CrossEntropyLoss(), fidelity="hf")
     print(f"Final HF Accuracy: {hf_acc*100}%")
@@ -279,7 +279,7 @@ def main(config_file):
         
             print(r_value_ranges[r_val_str][n])
 
-        with open(path.join(results_save_location, "fe_metadata_toy4.json"), "w") as json_file:
+        with open(path.join(results_save_location, "fe_metadata_image_class.json"), "w") as json_file:
             json.dump(r_value_ranges, json_file, indent=4)
 
     
