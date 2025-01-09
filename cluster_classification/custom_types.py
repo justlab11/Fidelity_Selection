@@ -64,6 +64,7 @@ class Stage2(BaseModel):
     fe_save_location: str
     results_save_location: str
     batch_size: int
+    loss: Literal["fe_original", "fe_alternative"]
     fe_model: FeModel
     r_range: RRange
 

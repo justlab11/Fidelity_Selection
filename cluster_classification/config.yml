@@ -39,9 +39,10 @@ stage1:
 
 stage2:
   epochs: 100
-  fe_save_location: saved_models/fe_models
+  fe_save_location: saved_models/fe_models_alt
   results_save_location: results/stage2
   batch_size: 4096
+  loss: fe_alternative
 
   fe_model:
     type: mlp # options: mlp or svm

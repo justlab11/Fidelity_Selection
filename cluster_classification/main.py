@@ -241,7 +241,8 @@ def main(config_file):
                 input_size=latent_size,
                 num_layers=4,
                 output_size=2,
-                hidden_size=latent_size
+                hidden_size=latent_size,
+                device=DEVICE
             )
 
             fe_optimizer = torch.optim.Adam(
@@ -282,7 +283,7 @@ def main(config_file):
         
             print(r_value_ranges[r_val_str][n])
 
-        with open(path.join(results_save_location, "fe_metadata_toy4.json"), "w") as json_file:
+        with open(path.join(results_save_location, "fe_metadata_toy6.json"), "w") as json_file:
             json.dump(r_value_ranges, json_file, indent=4)
 
     
