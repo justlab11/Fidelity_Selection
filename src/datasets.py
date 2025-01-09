@@ -7,6 +7,10 @@ from PIL import Image, ImageFilter
 from sklearn.model_selection import train_test_split
 from torchvision.models import ResNet18_Weights
 from custom_types import Options
+import glob
+import os.path as path
+import tifffile as tif
+import cv2
 
 class HypercubeDataset:
     def __init__(self, config: Options, val_split=0.2, test_split=0.2, random_seed=42):
@@ -103,15 +107,17 @@ class HypercubeSubset(Dataset):
         noisy_sample = clean_sample + torch.randn_like(clean_sample) * self.noise_level
         return self.labels[idx], clean_sample, noisy_sample
 
-
 class DualFidelityDataset:
-    def __init__(self, config, data_folder="./data", 
+    def __init__(self, config: Options, data_folder="./data", 
                  val_split=0.5, random_seed=42):
         
-
+        self.config = config
         self.dataset_name = config.dataset.name.lower()
         self.augmentation = config.dataset.augmentation.lower()
         self.augmentation_level = config.dataset.augmentation_level
+
+        self.folder = config.dataset.folder
+
         self.val_split = val_split
         self.random_seed = random_seed
 
@@ -134,13 +140,30 @@ class DualFidelityDataset:
         if self.dataset_name == 'mnist':
             self.train_dataset = datasets.MNIST(root=data_folder, train=True, download=True)
             self.test_dataset = datasets.MNIST(root=data_folder, train=False, download=True)
+
         elif self.dataset_name == 'cifar10':
             self.train_dataset = datasets.CIFAR10(root=data_folder, train=True, download=True)
             self.test_dataset = datasets.CIFAR10(root=data_folder, train=False, download=True)
+
         elif self.dataset_name == 'cifar100':
             self.train_dataset = datasets.CIFAR100(root=data_folder, train=True, download=True)
             self.test_dataset = datasets.CIFAR100(root=data_folder, train=False, download=True)
-        
+
+        elif self.dataset_name == 'crop':
+            all_train_files = glob.glob(
+                path.join(self.folder, "training_chips/*")
+            )
+            train_files = [file for file in all_train_files if not path.basename(file).startswith(".")]
+
+            all_val_files = glob.glob(
+                path.join(self.folder, "validation_chips/*")
+            )
+            val_files = [file for file in all_val_files if not path.basename(file).startswith(".")]
+
+            self.train_dataset = CropClassificationDataset(train_files)
+            self.test_dataset = CropClassificationDataset(val_files)            
+            
+                
         # Split test set into test and validation sets
         test_indices = list(range(len(self.test_dataset)))
         val_indices, test_indices = train_test_split(
@@ -156,23 +179,28 @@ class DualFidelityDataset:
         self.test_data = torch.utils.data.Subset(self.test_dataset, test_indices)
 
     def train(self):
-        return AugmentedDataset(self.train_data, self.augmentation, self.augmentation_level)
+        return AugmentedDataset(self.train_data, self.config)
 
     def val(self):
-        return AugmentedDataset(self.val_data, self.augmentation, self.augmentation_level)
+        return AugmentedDataset(self.val_data, self.config)
 
     def test(self):
-        return AugmentedDataset(self.test_data, self.augmentation, self.augmentation_level)
+        return AugmentedDataset(self.test_data, self.config)
+
 
 class AugmentedDataset(Dataset):
-    def __init__(self, base_dataset, augmentation, degree):
+    def __init__(self, base_dataset, config: Options):
         self.base_dataset = base_dataset
-        self.augmentation = augmentation
-        self.degree = degree
+
+        self.hf_aug_info = config.dataset.augmentations.high_fidelity
+        self.lf_aug_info = config.dataset.augmentations.low_fidelity
 
         # ResNet18 preprocessing
         weights = ResNet18_Weights.DEFAULT
-        self.preprocess = weights.transforms()
+        if config.dataset.name in ["mnist", "cifar10", "cifar100"]: 
+            self.preprocess = weights.transforms()
+        else:
+            self.preprocess = transforms.ToTensor()
 
     def __len__(self):
         return len(self.base_dataset)
@@ -217,19 +245,62 @@ class AugmentedDataset(Dataset):
     def random_rotate(self, image):
         angle = np.random.uniform(-self.degree, self.degree)
         return image.rotate(angle)
-    
 
-class QE_Dataset(Dataset):
-    def __init__(self, lf_embeddings, lf_preds, hf_preds, labels):
-        super(QE_Dataset, self).__init__()
 
-        self.lf_embeddings = lf_embeddings
-        self.lf_preds = lf_preds
-        self.hf_preds = hf_preds
-        self.labels = labels
+class CropClassificationDataset(Dataset):
+    def __init__(self, files, num_subsamples=8):
+        self.num_subsamples = num_subsamples
+        base_names = set()
+
+        # First pass: Collect all base names
+        for filename in files:
+            if filename.endswith('_merged.tif'):
+                base_name = filename[:-11]  # Remove '_merged.tif'
+                base_names.add(base_name)
+            elif filename.endswith('.mask.tif'):
+                base_name = filename[:-9]  # Remove '.mask.tif'
+                base_names.add(base_name)
+
+        self.samples = []
+
+        for base_name in base_names:
+            img_name = base_name + "_merged.tif"
+            mask_name = base_name + ".mask.tif"
+            if not path.exists(img_name):
+                raise FileNotFoundError(f"No file named {img_name}")
+            
+            if not path.exists(mask_name):
+                raise FileNotFoundError(f"No file named {mask_name}")
+            
+            # Pre-define subsections and layouts for each sample
+            for _ in range(self.num_subsamples * 3):
+                layout = np.random.randint(0, 3)
+                subsection = np.random.randint(0, 224 - 56 + 1, 2)
+                self.samples.append({
+                    'img_file': img_name,
+                    'mask_file': mask_name,
+                    'layout': layout,
+                    'subsection': subsection
+                })
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        img_file = sample['img_file']
+        mask_file = sample['mask_file']
+        layout = sample['layout']
+        subsection = sample['subsection']
 
-    def __getitem__(self, idx:int):
-        return self.lf_embeddings[idx], self.lf_preds[idx], self.hf_preds[idx], self.labels[idx]
+        img = tif.imread(img_file).reshape(224, 224, 6, 3)
+        mask = tif.imread(mask_file)
+
+        img = img[subsection[0]:subsection[0]+56, subsection[1]:subsection[1]+56, :, layout]
+        mask = mask[subsection[0]:subsection[0]+56, subsection[1]:subsection[1]+56]
+
+        img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_LINEAR)
+        img /= np.max(img)
+        mask = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_NEAREST)
+
+        return img, mask

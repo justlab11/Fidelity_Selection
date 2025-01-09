@@ -4,7 +4,7 @@ import numpy as np
 from torch.utils.data import DataLoader, Subset
 from torchvision.models.feature_extraction import create_feature_extractor
 from models import build_mlp, build_resnet
-from custom_types import Options
+from custom_types import Options, MetaData, PerformanceData
 import yaml
 from os import path
 from datasets import *
@@ -372,3 +372,26 @@ class EarlyStopper:
             if self.counter >= self.patience:
                 return True
         return False
+    
+def build_metadata(config: Options):
+    augmentation = config.dataset.augmentation
+    dataset = config.dataset.name
+    aug_deg = config.dataset.augmentation_level
+
+    metadata = MetaData(
+        loss = PerformanceData(
+            train = [],
+            test = [],
+            val = []
+        ),
+        acc = PerformanceData(
+            train = [],
+            test = [],
+            val = []
+        ),
+        augmentation = augmentation,
+        augmentation_degree = aug_deg,
+        dataset = dataset
+    )
+
+    return metadata

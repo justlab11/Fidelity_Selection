@@ -1,0 +1,100 @@
+from typing import *
+import torch
+import torch.nn as nn
+
+class FidelityEvaluationLoss(nn.Module):
+    def __init__(self, num_classes, r, measurement="binary_accuracy", device="cpu"):
+        super(FidelityEvaluationLoss, self).__init__()
+
+        measure_funcs = {
+            "binary_accuracy": self.calculate_binary_accuracy,
+            "class_accuracy": self.calculate_class_accuracy,
+        }
+        if measurement not in measure_funcs.keys(): 
+            raise ValueError("measurement parameter must be either 'binary_accuracy', or 'class_accuracy'")
+
+        self.num_classes = num_classes
+        self.r = r
+        self.measurement_func = measure_funcs[measurement]
+        self.register_buffer("fidelity_costs", torch.tensor([0, r]))
+        self.to(device)
+
+    def forward(self, fe_output, lf_output, hf_output, target):
+        # start = time.time()
+        fe_output = nn.functional.softmax(fe_output, dim=1)
+        # print("1", time.time()-start)
+        lf_accuracy = self.measurement_func(lf_output.detach(), target).float()
+        hf_accuracy = self.measurement_func(hf_output.detach(), target).float()
+
+        # print("2", time.time()-start)
+        accuracies = torch.stack([1-lf_accuracy, 1-hf_accuracy], dim=1)
+        accuracies = accuracies.to(fe_output.device)
+        # print("3", time.time()-start)
+        expected_accuracy = torch.sum(fe_output * accuracies, dim=1)
+        # print("4", time.time()-start)
+        self.fidelity_costs = self.fidelity_costs.to(fe_output.device)
+        fidelity_cost = torch.sum(fe_output * self.fidelity_costs, dim=1)
+        # print("5", time.time()-start)
+        loss = torch.sum(fidelity_cost + expected_accuracy)
+        # print("6", time.time()-start)
+        return loss
+
+    def calculate_binary_accuracy(self, pred, target):
+        pred_logit = torch.argmax(pred, dim=1)
+        try:
+            target_logit = torch.argmax(target, dim=1)
+        except:
+            target_logit = target
+
+        return pred_logit == target_logit
+    
+    def calculate_class_accuracy(self, pred, target):
+        target_logit = torch.argmax(target, dim=1)
+
+        return pred[target_logit]
+
+class FidelityEvaluationAlternativeLoss(nn.Module):
+    def __init__(self, num_classes, r, device="cpu"):
+        super(FidelityEvaluationAlternativeLoss, self).__init__()
+
+        self.num_classes = num_classes
+        self.r = r
+        self.register_buffer("fidelity_costs", torch.tensor([0, r]))
+        self.to(device)
+
+    def forward(self, fe_output, lf_output, hf_output, target):
+        fe_output = nn.functional.softmax(fe_output, dim=1)
+
+        lf_accuracy = self.calculate_binary_accuracy(lf_output.detach(), target).float()
+        hf_accuracy = self.calculate_binary_accuracy(hf_output.detach(), target).float()
+
+        true_decisions = (~lf_accuracy & hf_accuracy).float()
+        mask = torch.stack([true_decisions, 1-true_decisions])
+
+        accuracies = torch.stack([1-lf_accuracy, 1-hf_accuracy], dim=1)
+        accuracies = accuracies.to(fe_output.device)
+
+        masked_accuracies = accuracies * mask
+
+        expected_accuracy = torch.sum(fe_output * masked_accuracies, dim=1)
+
+        self.fidelity_costs = self.fidelity_costs.to(fe_output.device)
+        fidelity_cost = torch.sum(fe_output * self.fidelity_costs, dim=1)
+
+        loss = torch.sum(fidelity_cost + expected_accuracy)
+
+        return loss
+
+    def calculate_binary_accuracy(self, pred, target):
+        pred_logit = torch.argmax(pred, dim=1)
+        try:
+            target_logit = torch.argmax(target, dim=1)
+        except:
+            target_logit = target
+
+        return pred_logit == target_logit
+    
+    def calculate_class_accuracy(self, pred, target):
+        target_logit = torch.argmax(target, dim=1)
+
+        return pred[target_logit]

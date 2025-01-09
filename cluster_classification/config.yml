@@ -1,0 +1,68 @@
+dataset:
+  name: toy
+  folder: ../data
+
+  settings:
+    radius: 1
+    num_dims: 2
+    num_samples: 4000
+    num_classes: 4
+    wrong_class_prob: 0.2
+
+  augmentations:
+    high_fidelity:
+      augmentation: noise
+      strength: 0
+      steps: 0
+
+    low_fidelity:
+      augmentation: noise
+      strength: 0.5
+      steps: 5
+
+parameters:
+  latent_representation_size: 16
+  random_seed: 42
+  num_reruns: 20
+
+stage1:
+  epochs: 50
+  hf_save_location: saved_models/hf_models
+  lf_save_location: saved_models/lf_models
+  results_save_location: results/stage1
+  batch_size: 128
+  loss_fun: CE
+
+  early_stop:
+    patience: 2
+    min_delta: 0
+
+stage2:
+  epochs: 100
+  fe_save_location: saved_models/fe_models_alt
+  results_save_location: results/stage2
+  batch_size: 4096
+  loss: fe_alternative
+
+  fe_model:
+    type: mlp # options: mlp or svm
+    regularization: 1.0 # Optional[float] = Field(None, description="not used if type != svm")
+    kernel: rbf # Optional[str] = Field(None, description="not used if type != svm")
+    
+    optimizer:
+      lr: 3e-3
+      weight_decay: 1e-5
+
+    scheduler:
+      gamma: .99
+
+    early_stop:
+      patience: 10
+      min_delta: 1e-4
+
+  r_range:
+    start: .1
+    stop: .3
+    num_steps: 500
+    scale: linear
+    direction: normal # normal: 0 -> 1, reversed 1 -> 0
