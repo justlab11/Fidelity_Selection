@@ -12,7 +12,7 @@ import click
 from torchvision.models.feature_extraction import create_feature_extractor
 
 from dataset import HypercubeDataset, FidelityDataset
-from loss import FidelityEvaluationLoss
+from loss import FidelityEvaluationLoss, FidelityEvaluationAlternativeLoss
 from utils import load_yaml_options, build_mlp, classifier_one_run, config_early_stop, generate_r_range
 
 from custom_types import ClusterClassificationConfig, Augmentation
@@ -251,10 +251,16 @@ def main(config_file):
                 weight_decay=config.stage2.fe_model.optimizer.weight_decay
             )
 
-            criterion = FidelityEvaluationLoss(
-                num_classes=output_size,
-                r=r_val
-            )
+            if config.stage2.loss == "fe_original":
+                criterion = FidelityEvaluationLoss(
+                    num_classes=output_size,
+                    r=r_val
+                )
+            else:
+                criterion = FidelityEvaluationAlternativeLoss(
+                    num_classes=output_size,
+                    r=r_val
+                )
 
             fe_early_stop = config_early_stop(config.stage2.fe_model.early_stop)
             best_val_loss = 1000
@@ -283,7 +289,7 @@ def main(config_file):
         
             print(r_value_ranges[r_val_str][n])
 
-        with open(path.join(results_save_location, "fe_metadata_toy6.json"), "w") as json_file:
+        with open(path.join(results_save_location, "fe_metadata_toy_alt.json"), "w") as json_file:
             json.dump(r_value_ranges, json_file, indent=4)
 
     
