@@ -65,8 +65,8 @@ class FidelityEvaluationAlternativeLoss(nn.Module):
     def forward(self, fe_output, lf_output, hf_output, target):
         fe_output = nn.functional.softmax(fe_output, dim=1)
 
-        lf_accuracy = self.calculate_binary_accuracy(lf_output.detach(), target).float()
-        hf_accuracy = self.calculate_binary_accuracy(hf_output.detach(), target).float()
+        lf_accuracy = self.calculate_class_accuracy(lf_output.detach(), target).float()
+        hf_accuracy = self.calculate_class_accuracy(hf_output.detach(), target).float()
 
         true_decisions = (~lf_accuracy & hf_accuracy).float()
         mask = torch.stack([true_decisions, 1-true_decisions])
@@ -98,3 +98,4 @@ class FidelityEvaluationAlternativeLoss(nn.Module):
         target_logit = torch.argmax(target, dim=1)
 
         return pred[target_logit]
+
