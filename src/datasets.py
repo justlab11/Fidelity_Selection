@@ -12,100 +12,103 @@ import os.path as path
 import tifffile as tif
 import cv2
 
-class HypercubeDataset:
-    def __init__(self, config: Options, val_split=0.2, test_split=0.2, random_seed=42):
-        
-        self.config: Options = config
+import numpy as np
+import torch
+from torch.utils.data import Dataset
 
-        toy_dataset_parameters = self.config.dataset.toy_dataset_parameters
+class HypercubeDataset(Dataset):
+    def __init__(
+        self,
+        num_dims=2,
+        num_samples=(100, 1000),
+        hf_std=(0.15, 0.3),
+        lf_std=(0.25, 0.4),
+        remove_clusters=False,
+        group_classes=True
+    ):
+        self.num_dims = num_dims
+        self.num_clusters = 2 ** num_dims
+        self.num_classes = self.num_clusters // 2 if group_classes else self.num_clusters
+        self.remove_clusters = remove_clusters
+        self.group_classes = group_classes
 
-        self.N_dim = toy_dataset_parameters.num_dims
-        self.N_samples = toy_dataset_parameters.num_samples
-        self.N_classes = toy_dataset_parameters.num_classes
-        self.radius = toy_dataset_parameters.radius
-        self.noise_level = self.config.dataset.augmentation_level
-        self.wrong_class_prob = toy_dataset_parameters.wrong_class_prob
+        if type(num_samples) == tuple:
+            num_samples_min, num_samples_max = num_samples
+        else:
+            num_samples_min = num_samples_max = num_samples
 
-        self.val_split = val_split
-        self.test_split = test_split
-        self.random_seed = random_seed
+        num_samples_per_cluster = np.random.randint(num_samples_min, num_samples_max, size=(num_clusters))
+        num_samples_per_cluster = np.insert(num_samples_per_cluster, 0, 0)
 
-        np.random.seed(self.random_seed)
-        torch.manual_seed(self.random_seed)
 
-        self.generate_data()
-
-    def generate_data(self):
-        # Generate corner coordinates
-        corners = np.array(np.meshgrid(*[[0, 1] for _ in range(self.N_dim)])).T.reshape(-1, self.N_dim)
-        num_corners = len(corners)
-        
-        # Assert that the number of classes doesn't exceed the number of corners
-        assert self.N_classes <= num_corners, f"Number of classes ({self.N_classes}) cannot exceed number of corners ({num_corners})"
-        
-        # Randomly select corners for clusters
-        cluster_corners = corners[np.random.choice(num_corners, num_corners, replace=False)]
-        
-        # Scale corners by radius
-        cluster_corners = cluster_corners * self.radius
-        
-        # Randomly assign classes to clusters
-        class_assignments = np.random.choice(self.N_classes, num_corners)
-        
-        # Generate samples for each cluster
-        samples_per_cluster = self.N_samples // num_corners
-        data = []
-        labels = []
-        
-        for i, corner in enumerate(cluster_corners):
-            # Generate samples around the corner
-            cluster_samples = np.random.normal(loc=corner, scale=0.1 * self.radius, size=(samples_per_cluster, self.N_dim))
-            # Clip samples to ensure they stay within the hypercube
-            cluster_samples = np.clip(cluster_samples, 0, self.radius)
-            
-            # Assign classes to samples, with some probability of wrong class
-            cluster_labels = np.full(samples_per_cluster, class_assignments[i])
-            wrong_mask = np.random.random(samples_per_cluster) < self.wrong_class_prob
-            cluster_labels[wrong_mask] = np.random.choice(self.N_classes, np.sum(wrong_mask))
-            
-            data.append(cluster_samples)
-            labels.append(cluster_labels)
-        
-        self.data = np.concatenate(data)
-        self.labels = np.concatenate(labels)
-        
-        # Split the data into train, validation, and test sets
-        train_val_data, self.test_data, train_val_labels, self.test_labels = train_test_split(
-            self.data, self.labels, test_size=self.test_split, stratify=self.labels, random_state=self.random_seed
-        )
-        
-        self.train_data, self.val_data, self.train_labels, self.val_labels = train_test_split(
-            train_val_data, train_val_labels, test_size=self.val_split / (1 - self.test_split),
-            stratify=train_val_labels, random_state=self.random_seed
+        self.hf_points, self.labels = self._generate_points_and_labels(
+            num_dims, self.num_clusters, self.num_classes,
+            num_samples_per_cluster, hf_std, group_classes
         )
 
-    def train(self):
-        return HypercubeSubset(self.train_data, self.train_labels, self.noise_level)
+        self.lf_points, _ = self._generate_points_and_labels(
+            num_dims, self.num_clusters, self.num_classes,
+            num_samples_per_cluster, lf_std, group_classes
+        )
 
-    def val(self):
-        return HypercubeSubset(self.val_data, self.val_labels, self.noise_level)
+        self.hf_points = torch.from_numpy(self.hf_points.astype(np.float32))
+        self.lf_points = torch.from_numpy(self.lf_points.astype(np.float32))
 
-    def test(self):
-        return HypercubeSubset(self.test_data, self.test_labels, self.noise_level)
-
-class HypercubeSubset(Dataset):
-    def __init__(self, data, labels, noise_level):
-        self.data = torch.FloatTensor(data)
-        self.labels = torch.LongTensor(labels)
-        self.noise_level = noise_level
+        self.labels = torch.from_numpy(self.labels.astype(np.int64))
 
     def __len__(self):
-        return len(self.data)
+        return len(self.points)
 
     def __getitem__(self, idx):
-        clean_sample = self.data[idx]
-        noisy_sample = clean_sample + torch.randn_like(clean_sample) * self.noise_level
-        return self.labels[idx], clean_sample, noisy_sample
+        return self.lf_points[idx], self.hf_points[idx], self.labels[idx]
+
+    def _hypercube_corners(self, num_dims):
+        corners = np.zeros((2 ** num_dims, num_dims))
+        for i in range(2 ** num_dims):
+            binary = np.binary_repr(i, width=num_dims)
+            for j in range(num_dims):
+                corners[i, j] = int(binary[j])
+        return corners
+
+    def _get_label_set(self, num_classes, group_classes):
+        label_set = [i for i in range(num_classes)]
+        if group_classes:
+            tmp = list(reversed(label_set))
+            label_set += tmp
+        return label_set
+
+    def get_num_classes(self):
+        return self.num_classes
+
+    def _generate_points_and_labels(
+        self, num_dims, num_clusters, num_classes,
+        num_samples_per_cluster, std, group_classes
+    ):
+
+        means = self._hypercube_corners(num_dims)
+        label_set = self._get_label_set(num_classes, group_classes)
+        if type(std) == tuple:
+            std_min, std_max = std
+        else:
+            std_min = std_max = std
+
+        stds = np.random.uniform(std_min, std_max, size=(num_clusters, num_dims))
+
+        points = np.zeros((num_samples_per_cluster.sum().item(), num_dims))
+        labels = np.zeros(num_samples_per_cluster.sum().item())
+
+        for i in range(len(num_samples_per_cluster) - 1):
+            start = num_samples_per_cluster[:i + 1].sum()
+            end = num_samples_per_cluster[:i + 2].sum()
+
+            points[start:end] = np.random.normal(
+                means[i], stds[i],
+                size=(num_samples_per_cluster[i + 1], num_dims)
+            )
+
+            labels[start:end] = label_set[i]
+
+        return points, labels
 
 class DualFidelityDataset:
     def __init__(self, config: Options, data_folder="./data", 
