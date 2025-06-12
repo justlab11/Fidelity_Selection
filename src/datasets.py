@@ -19,45 +19,36 @@ from torch.utils.data import Dataset
 class HypercubeDataset(Dataset):
     def __init__(
         self,
-        num_dims=2,
-        num_samples=(100, 1000),
-        hf_std=(0.15, 0.3),
-        lf_std=(0.25, 0.4),
-        remove_clusters=False,
-        group_classes=True
+        num_dims: int,
+        num_samples: np.ndarray,  # shape: (num_clusters,)
+        hf_std: np.ndarray,       # shape: (num_clusters,)
+        lf_std: np.ndarray,       # shape: (num_clusters,)
+        group_classes: bool=True
     ):
         self.num_dims = num_dims
         self.num_clusters = 2 ** num_dims
         self.num_classes = self.num_clusters // 2 if group_classes else self.num_clusters
-        self.remove_clusters = remove_clusters
         self.group_classes = group_classes
 
-        if type(num_samples) == tuple:
-            num_samples_min, num_samples_max = num_samples
-        else:
-            num_samples_min = num_samples_max = num_samples
-
-        num_samples_per_cluster = np.random.randint(num_samples_min, num_samples_max, size=(num_clusters))
-        num_samples_per_cluster = np.insert(num_samples_per_cluster, 0, 0)
-
+        # Insert zero at the start for your indexing scheme
+        num_samples = np.insert(num_samples, 0, 0)
 
         self.hf_points, self.labels = self._generate_points_and_labels(
-            num_dims, self.num_clusters, self.num_classes,
-            num_samples_per_cluster, hf_std, group_classes
+            num_dims, self.num_classes, 
+            num_samples, hf_std, group_classes
         )
 
         self.lf_points, _ = self._generate_points_and_labels(
-            num_dims, self.num_clusters, self.num_classes,
-            num_samples_per_cluster, lf_std, group_classes
+            num_dims, self.num_classes,
+            num_samples, lf_std, group_classes
         )
 
         self.hf_points = torch.from_numpy(self.hf_points.astype(np.float32))
         self.lf_points = torch.from_numpy(self.lf_points.astype(np.float32))
-
         self.labels = torch.from_numpy(self.labels.astype(np.int64))
 
     def __len__(self):
-        return len(self.points)
+        return len(self.lf_points)
 
     def __getitem__(self, idx):
         return self.lf_points[idx], self.hf_points[idx], self.labels[idx]
@@ -81,21 +72,15 @@ class HypercubeDataset(Dataset):
         return self.num_classes
 
     def _generate_points_and_labels(
-        self, num_dims, num_clusters, num_classes,
-        num_samples_per_cluster, std, group_classes
+        self, num_dims, num_classes,
+        num_samples_per_cluster, stds, group_classes
     ):
-
         means = self._hypercube_corners(num_dims)
         label_set = self._get_label_set(num_classes, group_classes)
-        if type(std) == tuple:
-            std_min, std_max = std
-        else:
-            std_min = std_max = std
 
-        stds = np.random.uniform(std_min, std_max, size=(num_clusters, num_dims))
-
-        points = np.zeros((num_samples_per_cluster.sum().item(), num_dims))
-        labels = np.zeros(num_samples_per_cluster.sum().item())
+        total_samples = num_samples_per_cluster.sum().item()
+        points = np.zeros((total_samples, num_dims))
+        labels = np.zeros(total_samples)
 
         for i in range(len(num_samples_per_cluster) - 1):
             start = num_samples_per_cluster[:i + 1].sum()
@@ -105,7 +90,6 @@ class HypercubeDataset(Dataset):
                 means[i], stds[i],
                 size=(num_samples_per_cluster[i + 1], num_dims)
             )
-
             labels[start:end] = label_set[i]
 
         return points, labels
