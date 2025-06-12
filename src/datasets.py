@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 import numpy as np
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset, random_split
 from PIL import Image, ImageFilter
 from sklearn.model_selection import train_test_split
 from torchvision.models import ResNet18_Weights
@@ -93,6 +93,55 @@ class HypercubeDataset(Dataset):
             labels[start:end] = label_set[i]
 
         return points, labels
+    
+class MNISTDataset(Dataset):
+    def __init__(
+        self,
+        split: str,
+        root: str = "../data",
+        hf_transform=None,
+        lf_transform=None,
+        val_ratio: float = 0.5,
+        seed: int = 42
+    ):
+        assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
+
+        if split == "train":
+            base_dataset = datasets.MNIST(
+                root=root, train=True, transform=None, download=True
+            )
+        else:
+            base_dataset = datasets.MNIST(
+                root=root, train=False, transform=None, download=True
+            )
+
+        if split in ["test", "val"]:
+            # Split the test set deterministically
+            n = len(base_dataset)
+            val_size = int(n * val_ratio)
+            test_size = n - val_size
+            generator = torch.Generator().manual_seed(seed)
+            test_set, val_set = random_split(base_dataset, [test_size, val_size], generator=generator)
+            if split == "test":
+                base_dataset = test_set
+            else:
+                base_dataset = val_set
+
+        # Now, create two datasets with different transforms but the same indices
+        self.hf_transform = hf_transform
+        self.lf_transform = lf_transform
+        self.base_dataset = base_dataset
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        img, target = self.base_dataset[idx]
+
+        hf_img = self.hf_transform(img) if self.hf_transform else img
+        lf_img = self.lf_transform(img) if self.lf_transform else img
+        
+        return lf_img, hf_img, target
 
 class DualFidelityDataset:
     def __init__(self, config: Options, data_folder="./data", 
