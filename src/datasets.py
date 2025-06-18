@@ -14,7 +14,7 @@ import cv2
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from datasets import load_dataset
 
 class HypercubeDataset(Dataset):
     def __init__(
@@ -106,24 +106,24 @@ class MNISTDataset(Dataset):
     ):
         assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
 
-        if split == "train":
-            base_dataset = datasets.MNIST(
-                root=root, train=True, transform=None, download=True
-            )
-        else:
+        if split == "test":
             base_dataset = datasets.MNIST(
                 root=root, train=False, transform=None, download=True
             )
+        else:
+            base_dataset = datasets.MNIST(
+                root=root, train=True, transform=None, download=True
+            )
 
-        if split in ["test", "val"]:
+        if split in ["train", "val"]:
             # Split the test set deterministically
             n = len(base_dataset)
             val_size = int(n * val_ratio)
-            test_size = n - val_size
+            train_size = n - val_size
             generator = torch.Generator().manual_seed(seed)
-            test_set, val_set = random_split(base_dataset, [test_size, val_size], generator=generator)
-            if split == "test":
-                base_dataset = test_set
+            train_set, val_set = random_split(base_dataset, [train_size, val_size], generator=generator)
+            if split == "train":
+                base_dataset = train_set
             else:
                 base_dataset = val_set
 
@@ -140,203 +140,122 @@ class MNISTDataset(Dataset):
 
         hf_img = self.hf_transform(img) if self.hf_transform else img
         lf_img = self.lf_transform(img) if self.lf_transform else img
-        
+
         return lf_img, hf_img, target
-
-class DualFidelityDataset:
-    def __init__(self, config: Options, data_folder="./data", 
-                 val_split=0.5, random_seed=42):
-        
-        self.config = config
-        self.dataset_name = config.dataset.name.lower()
-        self.augmentation = config.dataset.augmentation.lower()
-        self.augmentation_level = config.dataset.augmentation_level
-
-        self.folder = config.dataset.folder
-
-        self.val_split = val_split
-        self.random_seed = random_seed
-
-        valid_dataset_names = ["mnist", "cifar10", "cifar100"]
-        valid_aug_names = ["noise", "blur", "random_rotation"]
-
-        if self.dataset_name not in valid_dataset_names:
-            valid_dataset_str = ", ".join(valid_dataset_names) 
-            raise ValueError(f"Unsupported dataset. Choose {valid_dataset_str}.")
-        
-        if self.augmentation not in valid_aug_names:
-            valid_aug_str = ", ".join(valid_aug_names) 
-            raise ValueError(f"Unsupported augmentation. Choose {valid_aug_str}.")
-        
-        # Set random seeds
-        torch.manual_seed(self.random_seed)
-        np.random.seed(self.random_seed)
-        
-        # Load the train and test datasets
-        if self.dataset_name == 'mnist':
-            self.train_dataset = datasets.MNIST(root=data_folder, train=True, download=True)
-            self.test_dataset = datasets.MNIST(root=data_folder, train=False, download=True)
-
-        elif self.dataset_name == 'cifar10':
-            self.train_dataset = datasets.CIFAR10(root=data_folder, train=True, download=True)
-            self.test_dataset = datasets.CIFAR10(root=data_folder, train=False, download=True)
-
-        elif self.dataset_name == 'cifar100':
-            self.train_dataset = datasets.CIFAR100(root=data_folder, train=True, download=True)
-            self.test_dataset = datasets.CIFAR100(root=data_folder, train=False, download=True)
-
-        elif self.dataset_name == 'crop':
-            all_train_files = glob.glob(
-                path.join(self.folder, "training_chips/*")
-            )
-            train_files = [file for file in all_train_files if not path.basename(file).startswith(".")]
-
-            all_val_files = glob.glob(
-                path.join(self.folder, "validation_chips/*")
-            )
-            val_files = [file for file in all_val_files if not path.basename(file).startswith(".")]
-
-            self.train_dataset = CropClassificationDataset(train_files)
-            self.test_dataset = CropClassificationDataset(val_files)            
-            
-                
-        # Split test set into test and validation sets
-        test_indices = list(range(len(self.test_dataset)))
-        val_indices, test_indices = train_test_split(
-            test_indices,
-            test_size=self.val_split,
-            random_state=self.random_seed,
-            stratify=self.test_dataset.targets
-        )
-        
-        # Create datasets
-        self.train_data = self.train_dataset
-        self.val_data = torch.utils.data.Subset(self.test_dataset, val_indices)
-        self.test_data = torch.utils.data.Subset(self.test_dataset, test_indices)
-
-    def train(self):
-        return AugmentedDataset(self.train_data, self.config)
-
-    def val(self):
-        return AugmentedDataset(self.val_data, self.config)
-
-    def test(self):
-        return AugmentedDataset(self.test_data, self.config)
-
-
-class AugmentedDataset(Dataset):
-    def __init__(self, base_dataset, config: Options):
-        self.base_dataset = base_dataset
-
-        self.hf_aug_info = config.dataset.augmentations.high_fidelity
-        self.lf_aug_info = config.dataset.augmentations.low_fidelity
-
-        # ResNet18 preprocessing
-        weights = ResNet18_Weights.DEFAULT
-        if config.dataset.name in ["mnist", "cifar10", "cifar100"]: 
-            self.preprocess = weights.transforms()
-        else:
-            self.preprocess = transforms.ToTensor()
-
-    def __len__(self):
-        return len(self.base_dataset)
-
-    def __getitem__(self, idx):
-        image, label = self.base_dataset[idx]
-        
-        # Convert to PIL Image if necessary
-        if not isinstance(image, Image.Image):
-            if isinstance(image, torch.Tensor):
-                image = transforms.ToPILImage()(image)
-            else:
-                image = Image.fromarray(np.uint8(image))
-        
-        # Convert grayscale to RGB if necessary
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # Apply augmentation
-        if self.augmentation == 'noise':
-            augmented_image = self.add_noise(image)
-        elif self.augmentation == 'blur':
-            augmented_image = self.apply_blur(image)
-        elif self.augmentation == 'random_rotation':
-            augmented_image = self.random_rotate(image)
-        
-        # Apply ResNet18 preprocessing
-        original_image = self.preprocess(image)
-        augmented_image = self.preprocess(augmented_image)
-        
-        return augmented_image, original_image, label
-
-    def add_noise(self, image):
-        np_image = np.array(image)
-        noise = np.random.normal(0, self.degree * 255, np_image.shape)
-        noisy_image = np.clip(np_image + noise, 0, 255).astype(np.uint8)
-        return Image.fromarray(noisy_image)
-
-    def apply_blur(self, image):
-        return image.filter(ImageFilter.GaussianBlur(radius=self.degree))
-
-    def random_rotate(self, image):
-        angle = np.random.uniform(-self.degree, self.degree)
-        return image.rotate(angle)
-
-
-class CropClassificationDataset(Dataset):
-    def __init__(self, files, num_subsamples=8):
-        self.num_subsamples = num_subsamples
-        base_names = set()
-
-        # First pass: Collect all base names
-        for filename in files:
-            if filename.endswith('_merged.tif'):
-                base_name = filename[:-11]  # Remove '_merged.tif'
-                base_names.add(base_name)
-            elif filename.endswith('.mask.tif'):
-                base_name = filename[:-9]  # Remove '.mask.tif'
-                base_names.add(base_name)
-
-        self.samples = []
-
-        for base_name in base_names:
-            img_name = base_name + "_merged.tif"
-            mask_name = base_name + ".mask.tif"
-            if not path.exists(img_name):
-                raise FileNotFoundError(f"No file named {img_name}")
-            
-            if not path.exists(mask_name):
-                raise FileNotFoundError(f"No file named {mask_name}")
-            
-            # Pre-define subsections and layouts for each sample
-            for _ in range(self.num_subsamples * 3):
-                layout = np.random.randint(0, 3)
-                subsection = np.random.randint(0, 224 - 56 + 1, 2)
-                self.samples.append({
-                    'img_file': img_name,
-                    'mask_file': mask_name,
-                    'layout': layout,
-                    'subsection': subsection
-                })
-
-    def __len__(self):
-        return len(self.samples)
     
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        img_file = sample['img_file']
-        mask_file = sample['mask_file']
-        layout = sample['layout']
-        subsection = sample['subsection']
+class CropDataset(Dataset):
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        seed: int = 42,
+        test_ratio: float = 0.2
+    ):
+        assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
 
-        img = tif.imread(img_file).reshape(224, 224, 6, 3)
-        mask = tif.imread(mask_file)
+        self.fileset = []
+        self.generator = torch.Generator().manual_seed(seed)
 
-        img = img[subsection[0]:subsection[0]+56, subsection[1]:subsection[1]+56, :, layout]
-        mask = mask[subsection[0]:subsection[0]+56, subsection[1]:subsection[1]+56]
+        self.img_transform = transforms.Compose([
+            transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
+            transforms.Resize((224, 224)),  # Resize to model input size
+            transforms.Normalize(
+                mean=[496.38, 816.70, 927.55, 2961.28, 2638.13, 1742.81],
+                std=[286.37, 359.40, 577.06, 897.17, 954.61, 922.32]
+            ),
+        ])
+        
+        self.mask_transform = transforms.Compose([
+            transforms.ToTensor(),  # Converts (H, W) to (1, H, W)
+            transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.Lambda(lambda x: x.squeeze(0).long())  # Remove channel dim and ensure integer type
+        ])
 
-        img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_LINEAR)
-        img /= np.max(img)
-        mask = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_NEAREST)
+        if split == "val":
+            val_folder = path.join(root, "multi-temporal-crop-classification", "validation_data.txt")
+            with open(val_folder, "r") as f:
+                val_chips = f.readlines()
 
-        return img, mask
+            val_filenames = [
+                path.join(
+                    root, 
+                    "multi-temporal-crop-classification", 
+                    "validation_chips", line.strip()
+                ) for line in val_chips
+            ]
+
+            for i in indices:
+                for t in range(3): # timestep 
+                    for q in range(4): # quandrant of the image
+                        self.fileset.append((val_filenames[i], t, q))
+
+        else:
+            train_folder = path.join(root, "multi-temporal-crop-classification", "training_data.txt")
+            with open(train_folder, "r") as f:
+                train_chips = f.readlines()
+
+            train_test_filenames = [
+                path.join(
+                    root, 
+                    "multi-temporal-crop-classification", 
+                    "training_chips", line.strip()
+                ) for line in train_chips
+            ]
+
+            n = len(train_test_filenames)
+            test_size = int(n * test_ratio)
+            train_size = n - test_size
+
+            train_set, test_set = random_split(train_test_filenames, [train_size, test_size], generator=self.generator)
+            if split == "train":
+                indices = train_set.indices
+            else:
+                indices = test_set.indices
+
+            for i in indices:
+                for t in range(3): # timestep 
+                    for q in range(4): # quandrant of the image
+                        self.fileset.append((train_test_filenames[i], t, q))
+
+    def __len__(self):
+        return len(self.fileset)
+    
+    def __getitem__(self, idx:int):
+        base_fname, timestep = self.fileset[idx]
+        mask_fname = base_fname + ".mask.tif"
+        image_fname = base_fname + "_merged.tif"
+
+        mask = tif.imread(mask_fname)
+        image_set = tif.imread(image_fname)
+
+        x_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
+        x_end = x_start + 56
+
+        y_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
+        y_end = y_start + 56
+
+        hf_image = image_set[x_start:x_end, y_start:y_end, 6*timestep:6*(timestep+1)]
+        hf_image = self.img_transform(hf_image)
+
+        lf_image = hf_image[:, :, :3]
+
+        mask = mask[x_start:x_end, y_start:y_end]
+        mask = self.mask_transform(mask)
+
+        return hf_image, lf_image, mask
+    
+        
+class QE_Dataset(Dataset):
+    def __init__(self, lf_embeddings, lf_preds, hf_preds, labels):
+        super(QE_Dataset, self).__init__()
+
+        self.lf_embeddings = lf_embeddings
+        self.lf_preds = lf_preds
+        self.hf_preds = hf_preds
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx:int):
+        return self.lf_embeddings[idx], self.lf_preds[idx], self.hf_preds[idx], self.labels[idx]
