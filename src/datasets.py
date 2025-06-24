@@ -16,6 +16,10 @@ import numpy as np
 import torch
 from datasets import load_dataset
 
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import torch
+
 class HypercubeDataset(Dataset):
     def __init__(
         self,
@@ -44,7 +48,23 @@ class HypercubeDataset(Dataset):
         )
 
         self.hf_points = torch.from_numpy(self.hf_points.astype(np.float32))
-        self.lf_points = torch.from_numpy(self.lf_points.astype(np.float32))
+        
+        # After generating hf_points and labels
+        lf_points = np.zeros_like(self.hf_points)
+        for i in range(self.hf_points.shape[0]):
+            cluster = int(self.labels[i])
+            
+            hf_std_val = hf_std[cluster]
+            lf_std_val = lf_std[cluster]
+
+            # Compute the extra std needed
+            extra_std = np.sqrt(lf_std_val**2 - hf_std_val**2)
+
+            # Add extra noise to hf_point
+            lf_points[i] = self.hf_points[i] + np.random.normal(0, extra_std, size=self.num_dims)
+
+        self.lf_points = torch.from_numpy(lf_points.astype(np.float32)) 
+
         self.labels = torch.from_numpy(self.labels.astype(np.int64))
 
     def __len__(self):
@@ -93,7 +113,7 @@ class HypercubeDataset(Dataset):
             labels[start:end] = label_set[i]
 
         return points, labels
-    
+        
 class MNISTDataset(Dataset):
     def __init__(
         self,
