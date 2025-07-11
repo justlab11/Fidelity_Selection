@@ -23,12 +23,73 @@ def build_mlp(input_size, num_layers, output_size, hidden_size=64, device='cpu')
     
     return model
 
-def build_resnet(latent_size, output_size, device='cpu'):
+class CustomMLP(nn.Module):
+    def __init__(self, input_size, num_layers, output_size, hidden_size=64):
+        super().__init__()
+        layers = []
+        
+        # Input layer
+        layers.append(nn.Linear(input_size, hidden_size))
+        layers.append(nn.ReLU())
+        
+        # Hidden layers
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_size, hidden_size))
+            layers.append(nn.ReLU())
+        
+        # Output layer
+        self.output_layer = nn.Linear(hidden_size, output_size)
+        
+        # Create the sequential model
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x):
+        layers = []
+
+        x = self.model(x)
+        layers.append(x)
+
+        x = self.output_layer(x)
+        layers.append(x)
+
+        return layers
+    
+class CustomResNet18(nn.Module):
+    def __init__(self, latent_size, output_size, three_channel=True):
+        model = models.resnet18(weights="DEFAULT")
+        if not three_channel:
+            model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Identity()
+
+        self.model = model
+        self.latent_rep = nn.Linear(num_ftrs, latent_size)
+        self.output_layer = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(latent_size, output_size)
+        )
+
+    def forward(self, x):
+        layers = []
+
+        x = self.model(x)
+        x = self.latent_rep(x)
+        layers.append(x)
+        
+        x = self.output_layer(x)
+        layers.append(x)
+
+def build_resnet(latent_size, output_size, device='cpu', three_channel=True):
     # Dictionary mapping resnet_size to the corresponding model function
     
     # Check if the requested ResNet size is valid    
     # Get the appropriate ResNet model
     model = models.resnet18(weights="DEFAULT")
+
+    # Add in the new conv1 layer for 6 channel
+    if not three_channel:
+        model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
     
     # Remove the original fully connected layer
     num_ftrs = model.fc.in_features
@@ -189,7 +250,6 @@ class Encoder(nn.Module):
 
         return encoder_features
 
-
 class Decoder(nn.Module):
     """The decoder part of the UNet architecture.
 
@@ -255,7 +315,6 @@ class Decoder(nn.Module):
             x = decoder_block(x)
         return x
 
-
 class UNet(nn.Module):
     """The UNet architecture.   
 
@@ -291,13 +350,33 @@ class UNet(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
+        layers = []
+
         encoder_features = self.encoder(x)[::-1]
+        layers.append(encoder_features[0])
+
         x = self.decoder(encoder_features[0], encoder_features[1:])
         x = self.output(x)
-        return x
+        layers.append(x)
+        
+        return layers
 
-def build_unet(num_channels, device='cpu'):
-    # img size should be 256x256
-    unet = UNet(channels=[num_channels, 64, 128, 256, 512, 1024], out_channels=1)
-    unet = unet.to(device)
+def build_unet(num_channels, num_classes):
+    # img size should be 224x224
+    unet = UNet(channels=[num_channels, 64, 128, 256, 512, 1024], out_channels=num_classes)
     return unet
+
+class LatentCNNHead(nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 256, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1)  # Output: [batch, 256, 1, 1]
+        )
+        self.fc = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)

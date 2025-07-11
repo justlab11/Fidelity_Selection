@@ -1,6 +1,9 @@
 from typing import *
 import torch
 import torch.nn as nn
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MetaLossFunction(nn.Module):
     def __init__(self, ch: List[float], cw: float, device: str, loss_fun: str="CE"):
@@ -29,6 +32,7 @@ class MetaLossFunction(nn.Module):
     def forward(self, y_true: torch.tensor, y_preds: torch.tensor, choices: torch.tensor):
         batch_size = len(y_true)
         model_losses = []
+        choices = nn.Softmax(dim=1)(choices)
 
         with torch.no_grad():
             for pred in y_preds:
@@ -49,5 +53,6 @@ class MetaLossFunction(nn.Module):
         model_loss_weights = model_losses_tensor * (cw_matrix + ch_matrix)
 
         self.meta_loss = choices.T * model_loss_weights
+
 
         return torch.sum(self.meta_loss)

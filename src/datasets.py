@@ -6,15 +6,12 @@ from torch.utils.data import Dataset, random_split
 from PIL import Image, ImageFilter
 from sklearn.model_selection import train_test_split
 from torchvision.models import ResNet18_Weights
-from custom_types import Options
 import glob
 import os.path as path
 import tifffile as tif
-import cv2
 
 import numpy as np
 import torch
-from datasets import load_dataset
 
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
@@ -51,9 +48,10 @@ class HypercubeDataset(Dataset):
         
         # After generating hf_points and labels
         lf_points = np.zeros_like(self.hf_points)
+
         for i in range(self.hf_points.shape[0]):
             cluster = int(self.labels[i])
-            
+
             hf_std_val = hf_std[cluster]
             lf_std_val = lf_std[cluster]
 
@@ -90,6 +88,9 @@ class HypercubeDataset(Dataset):
 
     def get_num_classes(self):
         return self.num_classes
+    
+    def get_input_size(self):
+        return self.num_dims
 
     def _generate_points_and_labels(
         self, num_dims, num_classes,
@@ -151,6 +152,9 @@ class MNISTDataset(Dataset):
         self.hf_transform = hf_transform
         self.lf_transform = lf_transform
         self.base_dataset = base_dataset
+
+    def get_num_classes(self):
+        return 10
 
     def __len__(self):
         return len(self.base_dataset)
@@ -258,16 +262,17 @@ class CropDataset(Dataset):
         hf_image = self.img_transform(hf_image)
 
         lf_image = hf_image[:, :, :3]
+        hf_image = hf_image[:, :, 3:]
 
         mask = mask[x_start:x_end, y_start:y_end]
         mask = self.mask_transform(mask)
 
-        return hf_image, lf_image, mask
+        return lf_image, hf_image, mask
     
         
-class QE_Dataset(Dataset):
+class FE_Dataset(Dataset):
     def __init__(self, lf_embeddings, lf_preds, hf_preds, labels):
-        super(QE_Dataset, self).__init__()
+        super(FE_Dataset, self).__init__()
 
         self.lf_embeddings = lf_embeddings
         self.lf_preds = lf_preds
