@@ -37,36 +37,27 @@ class AddGaussianNoise(object):
         return f"{self.__class__.__name__}(std={self.std})"
 
 def build_mnist_transform(aug_name, aug_strength):
-    aug_transforms = []
-    # Augmentation step
+    aug_transforms = [transforms.ToTensor()]  # Always start with ToTensor
+
     if aug_name == "rotation":
-        # aug_strength is the max degree of rotation
         aug_transforms.append(transforms.RandomRotation(degrees=aug_strength))
     elif aug_name == "noise":
-        # aug_strength is the std of the Gaussian noise
-        # Noise must be applied after ToTensor
-        aug_transforms.append(transforms.ToTensor())
         aug_transforms.append(AddGaussianNoise(std=aug_strength))
-    else:
-        aug_transforms.append(transforms.ToTensor())
-    
+    # else: no additional augmentation
+
     # Ensure image is 3-channel for ResNet
     def to_rgb(x):
         return x.expand(3, -1, -1) if x.shape[0] == 1 else x
     aug_transforms.append(transforms.Lambda(to_rgb))
-    
+
     # Resize and crop to match ResNet-18 input
     aug_transforms += [
         transforms.Resize(256, interpolation=transforms.InterpolationMode.BILINEAR),
         transforms.CenterCrop(224),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ]
-    
-    # If noise was added after ToTensor, remove duplicate ToTensor
-    if aug_name != "noise":
-        aug_transforms.insert(0, transforms.ToTensor())
-    
-    return transforms.Compose(aug_transforms)    
+
+    return transforms.Compose(aug_transforms)
 
 def build_dataset(dataset_settings: DatasetSettings, seed: int):
     ds_name: str = dataset_settings.name
@@ -109,11 +100,11 @@ def build_dataset(dataset_settings: DatasetSettings, seed: int):
         )
 
     elif ds_name == "mnist":
-        hf_augment: str = dataset_settings["high_fidelity"].aug_name
-        hf_aug_str: float = dataset_settings["high_fidelity"].strength
+        hf_augment: str = dataset_settings.high_fidelity.aug_name
+        hf_aug_str: float = dataset_settings.high_fidelity.strength
         
-        lf_augment: str = dataset_settings["low_fidelity"].aug_name
-        lf_aug_str: float = dataset_settings["low_fidelity"].strength
+        lf_augment: str = dataset_settings.low_fidelity.aug_name
+        lf_aug_str: float = dataset_settings.low_fidelity.strength
 
         hf_transform = build_mnist_transform(
             aug_name=hf_augment,
@@ -198,6 +189,7 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
             target = target.type(torch.LongTensor)
             data, target = data.to(device, torch.float), target.to(device)
             output = model(data)[-1]
+
             loss = criterion(output, target)
             if optimizer:
                 optimizer.zero_grad()
@@ -298,7 +290,7 @@ def create_fe_dataset(dataloader, lf_model, hf_model, device):
             lf_pred = lf_outs[-1]
 
             # HF model (concatenate lf_sample and hf_sample along last dim)
-            hf_input = torch.cat([lf_sample, hf_sample], dim=-1)
+            hf_input = torch.cat([lf_sample, hf_sample], dim=1)
             hf_outs = hf_model(hf_input)
             hf_pred = hf_outs[-1]
 
@@ -511,22 +503,22 @@ def reset_all_weights(model):
 
 #     return train_loader, test_loader, val_loader
 
-# class EarlyStopper:
-#     def __init__(self, patience=1, min_delta=0):
-#         self.patience = patience
-#         self.min_delta = min_delta
-#         self.counter = 0
-#         self.min_validation_loss = float('inf')
+class EarlyStopper:
+    def __init__(self, patience=1, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = float('inf')
 
-#     def early_stop(self, validation_loss):
-#         if validation_loss < self.min_validation_loss:
-#             self.min_validation_loss = validation_loss
-#             self.counter = 0
-#         elif validation_loss > (self.min_validation_loss + self.min_delta):
-#             self.counter += 1
-#             if self.counter >= self.patience:
-#                 return True
-#         return False
+    def early_stop(self, validation_loss):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
     
 # def build_metadata(config: Options):
 #     augmentation = config.dataset.augmentation

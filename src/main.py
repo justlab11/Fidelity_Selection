@@ -10,8 +10,8 @@ import logging
 import os
 
 from datasets import *
-from models import build_unet, build_resnet, build_mlp, LatentCNNHead, CustomMLP
-from helpers import seed_all, load_yaml_options, build_dataset, classifier_one_run, create_fe_dataset, reset_all_weights
+from models import build_unet, build_resnet, CustomResNet18, LatentCNNHead, CustomMLP
+from helpers import seed_all, load_yaml_options, build_dataset, classifier_one_run, create_fe_dataset, reset_all_weights, EarlyStopper
 from losses import MetaLossFunction
 
 from custom_types import ConfigOptions
@@ -102,20 +102,20 @@ def main(config_file):
     elif dataset == "mnist":
         num_classes: int = 10
 
-        lf_model = build_resnet(
+        lf_model = CustomResNet18(
             latent_size=latent_size,
             output_size=num_classes,
             three_channel=True
         )
 
-        hf_model = build_resnet(
+        hf_model = CustomResNet18(
             latent_size=latent_size,
             output_size=num_classes,
             three_channel=False
         )
 
-        fe_model = build_mlp(
-            input=latent_size,
+        fe_model = CustomMLP(
+            input_size=latent_size,
             num_layers=5,
             output_size=2,
             hidden_size=latent_size
@@ -164,6 +164,9 @@ def main(config_file):
         model_folder,
         "lf_model.pt"
     )
+    lf_early_stop = EarlyStopper(
+        patience=10
+    )
     best_val_acc = 0
 
     for epoch in range(classifier_epochs):
@@ -172,6 +175,10 @@ def main(config_file):
 
         log_msg = f"Epoch {epoch+1}: {train_loss:.4f}, {train_acc*100:.2f}% | {val_loss:.4f}, {val_acc*100:.2f}%"
         
+        if lf_early_stop.early_stop(val_loss):
+            logger.info(f"Training early stopped at epoch {epoch+1}")
+            break
+
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             log_msg += " <- BEST"
@@ -196,6 +203,10 @@ def main(config_file):
         "hf_model.pt"
     )
 
+    hf_early_stop = EarlyStopper(
+        patience=10
+    )
+
     best_val_acc = 0
 
     for epoch in range(classifier_epochs):
@@ -204,6 +215,10 @@ def main(config_file):
 
         log_msg = f"Epoch {epoch+1}: {train_loss:.4f}, {train_acc*100:.2f}% | {val_loss:.4f}, {val_acc*100:.2f}%"
         
+        if hf_early_stop.early_stop(val_loss):
+            logger.info(f"Training early stopped at epoch {epoch+1}")
+            break
+
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             log_msg += " <- BEST"

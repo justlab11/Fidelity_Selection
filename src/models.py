@@ -56,6 +56,7 @@ class CustomMLP(nn.Module):
     
 class CustomResNet18(nn.Module):
     def __init__(self, latent_size, output_size, three_channel=True):
+        super().__init__()
         model = models.resnet18(weights="DEFAULT")
         if not three_channel:
             model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -79,6 +80,8 @@ class CustomResNet18(nn.Module):
         
         x = self.output_layer(x)
         layers.append(x)
+
+        return layers
 
 def build_resnet(latent_size, output_size, device='cpu', three_channel=True):
     # Dictionary mapping resnet_size to the corresponding model function

@@ -1,0 +1,29 @@
+dataset:
+  name: mnist
+  folder: ../data
+  high_fidelity:
+    aug_name: none
+    strength: 0
+  low_fidelity:
+    aug_name: noise
+    strength: 1
+
+latent_size: 128
+random_seed: 42
+num_reruns: 1
+
+classifier_training:
+  epochs: 200
+  batch_size: 32
+  loss_fun: CE
+
+fe_training:
+  epochs: 200
+  batch_size: 128
+
+  r_range:
+    start: 0.0
+    stop: 1.0
+    num_steps: 100
+    scale: linear
+    direction: reversed # normal: 0 -> 1, reversed 1 -> 0
