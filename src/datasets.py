@@ -9,6 +9,7 @@ from torchvision.models import ResNet18_Weights
 import glob
 import os.path as path
 import tifffile as tif
+import os
 
 import numpy as np
 import torch
@@ -114,7 +115,7 @@ class HypercubeDataset(Dataset):
             labels[start:end] = label_set[i]
 
         return points, labels
-        
+
 class MNISTDataset(Dataset):
     def __init__(
         self,
@@ -269,6 +270,63 @@ class CropDataset(Dataset):
 
         return lf_image, hf_image, mask
     
+class CUBDataset(Dataset):
+    def __init__(
+            self, 
+            root: str, 
+            split: str, 
+            seed:int, 
+            transform=None
+    ):
+        assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
+
+        self.transform = transform
+        self.root = root
+        self.split = split
+
+        image_split = self.get_split()
+
+        if split != "test":
+            num_images = len(image_split)
+            val_ratio = .1
+            val_size = int(val_ratio * num_images)
+            
+            self.generator = torch.Generator().manual_seed(seed)
+
+
+    def get_split(self):
+        splits_file = os.path.join(self.root, "train_test_split.txt")
+        image_id_file = os.path.join(self.root, "images.txt")
+
+        splits = np.loadtxt(splits_file, dtype=int)
+        image_ids = np.loadtxt(image_id_file, dtype=str)
+
+        image_ids_dict = {
+            int(image_ids[i, 0]): str(image_ids[i, 1]) 
+            for i in range(len(image_ids))
+        }
+
+        image_split_dict = {
+            image_ids_dict[splits[i, 0]]: int(splits[i, 1]) 
+            for i in range(len(splits))
+        }
+
+        # for this dataset 1 = train and 0 = test
+        # split_idx is 0 if "test", but 1 if "train" or "val" since we build val from train
+        split_idx = 0 if self.split=="test" else 1
+
+        images_for_split = [key for key in image_split_dict.keys() if image_split_dict[key]==split_idx]
+
+        return images_for_split
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img, target = self.data[idx]
+        if self.transform:
+            img = self.transform(img)
+        return img, target
         
 class FE_Dataset(Dataset):
     def __init__(self, lf_embeddings, lf_preds, hf_preds, labels):
