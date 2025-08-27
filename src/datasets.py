@@ -184,10 +184,6 @@ class CropDataset(Dataset):
         self.img_transform = transforms.Compose([
             transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
             transforms.Resize((224, 224)),  # Resize to model input size
-            transforms.Normalize(
-                mean=[496.38, 816.70, 927.55, 2961.28, 2638.13, 1742.81],
-                std=[286.37, 359.40, 577.06, 897.17, 954.61, 922.32]
-            ),
         ])
         
         self.mask_transform = transforms.Compose([
@@ -205,11 +201,11 @@ class CropDataset(Dataset):
                 path.join(
                     root, 
                     "multi-temporal-crop-classification", 
-                    "validation_chips", line.strip()
+                    "validation_chips", "validation_chips", line.strip()
                 ) for line in val_chips
             ]
 
-            for i in indices:
+            for i in range(len(val_filenames)):
                 for t in range(3): # timestep 
                     for q in range(4): # quandrant of the image
                         self.fileset.append((val_filenames[i], t, q))
@@ -223,7 +219,7 @@ class CropDataset(Dataset):
                 path.join(
                     root, 
                     "multi-temporal-crop-classification", 
-                    "training_chips", line.strip()
+                    "training_chips", "training_chips", line.strip()
                 ) for line in train_chips
             ]
 
@@ -246,12 +242,17 @@ class CropDataset(Dataset):
         return len(self.fileset)
     
     def __getitem__(self, idx:int):
-        base_fname, timestep = self.fileset[idx]
+        base_fname, timestep, _ = self.fileset[idx]
         mask_fname = base_fname + ".mask.tif"
         image_fname = base_fname + "_merged.tif"
 
         mask = tif.imread(mask_fname)
         image_set = tif.imread(image_fname)
+
+        img_min = image_set.min()
+        img_max = image_set.max()
+
+        image_set = (image_set - img_min) / (img_max - img_min + 1e-8)
 
         x_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
         x_end = x_start + 56
@@ -260,10 +261,10 @@ class CropDataset(Dataset):
         y_end = y_start + 56
 
         hf_image = image_set[x_start:x_end, y_start:y_end, 6*timestep:6*(timestep+1)]
+        hf_image[:,:,:3] = hf_image[:, :, [2, 1, 0]]
         hf_image = self.img_transform(hf_image)
 
-        lf_image = hf_image[:, :, :3]
-        hf_image = hf_image[:, :, 3:]
+        lf_image = hf_image[:3]
 
         mask = mask[x_start:x_end, y_start:y_end]
         mask = self.mask_transform(mask)
