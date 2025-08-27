@@ -276,7 +276,7 @@ class CUBDataset(Dataset):
             self, 
             root: str, 
             split: str, 
-            seed:int, 
+            seed:int=42, 
             transform=None
     ):
         assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
@@ -284,6 +284,18 @@ class CUBDataset(Dataset):
         self.transform = transform
         self.root = root
         self.split = split
+        self.generator = torch.Generator().manual_seed(seed)
+
+        self.lf_transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),  # Convert image to grayscale with 1 channel
+            transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
+            transforms.Resize((224, 224)),  # Resize to model input size
+        ])
+
+        self.hf_transform = transforms.Compose([
+            transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
+            transforms.Resize((224, 224)),  # Resize to model input size
+        ])
 
         image_split = self.get_split()
 
@@ -291,9 +303,14 @@ class CUBDataset(Dataset):
             num_images = len(image_split)
             val_ratio = .1
             val_size = int(val_ratio * num_images)
-            
-            self.generator = torch.Generator().manual_seed(seed)
+            train_size = num_images - val_size
 
+            train_set, val_set = random_split(image_split, [train_size, val_size], generator=self.generator)
+            indices = train_set.indices if split == "train" else val_set.indices
+            self.data = [image_split[i] for i in indices]
+
+        else:
+            self.data = image_split
 
     def get_split(self):
         splits_file = os.path.join(self.root, "train_test_split.txt")
@@ -324,10 +341,20 @@ class CUBDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        img, target = self.data[idx]
-        if self.transform:
-            img = self.transform(img)
-        return img, target
+        local_fname = self.data[idx]
+        # example: 045.Northern_Fulmar/Northern_Fulmar_0010_44112.jpg
+
+        metadata = local_fname.split(".")
+        # example: [045, Northern_Fulmar/Northern_Fulmar_0010_44112, jpg]
+
+        label = int(metadata[0]) # 045 -> labeled as class 45
+        fname = os.path.join(self.root, "images", local_fname)
+
+        image = Image.open(fname).convert("RGB")
+        lf_img = self.lf_transform(image)
+        hf_img = self.hf_transform(image)
+
+        return lf_img, hf_img, label
         
 class FE_Dataset(Dataset):
     def __init__(self, lf_embeddings, lf_preds, hf_preds, labels):
