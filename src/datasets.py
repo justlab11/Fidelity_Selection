@@ -3,10 +3,7 @@ from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 import numpy as np
 from torch.utils.data import Dataset, random_split
-from PIL import Image, ImageFilter
-from sklearn.model_selection import train_test_split
-from torchvision.models import ResNet18_Weights
-import glob
+from PIL import Image
 import os.path as path
 import tifffile as tif
 import os
@@ -14,7 +11,7 @@ import os
 import numpy as np
 import torch
 
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import numpy as np
 import torch
 
@@ -347,7 +344,7 @@ class CUBDataset(Dataset):
         metadata = local_fname.split(".")
         # example: [045, Northern_Fulmar/Northern_Fulmar_0010_44112, jpg]
 
-        label = int(metadata[0]) # 045 -> labeled as class 45
+        label = int(metadata[0])-1 # 045 -> labeled as class 44 because 1 indexing
         fname = os.path.join(self.root, "images", local_fname)
 
         image = Image.open(fname).convert("RGB")

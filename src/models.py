@@ -3,26 +3,6 @@ import torch.nn as nn
 from torchvision import models
 from sklearn.svm import SVC
 
-def build_mlp(input_size, num_layers, output_size, hidden_size=64, device='cpu'):
-    layers = []
-    
-    # Input layer
-    layers.append(nn.Linear(input_size, hidden_size))
-    layers.append(nn.ReLU())
-    
-    # Hidden layers
-    for _ in range(num_layers - 1):
-        layers.append(nn.Linear(hidden_size, hidden_size))
-        layers.append(nn.ReLU())
-    
-    # Output layer
-    layers.append(nn.Linear(hidden_size, output_size))
-    
-    # Create the sequential model
-    model = nn.Sequential(*layers).to(device)
-    
-    return model
-
 class CustomMLP(nn.Module):
     def __init__(self, input_size, num_layers, output_size, hidden_size=64):
         super().__init__()
@@ -55,11 +35,11 @@ class CustomMLP(nn.Module):
         return layers
     
 class CustomResNet18(nn.Module):
-    def __init__(self, latent_size, output_size, three_channel=True):
+    def __init__(self, latent_size, output_size, num_channels=3):
         super().__init__()
         model = models.resnet18(weights="DEFAULT")
-        if not three_channel:
-            model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        if num_channels != 3:
+            model.conv1 = nn.Conv2d(num_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
 
         num_ftrs = model.fc.in_features
         model.fc = nn.Identity()
@@ -82,39 +62,6 @@ class CustomResNet18(nn.Module):
         layers.append(x)
 
         return layers
-
-def build_resnet(latent_size, output_size, device='cpu', three_channel=True):
-    # Dictionary mapping resnet_size to the corresponding model function
-    
-    # Check if the requested ResNet size is valid    
-    # Get the appropriate ResNet model
-    model = models.resnet18(weights="DEFAULT")
-
-    # Add in the new conv1 layer for 6 channel
-    if not three_channel:
-        model.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    
-    # Remove the original fully connected layer
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Identity()
-    
-    # Create a new sequential module for the final layers
-    new_head = nn.Sequential(
-        nn.Linear(num_ftrs, latent_size),
-        nn.ReLU(),
-        nn.Linear(latent_size, output_size)
-    )
-    
-    # Create a new sequential model combining ResNet and the new head
-    full_model = nn.Sequential(
-        model,
-        new_head
-    )
-    
-    # Move the model to the specified device
-    full_model = full_model.to(device)
-    
-    return full_model
 
 def build_svm(C=1.0, kernel='rbf'):
     valid_kernels = ['linear', 'poly', 'rbf', 'sigmoid', 'precomputed']
