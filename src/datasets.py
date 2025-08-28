@@ -262,6 +262,7 @@ class CropDataset(Dataset):
         hf_image = self.img_transform(hf_image)
 
         lf_image = hf_image[:3]
+        hf_image = hf_image[3:] # we concatenate later in the code so we split here
 
         mask = mask[x_start:x_end, y_start:y_end]
         mask = self.mask_transform(mask)
