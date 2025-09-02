@@ -33,6 +33,7 @@ class MetaLossFunction(nn.Module):
         batch_size = len(y_true)
         model_losses = []
         choices = nn.Softmax(dim=1)(choices)
+        choices = choices.to(self.device)
 
         with torch.no_grad():
             for pred in y_preds:
@@ -49,10 +50,11 @@ class MetaLossFunction(nn.Module):
 
         cw_matrix = cw_matrix.to(self.device)
         ch_matrix = ch_matrix.to(self.device)
+        model_losses_tensor = model_losses_tensor.to(self.device)
 
         model_loss_weights = model_losses_tensor * (cw_matrix + ch_matrix)
+        meta_loss = choices.T * model_loss_weights
 
-        self.meta_loss = choices.T * model_loss_weights
+        loss_result = torch.sum(meta_loss) / batch_size
 
-
-        return torch.sum(self.meta_loss)
+        return loss_result
