@@ -2,14 +2,13 @@ import torch
 import torch.nn as nn
 import numpy as np
 import random
-from torch.utils.data import DataLoader, Subset
-from torchvision.models.feature_extraction import create_feature_extractor
-from models import build_mlp, build_resnet
-from custom_types import ConfigOptions, DatasetSettings
 import torchvision.transforms as transforms
 import yaml
 from os import path
-from datasets import HypercubeDataset, MNISTDataset, CropDataset, FE_Dataset
+
+from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset, FE_Dataset
+from custom_types import ConfigOptions, DatasetSettings
+from models import CustomMLP, CustomResNet18, build_unet, LatentCNNHead
 
 def load_yaml_options(config_file: str) -> ConfigOptions:
     with open(config_file, 'r') as file:
@@ -69,7 +68,7 @@ def build_dataset(dataset_settings: DatasetSettings, seed: int):
         hf_std = np.random.uniform(0.25, 0.4, size=num_clusters)
         lf_std = np.random.uniform(0.4, 0.6, size=num_clusters)
 
-        total_num_samples = 3000
+        total_num_samples = 500
         train_samples = int(total_num_samples*.8)
         test_samples = int(total_num_samples*.1)
         val_samples = int(total_num_samples*.1)
@@ -158,8 +157,100 @@ def build_dataset(dataset_settings: DatasetSettings, seed: int):
             root=ds_folder,
             seed=seed,
         )
+    
+    elif ds_name == "cub":
+        train_ds = CUBDataset(
+            root=ds_folder,
+            split="train",
+            seed=seed
+        )
+
+        test_ds = CUBDataset(
+            root=ds_folder,
+            split="test",
+            seed=seed        
+        )
+
+        val_ds = CUBDataset(
+            root=ds_folder,
+            split="val",
+            seed=seed
+        )
 
     return train_ds, test_ds, val_ds
+
+def build_models(dataset_settings, latent_size=64):
+    ds_name: str = dataset_settings.name
+    ds_types = {
+        "toy": "mlp",
+        "mnist": "image",
+        "cub": "image",
+        "crop": "seg"
+    }
+
+    match ds_types[ds_name]:
+        case "mlp":
+            lf_model = CustomMLP(
+                input_size=2,
+                num_layers=2,
+                output_size=4,
+                hidden_size=32
+            )
+
+            hf_model = CustomMLP(
+                input_size=4,
+                num_layers=2,
+                output_size=4,
+                hidden_size=32
+            )
+
+            fe_model = CustomMLP(
+                input_size=32,
+                num_layers=3,
+                output_size=2
+            )
+
+        case "image":
+            num_classes: int = 10 if ds_name=="mnist" else 200
+
+            lf_model = CustomResNet18(
+                latent_size=256,
+                output_size=num_classes,
+                num_channels=3
+            )
+
+            hf_model = CustomResNet18(
+                latent_size=256,
+                output_size=num_classes,
+                num_channels=6
+            )
+
+            fe_model = CustomMLP(
+                input_size=latent_size,
+                num_layers=5,
+                output_size=2,
+                hidden_size=latent_size
+            )
+
+        case "seg":
+            num_classes: int = 14
+
+            lf_model = build_unet(
+                num_channels=3,
+                num_classes=num_classes
+            )
+
+            hf_model = build_unet(
+                num_channels=6,
+                num_classes=num_classes
+            )
+
+            fe_model = LatentCNNHead(
+                in_channels=1024,
+                num_classes=num_classes
+            )
+
+    return lf_model, hf_model, fe_model
 
 def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
     """
@@ -520,6 +611,7 @@ class EarlyStopper:
                 return True
         return False
     
+
 # def build_metadata(config: Options):
 #     augmentation = config.dataset.augmentation
 #     dataset = config.dataset.name

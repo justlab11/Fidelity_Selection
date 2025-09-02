@@ -285,7 +285,7 @@ class CUBDataset(Dataset):
         self.generator = torch.Generator().manual_seed(seed)
 
         self.lf_transform = transforms.Compose([
-            transforms.Grayscale(num_output_channels=1),  # Convert image to grayscale with 1 channel
+            transforms.Grayscale(num_output_channels=3),  # Convert image to grayscale with 3 channels
             transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
             transforms.Resize((224, 224)),  # Resize to model input size
         ])
