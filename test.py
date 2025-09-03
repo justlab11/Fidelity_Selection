@@ -253,12 +253,11 @@ class LatentCNNHead(nn.Module):
         x = x.view(x.size(0), -1)
         return self.fc(x)
 
-from src.datasets import CUBDataset, FE_Dataset, CropDataset
+from src.datasets import CUBDataset, CropDataset
 import numpy as np
 import torch
 from torchvision import transforms
-from torch.utils.data import DataLoader
-
+from torch.utils.data import DataLoader, Dataset
 
 train_ds = CropDataset(
     root="data",
@@ -309,86 +308,6 @@ print(DEVICE)
 lf_model = lf_model.to(DEVICE)
 hf_model = hf_model.to(DEVICE)
 
-def create_fe_dataset(dataloader, lf_model, hf_model, device):
-    lf_embeddings = []
-    lf_preds = []
-    hf_preds = []
-    labels = []
-
-    # Set models to eval mode
-    lf_model.eval()
-    hf_model.eval()
-
-    lf_model.to(device)
-    hf_model.to(device)
-
-    with torch.no_grad():
-        for lf_sample, hf_sample, label in dataloader:
-            if device is not None:
-                lf_sample = lf_sample.to(device, torch.float)
-                hf_sample = hf_sample.to(device, torch.float)
-                label = label.to(device)
-
-            # LF model
-            lf_outs = lf_model(lf_sample)
-            lf_embed = lf_outs[0]
-            lf_pred = lf_outs[-1]
-
-            # HF model (concatenate lf_sample and hf_sample along last dim)
-            hf_input = torch.cat([lf_sample, hf_sample], dim=1)
-            hf_outs = hf_model(hf_input)
-            hf_pred = hf_outs[-1]
-
-            lf_embeddings.append(lf_embed.cpu())
-            lf_preds.append(lf_pred.cpu())
-            hf_preds.append(hf_pred.cpu())
-            labels.append(label.cpu())
-
-    # Concatenate all batches
-    lf_embeddings = torch.cat(lf_embeddings, dim=0)
-    lf_preds = torch.cat(lf_preds, dim=0)
-    hf_preds = torch.cat(hf_preds, dim=0)
-    labels = torch.cat(labels, dim=0)
-
-    return FE_Dataset(lf_embeddings, lf_preds, hf_preds, labels)
-
-fe_train_ds = create_fe_dataset(
-    dataloader=train_loader,
-    lf_model=lf_model,
-    hf_model=hf_model,
-    device=DEVICE
-)
-
-fe_val_ds = create_fe_dataset(
-    dataloader=val_loader,
-    lf_model=lf_model,
-    hf_model=hf_model,
-    device=DEVICE
-)
-
-fe_test_ds = create_fe_dataset(
-    dataloader=test_loader,
-    lf_model=lf_model,
-    hf_model=hf_model,
-    device=DEVICE
-)
-
-fe_train_loader = DataLoader(
-    fe_train_ds,
-    batch_size=64,
-    shuffle=True
-)
-
-fe_val_loader = DataLoader(
-    fe_val_ds,
-    batch_size=64
-)
-
-fe_test_loader = DataLoader(
-    fe_test_ds,
-    batch_size=64
-)
-
 class MetaLossFunction(nn.Module):
     def __init__(self, ch, cw: float, device: str, loss_fun: str="CE"):
         '''
@@ -433,7 +352,7 @@ class MetaLossFunction(nn.Module):
 
         return expected_costs.mean()
     
-def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
+def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None, lf_model=None, hf_model=None):
     """
     Perform one run through the DataLoader.
 
@@ -451,6 +370,13 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
         return
 
     model.train(mode=bool(optimizer))
+    if hf_model and lf_model:
+        hf_model = hf_model.to(device)
+        lf_model = lf_model.to(device)
+
+        hf_model.eval()
+        lf_model.eval()
+
     device = next(model.parameters()).device
     total_loss = 0.0
     total_correct = 0
@@ -496,10 +422,19 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
             scheduler.step()
 
     elif fidelity == "gate":
-        for lf_embeddings, lf_preds, hf_preds, target in dataloader:
-            lf_embeddings = lf_embeddings.to(device, torch.float)
-            lf_preds = lf_preds.to(device, torch.float)      # [B, C, H, W]
-            hf_preds = hf_preds.to(device, torch.float)      # [B, C, H, W]
+        lf_model.eval()
+        hf_model.eval()
+
+        for lf_data, hf_data, target in dataloader:
+            with torch.no_grad():
+                target = target.long()
+                data = torch.cat([lf_data, hf_data], dim=1)
+
+                data, target = data.to(device, torch.float), target.to(device)
+                lf_data = lf_data.to(device, torch.float)
+
+                lf_embeddings, lf_preds = lf_model(lf_data)
+                hf_preds = hf_model(data)
 
             target = target.long().to(device)                # [B, H, W]
 
@@ -542,7 +477,6 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
         return average_loss, accuracy, high_count
     
     return average_loss, accuracy
-
 
 
 for r in range(0, 101, 1):
