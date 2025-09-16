@@ -24,13 +24,13 @@ class CustomMLP(nn.Module):
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
-        layers = []
+        layers = {}
 
         x = self.model(x)
-        layers.append(x)
+        layers["latent"] = x
 
         x = self.output_layer(x)
-        layers.append(x)
+        layers["output"] = x
 
         return layers
     
@@ -51,15 +51,82 @@ class CustomResNet18(nn.Module):
             nn.Linear(latent_size, output_size)
         )
 
-    def forward(self, x):
-        layers = []
+    def freeze_body(self, freeze=True):
+        for param in self.model.parameters():
+            param.requires_grad = not freeze
 
-        x = self.model(x)
+    def head(self, x):
+        layers = {}
+
         x = self.latent_rep(x)
-        layers.append(x)
+        layers["latent"] = x
         
         x = self.output_layer(x)
-        layers.append(x)
+        layers["output"] = x
+
+        return layers
+
+    def forward(self, x):
+        layers = {}
+
+        x = self.model(x)
+        layers["body_output"] = x
+
+        x = self.latent_rep(x)
+        layers["latent"] = x
+        
+        x = self.output_layer(x)
+        layers["output"] = x
+
+        return layers
+    
+class CustomViT(nn.Module):
+    def __init__(self, latent_size, output_size):
+        super().__init__()
+        # Load vision transformer backbone with pretrained weights
+        model = models.vit_b_16(weights="DEFAULT")  # or weights=None for no pretrained
+        
+        # Remove the original classification head
+        num_ftrs = model.heads.head.in_features
+        model.heads.head = nn.Identity()
+        
+        self.model = model
+        self.latent_rep = nn.Sequential(
+            nn.Linear(num_ftrs, latent_size),
+            nn.Dropout(p=0.4)
+        )
+        self.output_layer = nn.Sequential(
+            nn.ReLU(),
+            nn.Dropout(p=0.4),
+            nn.Linear(latent_size, output_size)
+        )
+
+    def freeze_body(self, freeze=True):
+        for param in self.model.parameters():
+            param.requires_grad = not freeze
+
+    def head(self, x):
+        layers = {}
+
+        x = self.latent_rep(x)
+        layers["latent"] = x
+        
+        x = self.output_layer(x)
+        layers["output"] = x
+
+        return layers
+
+    def forward(self, x):
+        layers = {}
+
+        x = self.model(x)  # forward through ViT body
+        layers["body_output"] = x
+
+        x = self.latent_rep(x)
+        layers["latent"] = x
+
+        x = self.output_layer(x)
+        layers["output"] = x
 
         return layers
 
