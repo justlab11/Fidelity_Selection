@@ -45,10 +45,14 @@ class CustomResNet18(nn.Module):
         model.fc = nn.Identity()
 
         self.model = model
-        self.latent_rep = nn.Linear(num_ftrs, latent_size)
+        self.latent_rep = nn.Sequential(
+            nn.Linear(num_ftrs, latent_size),
+            nn.Dropout(p=0.6)
+        )
         self.output_layer = nn.Sequential(
             nn.ReLU(),
-            nn.Linear(latent_size, output_size)
+            nn.Dropout(p=0.6),
+            nn.Linear(latent_size, output_size),
         )
 
     def freeze_body(self, freeze=True):
@@ -93,11 +97,11 @@ class CustomViT(nn.Module):
         self.model = model
         self.latent_rep = nn.Sequential(
             nn.Linear(num_ftrs, latent_size),
-            nn.Dropout(p=0.4)
+            nn.Dropout(p=0.6)
         )
         self.output_layer = nn.Sequential(
             nn.ReLU(),
-            nn.Dropout(p=0.4),
+            nn.Dropout(p=0.6),
             nn.Linear(latent_size, output_size)
         )
 

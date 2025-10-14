@@ -357,7 +357,7 @@ def build_model(model_name, latent_size, output_size, input_size=None):
 
     return model
 
-def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
+def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, optimizer=None, scheduler=None):
     """
     Perform one run through the DataLoader.
 
@@ -384,7 +384,12 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
         for data, _, target in dataloader:
             target = target.type(torch.LongTensor)
             data, target = data.to(device, torch.float), target.to(device)
-            output = model(data)[-1]
+            
+            if train_body:
+                output = model(data)["output"]
+
+            else:
+                output = model.head(data)["output"]
 
             loss = criterion(output, target)
             if optimizer:
@@ -396,6 +401,7 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
             predicted = torch.argmax(output, dim=1)
             total_correct += (predicted == target).sum().item()
             total_samples += data.size(0)
+
         if scheduler:
             scheduler.step()
 
@@ -403,9 +409,14 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
         for lf_data, hf_data, target in dataloader:
             target = target.type(torch.LongTensor)
             data = torch.cat([lf_data, hf_data], dim=1)
-
             data, target = data.to(device, torch.float), target.to(device)
-            output = model(data)[-1]
+
+            if train_body:
+                output = model(data)["output"]
+
+            else:
+                output = model.head(data)["output"]
+
             loss = criterion(output, target)
             if optimizer:
                 optimizer.zero_grad()
@@ -416,6 +427,7 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
             predicted = torch.argmax(output, dim=1)
             total_correct += (predicted == target).sum().item()
             total_samples += data.size(0)
+
         if scheduler:
             scheduler.step()
 
@@ -464,13 +476,11 @@ def save_body(
         lf_model: nn.Module,
         hf_model: nn.Module,  
         dataloader: DataLoader,
-        folder: str, 
-        split: str, 
+        save_folder: str, 
         device):
     
     lf_model = lf_model.to(device)
     hf_model = hf_model.to(device)
-    save_folder = os.path.join(folder, split)
     os.mkdir(save_folder)
 
     lf_model.eval()
@@ -498,7 +508,59 @@ def save_body(
                     "label": label
                 }, os.path.join(save_folder, f"sample_{batch_idx}_{i}.pt"))
 
-    logger.info(f"Finished saving {split} split to {save_folder}")
+    logger.info(f"Finished saving split to {save_folder}")
+
+def save_latent(
+        lf_model: nn.Module,
+        hf_model: nn.Module,  
+        dataloader: DataLoader,
+        save_folder: str, 
+        train_body: bool,
+        device):
+
+    lf_model = lf_model.to(device)
+    hf_model = hf_model.to(device)
+    os.mkdir(save_folder)
+
+    lf_model.eval()
+    hf_model.eval()
+
+    with torch.no_grad():
+        for batch_idx, (lf, hf, labels) in enumerate(dataloader):
+            lf = lf.to(device)
+            hf = hf.to(device)
+            labels = labels.to(device)
+
+            if train_body:
+                lf_head = lf_model(lf)
+                hf_head = hf_model(hf)
+            else:
+                lf_head = lf_model.head(lf)
+                hf_head = hf_model.head(hf)
+            
+
+            lf_latent = lf_head["latent"]
+            lf_output = lf_head["output"]
+
+            # Pass hf through hf_model head (latent + output)
+            hf_output = hf_head["output"]
+
+            lf_latent = lf_latent.cpu()
+            lf_output = lf_output.cpu()
+            hf_output = hf_output.cpu()
+            labels = labels.cpu()
+
+            batch_size = lf_latent.size(0)
+            for i in range(batch_size):
+                torch.save({
+                    "lf_latent": lf_latent[i],
+                    "lf_output": lf_output[i],
+                    "hf_output": hf_output[i],
+                    "label": labels[i]
+                }, os.path.join(save_folder, f"sample_{batch_idx}_{i}.pt"))
+
+
+
 
 def get_folder_size(folder):
     total_size = 0
