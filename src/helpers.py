@@ -4,8 +4,10 @@ import numpy as np
 import random
 import torchvision.transforms as transforms
 import yaml
-from os import path
+import os
 import logging
+from torch.utils.data import DataLoader
+
 
 from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset, FE_Dataset
 from custom_types import ConfigOptions, DatasetSettings
@@ -457,6 +459,59 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
         return average_loss, accuracy.item(), high_count
 
     return average_loss, accuracy
+
+def save_body(
+        lf_model: nn.Module,
+        hf_model: nn.Module,  
+        dataloader: DataLoader,
+        folder: str, 
+        split: str, 
+        device):
+    
+    lf_model = lf_model.to(device)
+    hf_model = hf_model.to(device)
+    save_folder = os.path.join(folder, split)
+    os.mkdir(save_folder)
+
+    lf_model.eval()
+    hf_model.eval()
+
+    with torch.no_grad():
+        for batch_idx, (lf_sample, hf_sample, label) in enumerate(dataloader):
+            lf_sample = lf_sample.to(device)
+            hf_sample = hf_sample.to(device)
+            labels = labels.to(device)
+
+            lf_out_batch = lf_model(lf_sample)["body_output"].cpu()
+            hf_out_batch = hf_model(hf_sample)["body_output"].cpu()
+            labels_batch = labels.cpu()
+
+            batch_size = lf_out_batch.size(0)
+            for i in range(batch_size):
+                lf_out = lf_out_batch[i]
+                hf_out = hf_out_batch[i]
+                label = labels_batch[i]
+
+                torch.save({
+                    "lf_body_output": lf_out,
+                    "hf_body_output": hf_out,
+                    "label": label
+                }, os.path.join(save_folder, f"sample_{batch_idx}_{i}.pt"))
+
+    logger.info(f"Finished saving {split} split to {save_folder}")
+
+def get_folder_size(folder):
+    total_size = 0
+    try:
+        for entry in os.scandir(folder):
+            if entry.is_file():
+                total_size += entry.stat().st_size
+            elif entry.is_dir():
+                total_size += get_folder_size(entry.path)
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return 0
+    return total_size
+
 
 def create_fe_dataset(dataloader, lf_model, hf_model, device):
     lf_embeddings = []

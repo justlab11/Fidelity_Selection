@@ -386,6 +386,24 @@ class CUBDataset(Dataset):
 
         return lf_img, hf_img, label
         
+class EmbeddingsDataset(Dataset):
+    def __init__(self, folder_path):
+        self.folder_path = folder_path
+        self.files = sorted(os.listdir(folder_path))  # List all .pt files sorted
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        file_path = os.path.join(self.folder_path, self.files[idx])
+        data = torch.load(file_path)
+
+        lf_body_output = data['lf_body_output']
+        hf_body_output = data['hf_body_output']
+        label = data['label']
+
+        return lf_body_output, hf_body_output, label
+
 class FE_Dataset(Dataset):
     def __init__(self, lf_embeddings, lf_preds, hf_preds, labels):
         super(FE_Dataset, self).__init__()
