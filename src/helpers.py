@@ -9,7 +9,7 @@ import logging
 
 from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset, FE_Dataset
 from custom_types import ConfigOptions, DatasetSettings
-from models import CustomMLP, CustomResNet18, build_unet, LatentCNNHead
+from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +272,7 @@ def build_dataset(dataset_name: str, seed: int, folder="../data"):
                 seed=seed,
                 grayscale=False
             )    
-            
+
         # https://huggingface.co/datasets/ibm-nasa-geospatial/multi-temporal-crop-classification
         # multi-temporal crop classification dataset
         # lf = rgb; hf = rgb + 3 IR channels
@@ -301,200 +301,59 @@ def build_dataset(dataset_name: str, seed: int, folder="../data"):
         
     return train_ds, test_ds, val_ds
 
-
-def build_datasets(dataset_settings: DatasetSettings, seed: int):
-    ds_name: str = dataset_settings.name
-    ds_folder: str = dataset_settings.folder
-
-    if ds_name =="toy":
-        num_dims = 2
-        num_clusters = 2 ** num_dims
-        hf_std = np.random.uniform(0.25, 0.4, size=num_clusters)
-        lf_std = np.random.uniform(0.4, 0.6, size=num_clusters)
-
-        total_num_samples = 500
-        train_samples = int(total_num_samples*.8)
-        test_samples = int(total_num_samples*.1)
-        val_samples = int(total_num_samples*.1)
-
-        train_samples_per_cluster = np.full(num_clusters, train_samples // num_clusters)
-        test_samples_per_cluster = np.full(num_clusters, test_samples // num_clusters)
-        val_samples_per_cluster = np.full(num_clusters, val_samples // num_clusters)
-
-        train_ds = HypercubeDataset(
-            num_dims=num_dims,
-            num_samples=train_samples_per_cluster,
-            hf_std=hf_std,
-            lf_std=lf_std,
-        )
-
-        test_ds = HypercubeDataset(
-            num_dims=num_dims,
-            num_samples=test_samples_per_cluster,
-            hf_std=hf_std,
-            lf_std=lf_std,
-        )
-
-        val_ds = HypercubeDataset(
-            num_dims=num_dims,
-            num_samples=val_samples_per_cluster,
-            hf_std=hf_std,
-            lf_std=lf_std,
-        )
-
-    elif ds_name == "mnist":
-        hf_augment: str = dataset_settings.high_fidelity.aug_name
-        hf_aug_str: float = dataset_settings.high_fidelity.strength
-        
-        lf_augment: str = dataset_settings.low_fidelity.aug_name
-        lf_aug_str: float = dataset_settings.low_fidelity.strength
-
-        hf_transform = build_mnist_transform(
-            aug_name=hf_augment,
-            aug_strength=hf_aug_str
-        )
-
-        lf_transform = build_mnist_transform(
-            aug_name=lf_augment,
-            aug_strength=lf_aug_str
-        )
-
-        train_ds = MNISTDataset(
-            split="train",
-            root=ds_folder,
-            seed=seed,
-            hf_transform=hf_transform,
-            lf_transform=lf_transform
-        )
-
-        test_ds = MNISTDataset(
-            split="test",
-            root=ds_folder,
-            seed=seed,
-            hf_transform=hf_transform,
-            lf_transform=lf_transform
-        )
-
-        val_ds = MNISTDataset(
-            split="val",
-            root=ds_folder,
-            seed=seed,
-            hf_transform=hf_transform,
-            lf_transform=lf_transform
-        )
-
-    elif ds_name == "crop":
-        train_ds = CropDataset(
-            split="train",
-            root=ds_folder,
-            seed=seed,
-        )
-
-        test_ds = CropDataset(
-            split="test",
-            root=ds_folder,
-            seed=seed,
-        )
-
-        val_ds = CropDataset(
-            split="val",
-            root=ds_folder,
-            seed=seed,
-        )
-    
-    elif ds_name == "cub":
-        train_ds = CUBDataset(
-            root=ds_folder,
-            split="train",
-            seed=seed
-        )
-
-        test_ds = CUBDataset(
-            root=ds_folder,
-            split="test",
-            seed=seed        
-        )
-
-        val_ds = CUBDataset(
-            root=ds_folder,
-            split="val",
-            seed=seed
-        )
-
-    return train_ds, test_ds, val_ds
-
-def build_models(dataset_settings, latent_size=64):
-    ds_name: str = dataset_settings.name
-    ds_types = {
-        "toy": "mlp",
-        "mnist": "image",
-        "cub": "image",
-        "crop": "seg"
-    }
-
-    match ds_types[ds_name]:
+def build_model(model_name, latent_size, output_size, input_size=None):
+    match model_name:
+        # multilayer perceptron used for toy dataset case
         case "mlp":
-            lf_model = CustomMLP(
-                input_size=2,
+            if input_size is None:
+                logger.error("Parameter input_size must be set for this model")
+                raise ValueError("Parameter input_size must be set for this model")
+
+            model = CustomMLP(
+                input_size=input_size,
                 num_layers=2,
-                output_size=4,
+                output_size=output_size,
                 hidden_size=32
             )
 
-            hf_model = CustomMLP(
-                input_size=4,
-                num_layers=2,
-                output_size=4,
-                hidden_size=32
+        # ResNet18 used for image classification tasks (MNIST + CUB-200)
+        case "resnet":
+            if input_size is None:
+                logger.error("Parameter input_size must be set for this model")
+                raise ValueError("Parameter input_size must be set for this model")
+
+            model = CustomResNet18(
+                latent_size=latent_size,
+                num_channels=input_size,
+                output_size=output_size
             )
 
-            fe_model = CustomMLP(
-                input_size=32,
-                num_layers=3,
-                output_size=2
+        # VIT used for image classification tasks (MNIST + CUB-200)
+        case "vit":
+            model = CustomViT(
+                latent_size=latent_size,
+                output_size=output_size
             )
 
-        case "image":
-            num_classes: int = 10 if ds_name=="mnist" else 200
+        # UNET used for image segmentation tasks (Crop)
+        case "unet":
+            if input_size is None:
+                logger.error("Parameter input_size must be set for this model")
+                raise ValueError("Parameter input_size must be set for this model")
 
-            lf_model = CustomResNet18(
-                latent_size=256,
-                output_size=num_classes,
-                num_channels=3
+            model = build_unet(
+                num_channels=input_size,
+                num_classes=output_size
             )
 
-            hf_model = CustomResNet18(
-                latent_size=256,
-                output_size=num_classes,
-                num_channels=6
+        # CNN head specifically for the FE model if the UNET is used for the LF model
+        case "cnn_head":
+            model = LatentCNNHead(
+                in_channels=latent_size,
+                num_classes=output_size
             )
 
-            fe_model = CustomMLP(
-                input_size=latent_size,
-                num_layers=5,
-                output_size=2,
-                hidden_size=latent_size
-            )
-
-        case "seg":
-            num_classes: int = 14
-
-            lf_model = build_unet(
-                num_channels=3,
-                num_classes=num_classes
-            )
-
-            hf_model = build_unet(
-                num_channels=6,
-                num_classes=num_classes
-            )
-
-            fe_model = LatentCNNHead(
-                in_channels=1024,
-                num_classes=num_classes
-            )
-
-    return lf_model, hf_model, fe_model
+    return model
 
 def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
     """
