@@ -8,10 +8,10 @@ import os
 import logging
 from torch.utils.data import DataLoader
 
-
 from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset, FE_Dataset
 from custom_types import ConfigOptions, DatasetSettings
 from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead
+from losses import MetaLossFunction
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +315,7 @@ def build_model(model_name, latent_size, output_size, input_size=None):
                 input_size=input_size,
                 num_layers=2,
                 output_size=output_size,
-                hidden_size=32
+                hidden_size=latent_size
             )
 
         # ResNet18 used for image classification tasks (MNIST + CUB-200)
@@ -351,7 +351,7 @@ def build_model(model_name, latent_size, output_size, input_size=None):
         # CNN head specifically for the FE model if the UNET is used for the LF model
         case "cnn_head":
             model = LatentCNNHead(
-                in_channels=latent_size,
+                in_channels=input_size,
                 num_classes=output_size
             )
 
@@ -559,8 +559,7 @@ def save_latent(
                     "label": labels[i]
                 }, os.path.join(save_folder, f"sample_{batch_idx}_{i}.pt"))
 
-
-
+    logger.info(f"Finished saving split to {save_folder}")
 
 def get_folder_size(folder):
     total_size = 0
@@ -574,169 +573,114 @@ def get_folder_size(folder):
         return 0
     return total_size
 
-
-def create_fe_dataset(dataloader, lf_model, hf_model, device):
-    lf_embeddings = []
-    lf_preds = []
-    hf_preds = []
-    labels = []
-
-    # Set models to eval mode
-    lf_model.eval()
-    hf_model.eval()
-
-    lf_model.to(device)
-    hf_model.to(device)
-
-    with torch.no_grad():
-        for lf_sample, hf_sample, label in dataloader:
-            if device is not None:
-                lf_sample = lf_sample.to(device)
-                hf_sample = hf_sample.to(device)
-                label = label.to(device)
-
-            # LF model
-            lf_outs = lf_model(lf_sample)
-            lf_embed = lf_outs[0]
-            lf_pred = lf_outs[-1]
-
-            # HF model (concatenate lf_sample and hf_sample along last dim)
-            hf_input = torch.cat([lf_sample, hf_sample], dim=1)
-            hf_outs = hf_model(hf_input)
-            hf_pred = hf_outs[-1]
-
-            lf_embeddings.append(lf_embed.cpu())
-            lf_preds.append(lf_pred.cpu())
-            hf_preds.append(hf_pred.cpu())
-            labels.append(label.cpu())
-
-    # Concatenate all batches
-    lf_embeddings = torch.cat(lf_embeddings, dim=0)
-    lf_preds = torch.cat(lf_preds, dim=0)
-    hf_preds = torch.cat(hf_preds, dim=0)
-    labels = torch.cat(labels, dim=0)
-
-    return FE_Dataset(lf_embeddings, lf_preds, hf_preds, labels)
-
 def reset_all_weights(model):
     def weight_reset(m):
         if hasattr(m, 'reset_parameters'):
             m.reset_parameters()
     model.apply(weight_reset)
 
+class AdaptiveGridSearch:
+    def __init__(self, fe_model, device, train_dl, val_dl, test_dl, model_folder):
+        self.evaluated_points = []
+        self.fe_model = fe_model
+        self.device = device
+        self.train_dl = train_dl
+        self.val_dl = val_dl
+        self.test_dl = test_dl
+        self.model_folder = model_folder
 
-# class ModelBuilder:
-#     def __init__(self, config: Options, device: torch.device):
-#         self.config = config
-#         self.device = device
+    def find_bracket(self, coverage):
+        # Sort points by r to ensure order
+        self.evaluated_points.sort(key=lambda x: x[0])
 
-#         self.input_sizes = {
-#             "toy": self.config.dataset.toy_dataset_parameters.num_dims,
-#             "mnist": None,
-#             "cifar10": None,
-#             "cifar100": None,
-#         }
+        for i in range(len(self.evaluated_points) - 1):
+            r_a, c_a = self.evaluated_points[i]
+            r_b, c_b = self.evaluated_points[i+1]
+            if c_a <= coverage < c_b:
+                return r_a, r_b
+            
+        # If no exact bracket, use full range as fallback
+        return 0.001, 1
 
-#         self.output_sizes = {
-#             "toy": self.config.dataset.toy_dataset_parameters.num_classes,
-#             "mnist": 10,
-#             "cifar10": 10,
-#             "cifar100": 100,
-#         }
+    def train_fe_model(self, r_val):
+        criterion = MetaLossFunction(
+            ch=[r_val],
+            cw=1,
+            device=self.device
+        )
 
-#     def __build_classifier__(self, model_type, dataset_name, pretrained=None):
-#         input_size = self.input_sizes[dataset_name]
-#         output_size = self.output_sizes[dataset_name]
-#         latent_size = self.config.parameters.latent_representation_size
+        self.fe_model = reset_all_weights(self.fe_model)
+        self.fe_model = self.fe_model.to(self.device)
+        fe_optimizer = torch.optim.Adam(self.fe_model.parameters(), lr=3e-4, weight_decay=1e-5)
 
-#         if "resnet" in model_type:
-#             num_layers = int(model_type[6:])
+        best_val_loss = float('inf')
+        fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
 
-#             model = build_resnet(
-#                 resnet_size=num_layers,
-#                 latent_size=latent_size,
-#                 output_size=output_size,
-#                 pretrained=pretrained,
-#                 device=self.device
-#             )
+        for epoch in range(30):
+            _, _, _ = classifier_one_run(
+                model=self.fe_model,
+                dataloader=self.train_dl,
+                criterion=criterion,
+                fidelity="gate",
+                optimizer=fe_optimizer
+            )
+
+            val_loss, _, val_use = classifier_one_run(
+                model=self.fe_model,
+                dataloader=self.val_dl,
+                criterion=criterion,
+                fidelity="gate",
+            )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(self.fe_model.state_dict(), fe_model_file)
+
+        return val_use
+
+    def evaluate_fe_model(self, r_val):
+        criterion = MetaLossFunction(
+            ch=[r_val],
+            cw=1,
+            device=self.device
+        )
+
+        fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
+        self.fe_model.load_state_dict(torch.load(fe_model_file, weights_only=True))
+        self.fe_model = self.fe_model.to(self.device)
+
+        _, test_acc, test_use = classifier_one_run(
+            model=self.fe_model,
+            dataloader=self.test_dl,
+            criterion=criterion,
+            fidelity="gate",
+        )
+
+        return test_acc, test_use
+
+    def find_r_for_target(self, coverage, tolerance=1e-3):
+        r_low, r_high = self.find_bracket(coverage)
+        reruns = 0
+        while r_high - r_low > tolerance:
+            reruns += 1
+            r_mid = (r_low + r_high) / 2
+            c_mid = self.train_fe_model(r_mid)
+            self.evaluated_points.append((r_mid, c_mid))
+            if c_mid > coverage:
+                r_low = r_mid
+            else:
+                r_high = r_mid
+
+        test_acc, test_use = self.evaluate_fe_model(r_high)
+
+        logger.info(f"\nTook {reruns} passes to find best r value")
+        logger.info(f"For coverage {coverage}:")
+        logger.info(f"\tBest r: {r_high}")
+        logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]}")
+        logger.info(f"\tTest usage: {test_use} / Test acc: {test_acc}")
         
-#         else:
-#             num_layers = self.config.stage1.hf_model.classifier.num_layers
-
-#             model = build_mlp(
-#                 input_size=input_size,
-#                 num_layers=num_layers,
-#                 output_size=output_size
-#             )
-
-#         return model
-
-#     def build_classifiers(self):
-#         dataset_name = self.config.dataset.name
-
-#         hf_model_type = self.config.stage1.hf_model.classifier.type
-#         lf_model_type = self.config.stage1.lf_model.classifier.type
-
-#         if dataset_name == "toy" and hf_model_type != "mlp":
-#             raise ValueError("stage1.hf_model.classifier.type must be 'mlp' with the 'toy' dataset")
-        
-#         if dataset_name == "toy" and lf_model_type != "mlp":
-#             raise ValueError("stage1.lf_model.classifier.type must be 'mlp' with the 'toy' dataset")
-        
-#         hf_pretrained = self.config.stage1.hf_model.classifier.pretrained
-#         lf_pretrained = self.config.stage1.lf_model.classifier.pretrained
-
-#         hf_model = self.__build_classifier__(
-#             model_type=hf_model_type,
-#             dataset_name=dataset_name,
-#             pretrained=hf_pretrained
-#         )
-
-#         lf_model = self.__build_classifier__(
-#             model_type=lf_model_type,
-#             dataset_name=dataset_name,
-#             pretrained=lf_pretrained
-#         )
-
-#         hf_model_path = str(self.config.stage1.hf_model.load_file)
-#         if path.exists(hf_model_path):
-#             hf_state_dict = torch.load(hf_model_path)
-#             hf_model.load_state_dict(hf_state_dict)
-
-#         lf_model_path = str(self.config.stage1.lf_model.load_file)
-#         if path.exists(lf_model_path):
-#             lf_state_dict = torch.load(lf_model_path)
-#             lf_model.load_state_dict(lf_state_dict)
-
-#         return hf_model, lf_model
-
-
-# def fe_nn_one_run(fe_model, hf_model, lf_model, dataloader, criterion, optimizer=None, scheduler=None):
-#     # device = next(hf_model.parameters()).device
-
-#     # lf_body = create_feature_extractor(
-#     #     lf_model, {"7": "body"}
-#     # ).to(device)
-
-#     # for hf_data, lf_data, target in dataloader:
-#     #     target = target.type(torch.LongTensor)
-#     #     hf_data = hf_data.to(device)
-#     #     lf_data = lf_data.to(device)
-#     #     target = target.to(device)
-
-#     #     lf_embeddings = lf_body(lf_data)
-#     #     lf_output = lf_model(lf_data)
-#     #     hf_output = hf_model(hf_data)
-
-#     #     fe_output = fe_model(lf_embeddings)
-        
-#     #     loss = criterion(target, preds, outputs)
-#     #     if optimizer:
-#     #         optimizer.zero_grad()
-#     #         loss.backward()
-#     #         optimizer.step()
-#     pass
-
+        return r_high, test_acc, test_use
+    
 # def fe_svm_one_run(fe_model, hf_model, lf_model, dataloader, hf_weight, mode="train"):
 #     device = next(hf_model.parameters()).device
 
@@ -778,42 +722,6 @@ def reset_all_weights(model):
 #         weights = np.where(best_choices==1, hf_weight, 1)
 #         fe_model.fit(lf_embeddings, labels, sample_weights=weights)
         
-
-
-# def build_qe_model(num_classes: int=2):
-#     qe_model = nn.Sequential(
-#         nn.Linear(32, 64),
-#         nn.ReLU(),
-#         nn.Linear(64, 128),
-#         nn.ReLU(),
-#         nn.Linear(128, 64),
-#         nn.ReLU(),
-#         nn.Linear(64, num_classes),
-#         nn.Softmax(dim=1)
-#     )
-
-#     return qe_model
-
-
-# def build_dataloaders(full_dataset, noise=1):
-#     # train_dataset = BinaryHypercubeDataset(1275, noise_level=noise)
-#     # test_dataset = BinaryHypercubeDataset(150, noise_level=noise)
-#     # val_dataset = BinaryHypercubeDataset(75, noise_level=noise)
-
-#     rand_idxs = np.random.choice(3, p=[.85, .1, .05], size=len(full_dataset))
-#     idxs = np.arange(len(full_dataset))
-
-#     train_dataset = Subset(full_dataset, idxs[rand_idxs==0])
-
-#     test_dataset = Subset(full_dataset, idxs[rand_idxs==1])
-#     val_dataset = Subset(full_dataset, idxs[rand_idxs==2])
-
-#     train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
-#     test_loader = DataLoader(test_dataset, batch_size=512, shuffle=True)
-#     val_loader = DataLoader(val_dataset, batch_size=512, shuffle=True)
-
-#     return train_loader, test_loader, val_loader
-
 class EarlyStopper:
     def __init__(self, patience=1, min_delta=0):
         self.patience = patience
@@ -831,26 +739,3 @@ class EarlyStopper:
                 return True
         return False
     
-
-# def build_metadata(config: Options):
-#     augmentation = config.dataset.augmentation
-#     dataset = config.dataset.name
-#     aug_deg = config.dataset.augmentation_level
-
-#     metadata = MetaData(
-#         loss = PerformanceData(
-#             train = [],
-#             test = [],
-#             val = []
-#         ),
-#         acc = PerformanceData(
-#             train = [],
-#             test = [],
-#             val = []
-#         ),
-#         augmentation = augmentation,
-#         augmentation_degree = aug_deg,
-#         dataset = dataset
-#     )
-
-#     return metadata
