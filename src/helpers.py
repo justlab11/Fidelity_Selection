@@ -589,14 +589,14 @@ class AdaptiveGridSearch:
         self.test_dl = test_dl
         self.model_folder = model_folder
 
-    def find_bracket(self, coverage):
+    def find_bracket(self, usage):
         # Sort points by r to ensure order
         self.evaluated_points.sort(key=lambda x: x[0])
 
         for i in range(len(self.evaluated_points) - 1):
-            r_a, c_a = self.evaluated_points[i]
-            r_b, c_b = self.evaluated_points[i+1]
-            if c_a <= coverage < c_b:
+            r_a, use_a = self.evaluated_points[i]
+            r_b, use_b = self.evaluated_points[i+1]
+            if use_a <= usage < use_b:
                 return r_a, r_b
             
         # If no exact bracket, use full range as fallback
@@ -658,15 +658,15 @@ class AdaptiveGridSearch:
 
         return test_acc, test_use
 
-    def find_r_for_target(self, coverage, tolerance=1e-3):
-        r_low, r_high = self.find_bracket(coverage)
+    def find_r_for_target(self, usage, tolerance=1e-3):
+        r_low, r_high = self.find_bracket(usage)
         reruns = 0
         while r_high - r_low > tolerance:
             reruns += 1
             r_mid = (r_low + r_high) / 2
-            c_mid = self.train_fe_model(r_mid)
-            self.evaluated_points.append((r_mid, c_mid))
-            if c_mid > coverage:
+            use_mid = self.train_fe_model(r_mid)
+            self.evaluated_points.append((r_mid, use_mid))
+            if use_mid > usage:
                 r_low = r_mid
             else:
                 r_high = r_mid
@@ -674,7 +674,7 @@ class AdaptiveGridSearch:
         test_acc, test_use = self.evaluate_fe_model(r_high)
 
         logger.info(f"\nTook {reruns} passes to find best r value")
-        logger.info(f"For coverage {coverage}:")
+        logger.info(f"For usage {usage}:")
         logger.info(f"\tBest r: {r_high}")
         logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]}")
         logger.info(f"\tTest usage: {test_use} / Test acc: {test_acc}")
