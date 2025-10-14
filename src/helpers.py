@@ -5,10 +5,13 @@ import random
 import torchvision.transforms as transforms
 import yaml
 from os import path
+import logging
 
 from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset, FE_Dataset
 from custom_types import ConfigOptions, DatasetSettings
 from models import CustomMLP, CustomResNet18, build_unet, LatentCNNHead
+
+logger = logging.getLogger(__name__)
 
 def load_yaml_options(config_file: str) -> ConfigOptions:
     with open(config_file, 'r') as file:
@@ -16,7 +19,7 @@ def load_yaml_options(config_file: str) -> ConfigOptions:
 
     return ConfigOptions(**yaml_data)
 
-def seed_all(seed=42):
+def set_all_seeds(seed=42):
     random.seed(seed)  # Python random module
     np.random.seed(seed)  # NumPy
     torch.manual_seed(seed)  # PyTorch CPU
@@ -58,7 +61,248 @@ def build_mnist_transform(aug_name, aug_strength):
 
     return transforms.Compose(aug_transforms)
 
-def build_dataset(dataset_settings: DatasetSettings, seed: int):
+def build_dataset(dataset_name: str, seed: int, folder="../data"):
+    match dataset_name:
+        # toy example where 2d points are split into 4 clusters
+        # lf = noisy; hf = clean
+        case "toy_2d":
+            num_dims = 2
+            num_clusters = 2 ** num_dims
+            hf_std = np.random.uniform(0.25, 0.4, size=num_clusters)
+            lf_std = np.random.uniform(0.4, 0.6, size=num_clusters)
+
+            total_num_samples = 200
+            train_samples = int(total_num_samples*.8)
+            test_samples = int(total_num_samples*.1)
+            val_samples = int(total_num_samples*.1)
+
+            train_samples_per_cluster = np.full(num_clusters, train_samples // num_clusters)
+            test_samples_per_cluster = np.full(num_clusters, test_samples // num_clusters)
+            val_samples_per_cluster = np.full(num_clusters, val_samples // num_clusters)
+
+            train_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=train_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            test_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=test_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            val_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=val_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+        
+        # toy example where 5d points are split into 10 clusters
+        # lf = noisy; hf = clean
+        case "toy_5d":
+            num_dims = 5
+            num_clusters = 2 ** num_dims
+            hf_std = np.random.uniform(0.25, 0.4, size=num_clusters)
+            lf_std = np.random.uniform(0.4, 0.6, size=num_clusters)
+
+            total_num_samples = 500
+            train_samples = int(total_num_samples*.8)
+            test_samples = int(total_num_samples*.1)
+            val_samples = int(total_num_samples*.1)
+
+            train_samples_per_cluster = np.full(num_clusters, train_samples // num_clusters)
+            test_samples_per_cluster = np.full(num_clusters, test_samples // num_clusters)
+            val_samples_per_cluster = np.full(num_clusters, val_samples // num_clusters)
+
+            train_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=train_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            test_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=test_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            val_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=val_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+        # mnist example 
+        # lf = noisy; hf = clean
+        case "mnist_noise":
+            hf_augment: str = "noise"
+            hf_aug_str: float = 0.0
+            
+            lf_augment: str = "noise"
+            lf_aug_str: float = 0.7
+
+            hf_transform = build_mnist_transform(
+                aug_name=hf_augment,
+                aug_strength=hf_aug_str
+            )
+
+            lf_transform = build_mnist_transform(
+                aug_name=lf_augment,
+                aug_strength=lf_aug_str
+            )
+
+            train_ds = MNISTDataset(
+                split="train",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+            test_ds = MNISTDataset(
+                split="test",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+            val_ds = MNISTDataset(
+                split="val",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+        
+        # mnist example
+        # lf = rotated; hf = clean
+        case "mnist_rotation":
+            hf_augment: str = "rotation"
+            hf_aug_str: float = 0.0
+            
+            lf_augment: str = "rotation"
+            lf_aug_str: float = 90
+
+            hf_transform = build_mnist_transform(
+                aug_name=hf_augment,
+                aug_strength=hf_aug_str
+            )
+
+            lf_transform = build_mnist_transform(
+                aug_name=lf_augment,
+                aug_strength=lf_aug_str
+            )
+
+            train_ds = MNISTDataset(
+                split="train",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+            test_ds = MNISTDataset(
+                split="test",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+            val_ds = MNISTDataset(
+                split="val",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+        # cub-200 example (200 bird classes)
+        # lf = grayscale; hf = rgb
+        case "bird_grayscale":
+            train_ds = CUBDataset(
+                root=folder,
+                split="train",
+                seed=seed,
+                grayscale=True
+            )
+
+            test_ds = CUBDataset(
+                root=folder,
+                split="test",
+                seed=seed,
+                grayscale=True
+            )
+
+            val_ds = CUBDataset(
+                root=folder,
+                split="val",
+                seed=seed,
+                grayscale=True
+            )      
+
+        # cub-200 example (200 bird classes)
+        # lf = rgb; hf = rgb (used if lf and hf are different models)
+        case "bird_color":
+            train_ds = CUBDataset(
+                root=folder,
+                split="train",
+                seed=seed,
+                grayscale=False
+            )
+
+            test_ds = CUBDataset(
+                root=folder,
+                split="test",
+                seed=seed,
+                grayscale=False
+            )
+
+            val_ds = CUBDataset(
+                root=folder,
+                split="val",
+                seed=seed,
+                grayscale=False
+            )    
+            
+        # https://huggingface.co/datasets/ibm-nasa-geospatial/multi-temporal-crop-classification
+        # multi-temporal crop classification dataset
+        # lf = rgb; hf = rgb + 3 IR channels
+        case "crop":
+            train_ds = CropDataset(
+                root=folder,
+                split="train",
+                seed=seed,
+            )
+
+            test_ds = CropDataset(
+                root=folder,
+                split="test",
+                seed=seed,
+            )
+
+            val_ds = CropDataset(
+                root=folder,
+                split="val",
+                seed=seed,
+            )
+
+        case _:
+            logger.error("Dataset Name is invalid")
+            raise ValueError("Dataset Name is invalid")
+        
+    return train_ds, test_ds, val_ds
+
+
+def build_datasets(dataset_settings: DatasetSettings, seed: int):
     ds_name: str = dataset_settings.name
     ds_folder: str = dataset_settings.folder
 
