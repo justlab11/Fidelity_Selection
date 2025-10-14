@@ -87,9 +87,12 @@ class HypercubeDataset(Dataset):
     def get_num_classes(self):
         return self.num_classes
     
-    def get_input_size(self):
+    def get_lf_input_size(self):
         return self.num_dims
-
+    
+    def get_hf_input_size(self):
+        return self.num_dims
+    
     def _generate_points_and_labels(
         self, num_dims, num_classes,
         num_samples_per_cluster, stds, group_classes
@@ -153,7 +156,13 @@ class MNISTDataset(Dataset):
 
     def get_num_classes(self):
         return 10
-
+    
+    def get_lf_input_size(self):
+        return 3
+    
+    def get_hf_input_size(self):
+        return 3
+    
     def __len__(self):
         return len(self.base_dataset)
 
@@ -235,6 +244,15 @@ class CropDataset(Dataset):
                     for q in range(4): # quandrant of the image
                         self.fileset.append((train_test_filenames[i], t, q))
 
+    def get_num_classes(self):
+        return 14
+
+    def get_lf_input_size(self):
+        return 3
+    
+    def get_lf_input_size(self):
+        return 6
+
     def __len__(self):
         return len(self.fileset)
     
@@ -274,21 +292,22 @@ class CUBDataset(Dataset):
             self, 
             root: str, 
             split: str, 
-            seed:int=42, 
-            transform=None
+            seed:int=42,
+            grayscale=True
     ):
         assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
 
-        self.transform = transform
         self.root = root
         self.split = split
         self.generator = torch.Generator().manual_seed(seed)
-
-        self.lf_transform = transforms.Compose([
-            transforms.Grayscale(num_output_channels=3),  # Convert image to grayscale with 3 channels
-            transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
-            transforms.Resize((224, 224)),  # Resize to model input size
-        ])
+        self.grayscale = grayscale
+        
+        if self.grayscale:
+            self.lf_transform = transforms.Compose([
+                transforms.Grayscale(num_output_channels=3),  # Convert image to grayscale with 3 channels
+                transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
+                transforms.Resize((224, 224)),  # Resize to model input size
+            ])
 
         self.hf_transform = transforms.Compose([
             transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
@@ -335,6 +354,15 @@ class CUBDataset(Dataset):
 
         return images_for_split
 
+    def get_num_classes(self):
+        return 200
+
+    def get_lf_input_size(self):
+        return 3
+    
+    def get_lf_input_size(self):
+        return 3
+
     def __len__(self):
         return len(self.data)
 
@@ -349,8 +377,12 @@ class CUBDataset(Dataset):
         fname = os.path.join(self.root, "images", local_fname)
 
         image = Image.open(fname).convert("RGB")
-        lf_img = self.lf_transform(image)
+
         hf_img = self.hf_transform(image)
+        if self.grayscale:
+            lf_img = self.lf_transform(image)
+        else:
+            lf_img = hf_img.clone()
 
         return lf_img, hf_img, label
         
