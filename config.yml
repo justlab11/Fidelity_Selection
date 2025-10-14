@@ -1,24 +1,21 @@
 dataset:
   name: mnist
   folder: ../data
-  high_fidelity:
-    aug_name: none
-    strength: 0
-  low_fidelity:
-    aug_name: noise
-    strength: 1
 
 latent_size: 128
 random_seed: 42
-num_reruns: 1
+run_comparisons: False
+train_body: False
 
 classifier_training:
-  epochs: 200
+  epochs: 50
   batch_size: 32
   loss_fun: CE
-
+  lf_model: resnet
+  hf_model: resnet
+  
 fe_training:
-  epochs: 200
+  epochs: 40
   batch_size: 128
 
   r_range:

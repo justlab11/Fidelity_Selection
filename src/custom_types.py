@@ -6,20 +6,16 @@ class SplitData(BaseModel):
     test: List[float]
     val: List[float]
 
-class FidelityAugmentations(BaseModel):
-    aug_name: Literal["none", "noise", "blur", "rotation"]
-    strength: float
-
 class DatasetSettings(BaseModel):
-    name: str
+    name: Literal["toy_2d", "toy_5d", "mnist_noise", "mnist_rotation", "bird_grayscale", "bird_color", "crop"]
     folder: str
-    high_fidelity: FidelityAugmentations
-    low_fidelity: FidelityAugmentations
 
 class ClassifierSettings(BaseModel):
     epochs: int
     batch_size: int
     loss_fun: Literal["CE"]
+    lf_model: Literal["mlp", "resnet", "vit", "unet"]
+    hf_model: Literal["mlp", "resnet", "vit", "unet"]
 
 class ThresholdSettings(BaseModel):
     start: float
