@@ -384,10 +384,9 @@ def main(config_file):
     
     logger.info("\nRUNNING DEFAULT SOFTMAX RESPONSE")
 
-    softmax_response: SoftmaxResponse = SoftmaxResponse(
+    softmax_response: SoftmaxResponseMethod = SoftmaxResponseMethod(
         val_dl=val_dl,
         test_dl=test_dl,
-        file_folder=file_folder
     )
 
     sr_acc_vals, sr_usage_vals = softmax_response.get_softmax_thresholds(
@@ -408,4 +407,4 @@ def main(config_file):
 
     logger.info("\nRUNNING DEFAULT SELECTIVENET")
 
-    
+

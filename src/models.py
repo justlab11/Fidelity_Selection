@@ -401,3 +401,43 @@ class LatentCNNHead(nn.Module):
         x = self.conv(x)
         x = x.view(x.size(0), -1)
         return self.fc(x)
+    
+class SelectiveNet(nn.Module):
+    def __init__(self, latent_dim, num_classes):
+        super().__init__()
+        self.proj_layer = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+        )
+
+        self.selection_head = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+        self.pred_head = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes),
+        )
+
+        self.aux_head = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, lf_latent):
+        proj = self.proj_layer(lf_latent)
+
+        selection_logits = self.selection_head(proj)
+        pred_logits = self.pred_head(proj)
+        aux_logits = self.aux_head(proj)
+
+        return selection_logits, pred_logits, aux_logits
+    
+    def body(self, lf_latent):
+        proj = self.proj_layer(lf_latent)
+
+        return proj

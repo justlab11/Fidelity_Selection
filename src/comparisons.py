@@ -5,11 +5,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class SoftmaxResponse:
-    def __init__(self, val_dl, test_dl, file_folder):
+class SoftmaxResponseMethod:
+    def __init__(self, val_dl, test_dl):
         self.val_dl = val_dl
         self.test_dl = test_dl
-        self.file_folder = file_folder
 
     def get_softmax_thresholds(self, usage_list):
         logger.info("\nRunning Softmax Response on LF Model")
@@ -68,3 +67,21 @@ class SoftmaxResponse:
         usage = 1-coverage
 
         return accuracy, usage
+
+class SelectiveNetMethod:
+    def __init__(self, train_dl, val_dl, test_dl, model_folder):
+        self.train_dl = train_dl
+        self.val_dl = val_dl
+        self.test_dl = test_dl
+        self.model_folder = model_folder
+
+    
+
+    def selective_loss(self, y_true, selection_logits, lf_logits, lamda=32, c=0.8):
+        selection_prob = torch.sigmoid(selection_logits)
+        ce = F.cross_entropy(lf_logits, y_true.argmax(dim=1), reduction='none')
+        weighted_ce = selection_prob.view(-1) * ce
+        ce_loss = weighted_ce.mean()
+        coverage = selection_prob.mean()
+        penalty = lamda * torch.clamp(-coverage + c, min=0) ** 2
+        return ce_loss + penalty
