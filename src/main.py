@@ -344,7 +344,7 @@ def main(config_file):
             latent_size=None
         )
 
-    logger.info("\nRUNNING SEARCH FOR R VALUES (FE)")
+    logger.info("\nRUNNING DEFAULT FE")
     adaptive_search: AdaptiveGridSearch = AdaptiveGridSearch(
         fe_model=fe_model,
         device=DEVICE,
@@ -357,16 +357,32 @@ def main(config_file):
     usage_values: List[float] = [i/10 for i in range(1, 11)]
 
     for usage in usage_values:
-        adaptive_search.find_r_for_target(
+        fe_usage_vals: float = []
+        fe_acc_vals: float = []
+
+        _, test_acc, test_use = adaptive_search.find_r_for_target(
             usage=usage
         )
+
+        fe_usage_vals.append(test_use)
+        fe_acc_vals.append(test_acc)
+
+    fe_usage_vals = np.array(fe_usage_vals)
+    fe_acc_vals = np.array(fe_acc_vals)
+
+    fe_data_path: str = os.path.join(file_folder, "fe_results.npz") 
+    np.savez(
+        fe_data_path,
+        usage=fe_usage_vals,
+        acc=fe_acc_vals
+    )
 
     # ends the script if you don't want comparisons
     if not run_comparisons:
         logger.info("\nEXPERIMENT FINISHED")
         return
     
-    logger.info("\nRUNNING DEFAULT SR")
+    logger.info("\nRUNNING DEFAULT SOFTMAX RESPONSE")
 
     softmax_response: SoftmaxResponse = SoftmaxResponse(
         val_dl=val_dl,
@@ -374,8 +390,22 @@ def main(config_file):
         file_folder=file_folder
     )
 
-    softmax_response.get_softmax_thresholds(
+    sr_acc_vals, sr_usage_vals = softmax_response.get_softmax_thresholds(
         usage_list=usage_values
     )
+
+    thresholds = np.array(list(sr_acc_vals.keys()))
+    sr_acc_vals = np.array(list(sr_acc_vals.values()))
+    sr_usage_vals = np.array(list(sr_usage_vals.values()))
+
+    sr_data_path: str = os.path.join(file_folder, "sr_results.npz") 
+    np.savez(
+        sr_data_path,
+        usage=sr_usage_vals,
+        acc=sr_acc_vals,
+        thresholds=thresholds
+    )
+
+    logger.info("\nRUNNING DEFAULT SELECTIVENET")
 
     

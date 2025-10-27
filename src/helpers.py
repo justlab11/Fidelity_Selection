@@ -672,12 +672,14 @@ class AdaptiveGridSearch:
                 r_high = r_mid
 
         test_acc, test_use = self.evaluate_fe_model(r_high)
+        test_acc *= 100
+        test_use *= 100
 
         logger.info(f"\nTook {reruns} passes to find best r value")
         logger.info(f"For usage {usage}:")
         logger.info(f"\tBest r: {r_high}")
         logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]:.4f}")
-        logger.info(f"\tTest usage: {test_use:.4f} / Test acc: {test_acc*100:.2f}")
+        logger.info(f"\tTest usage: {test_use:.2f} / Test acc: {test_acc:.2f}")
         
         return r_high, test_acc, test_use
     

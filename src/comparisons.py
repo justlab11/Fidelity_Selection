@@ -28,14 +28,24 @@ class SoftmaxResponse:
 
         # sort descending for coverage mapping
         sorted_probs = np.sort(all_max_probs)[::-1]
-
+        acc_vals = {}
+        usage_vals = {}
+        
         for coverage in coverage_list:
             idx = max(0, int(np.floor(len(sorted_probs) * coverage)) - 1)
             threshold = sorted_probs[idx]
             test_acc, test_use = self.apply_softmax_threshold(threshold)
 
+            test_acc *= 100
+            test_use *= 100
+
             logger.info(f"\n\tVal Usage {1-coverage} occurs at threshold {threshold}")
-            logger.info(f"\tTest Usage: {test_use:.4f} with accuracy: {test_acc*100:.2f}")
+            logger.info(f"\tTest Usage: {test_use:.2f} with accuracy: {test_acc:.2f}")
+
+            acc_vals[threshold] = test_acc
+            usage_vals[threshold] = test_use
+
+        return acc_vals, usage_vals
 
     def apply_softmax_threshold(self, threshold):
         correct = 0
