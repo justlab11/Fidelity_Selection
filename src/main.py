@@ -13,6 +13,7 @@ import os
 from datasets import *
 from models import build_unet, build_resnet, CustomResNet18, LatentCNNHead, CustomMLP
 from helpers import *
+from comparisons import *
 from losses import MetaLossFunction
 
 from custom_types import ConfigOptions
@@ -30,10 +31,10 @@ def main(config_file):
     lf_model_name: str = config.classifier_training.lf_model
     hf_model_name: str = config.classifier_training.hf_model
     run_comparisons: bool = config.run_comparisons
-    train_body: bool = config.train_body
+    train_body: bool = config.train_body if dataset_name != "crop" else True
 
     # create folders for the dataset
-    folder_name: str = os.path.join("results", f"{dataset_name}-{seed}-{latent_size}")
+    folder_name: str = os.path.join("results", f"{dataset_name}-{lf_model_name}-{hf_model_name}-{seed}-{latent_size}")
 
     print(f"Results for this experiment located at '{os.path.abspath(folder_name)}'")
     print("Please see 'experiments.log' for the logs")
@@ -69,10 +70,10 @@ def main(config_file):
     logger.info("SETTINGS")
     logger.info(f"Device: {DEVICE}")
     logger.info(f"Seed: {seed}")
-    logger.info(f"Folder: {folder}")
-    logger.info(f"Dataset: {dataset_name}")
-    logger.info(f"LF Model: {lf_model_name}")
-    logger.info(f"HF Model: {hf_model_name}")
+    logger.info(f"Folder: {folder_name}")
+    logger.info(f"Dataset: {dataset_name.capitalize()}")
+    logger.info(f"LF Model: {lf_model_name.capitalize()}")
+    logger.info(f"HF Model: {hf_model_name.capitalize()}")
     logger.info(f"Latent Size: {latent_size}")
     logger.info(f"Run Comparisons: {run_comparisons}")
 
@@ -83,7 +84,7 @@ def main(config_file):
     train_ds, test_ds, val_ds = build_dataset(
         dataset_name=dataset_name,
         seed=seed,
-        folder="../../data"
+        folder="../data"
     )
 
     train_dl = DataLoader(
@@ -107,14 +108,14 @@ def main(config_file):
     hf_input_size: int = train_ds.get_hf_input_size()
     output_size: int = train_ds.get_num_classes()
 
-    lf_model = build_model(
+    lf_model: nn.Module = build_model(
         model_name=lf_model_name,
         input_size=lf_input_size,
         output_size=output_size,
         latent_size=latent_size
     )
 
-    hf_model = build_model(
+    hf_model: nn.Module = build_model(
         model_name=hf_model_name,
         input_size=hf_input_size,
         output_size=output_size,
@@ -124,7 +125,7 @@ def main(config_file):
     if not train_body:
         logger.info(f"Parameter 'train_body' was set to False, saving the body outputs for faster running")
         
-        train_body_folder = os.path.join(body_folder, "train")
+        train_body_folder: str = os.path.join(body_folder, "train")
         save_body(
             lf_model=lf_model,
             hf_model=hf_model,
@@ -133,7 +134,7 @@ def main(config_file):
             device=DEVICE
         )
 
-        test_body_folder = os.path.join(body_folder, "test")
+        test_body_folder: str = os.path.join(body_folder, "test")
         save_body(
             lf_model=lf_model,
             hf_model=hf_model,
@@ -142,7 +143,7 @@ def main(config_file):
             device=DEVICE
         )
 
-        val_body_folder = os.path.join(body_folder, "val")
+        val_body_folder: str = os.path.join(body_folder, "val")
         save_body(
             lf_model=lf_model,
             hf_model=hf_model,
@@ -151,49 +152,49 @@ def main(config_file):
             device=DEVICE
         )
         
-        folder_size = get_folder_size(body_folder)/1e6
-        logger.debug(f"Total size of {body_folder}: {folder_size:,} MB")
+        folder_size: float = get_folder_size(body_folder)/1e6
+        logger.info(f"Total size of {body_folder}: {folder_size:,} MB")
 
-        train_ds = BodyDataset(
+        train_ds: BodyDataset = BodyDataset(
             folder_path=train_body_folder
         )
 
-        test_ds = BodyDataset(
+        test_ds: BodyDataset = BodyDataset(
             folder_path=test_body_folder
         )
 
-        val_ds = BodyDataset(
+        val_ds: BodyDataset = BodyDataset(
             folder_path=val_body_folder
         )
 
-        train_dl = DataLoader(
+        train_dl: DataLoader = DataLoader(
             train_ds,
             batch_size=config.classifier_training.batch_size,
             shuffle=True
         )
 
-        test_dl = DataLoader(
+        test_dl: DataLoader = DataLoader(
             test_ds,
             batch_size=config.classifier_training.batch_size,
         )
 
-        val_dl = DataLoader(
+        val_dl: DataLoader = DataLoader(
             val_ds,
             batch_size=config.classifier_training.batch_size,
         )
 
     logger.info(f"\nTRAINING HF AND LF MODELS")
-    lf_model = lf_model.to(DEVICE)
-    hf_model = hf_model.to(DEVICE)
+    lf_model: nn.Module = lf_model.to(DEVICE)
+    hf_model: nn.Module = hf_model.to(DEVICE)
 
     lf_optimizer = torch.optim.Adam(lf_model.parameters(), lr=1e-3, weight_decay=1e-5)
     hf_optimizer = torch.optim.Adam(hf_model.parameters(), lr=1e-3, weight_decay=1e-5)
 
-    lf_state_dict = None
-    hf_state_dict = None
+    lf_state_dict: Dict | None  = None
+    hf_state_dict: Dict | None  = None
 
-    lf_best_acc = 0
-    hf_best_acc = 0
+    lf_best_acc: float = 0.0
+    hf_best_acc: float = 0.0
 
     lf_model_file = os.path.join(model_folder, "lf_model.pt")
     hf_model_file = os.path.join(model_folder, "hf_model.pt")
@@ -271,7 +272,7 @@ def main(config_file):
     logger.info(f"\tHF Test   Loss: {hf_test_loss:.4f}  | Accuracy: {100 * hf_test_acc:.2f}%")
 
     logger.info("\nSAVING LATENT REPRESENTATIONS")
-    train_latent_folder = os.path.join(latent_folder, "train")
+    train_latent_folder: str = os.path.join(latent_folder, "train")
     save_latent(
         lf_model=lf_model,
         hf_model=hf_model,
@@ -280,7 +281,7 @@ def main(config_file):
         train_body=train_body
     )
 
-    test_latent_folder = os.path.join(latent_folder, "test")
+    test_latent_folder: str = os.path.join(latent_folder, "test")
     save_latent(
         lf_model=lf_model,
         hf_model=hf_model,
@@ -289,7 +290,7 @@ def main(config_file):
         train_body=train_body
     )
 
-    val_latent_folder = os.path.join(latent_folder, "val")
+    val_latent_folder: str = os.path.join(latent_folder, "val")
     save_latent(
         lf_model=lf_model,
         hf_model=hf_model,
@@ -297,53 +298,54 @@ def main(config_file):
         save_folder=val_latent_folder,
         train_body=train_body
     )
-    folder_size = get_folder_size(latent_folder)/1e6
-    logger.debug(f"Total size of {latent_folder}: {folder_size:,} MB")
+    folder_size: float = get_folder_size(latent_folder)/1e6
+    logger.info(f"Total size of {latent_folder}: {folder_size:,} MB")
 
-    train_ds = FE_Dataset(
+    train_ds: FE_Dataset = FE_Dataset(
         folder_path=train_latent_folder
     )
 
-    test_ds = FE_Dataset(
+    test_ds: FE_Dataset = FE_Dataset(
         folder_path=test_latent_folder
     )
 
-    val_ds = FE_Dataset(
+    val_ds: FE_Dataset = FE_Dataset(
         folder_path=val_latent_folder
     )
 
-    train_dl = DataLoader(
+    train_dl: DataLoader = DataLoader(
         train_ds,
         batch_size=config.fe_training.batch_size,
         shuffle=True
     )
 
-    test_dl = DataLoader(
+    test_dl: DataLoader = DataLoader(
         test_ds,
         batch_size=config.fe_training.batch_size,
     )
 
-    val_dl = DataLoader(
+    val_dl: DataLoader = DataLoader(
         val_ds,
         batch_size=config.fe_training.batch_size,
     )
 
     if dataset_name != "crop":
-        fe_model = build_model(
+        fe_model: nn.Module = build_model(
             model_name="mlp",
             input_size=latent_size,
             output_size=2,
             latent_size=128
         )
     else:
-        fe_model = build_model(
+        fe_model: nn.Module = build_model(
             model_name="cnn_head",
             input_size=latent_size,
             output_size=2,
             latent_size=None
         )
 
-    adaptive_search = AdaptiveGridSearch(
+    logger.info("\nRUNNING SEARCH FOR R VALUES (FE)")
+    adaptive_search: AdaptiveGridSearch = AdaptiveGridSearch(
         fe_model=fe_model,
         device=DEVICE,
         train_dl=train_dl,
@@ -352,10 +354,28 @@ def main(config_file):
         model_folder=model_folder
     )
 
-    usage_values = [i/10 for i in range(1, 11)]
+    usage_values: List[float] = [i/10 for i in range(1, 11)]
 
     for usage in usage_values:
         adaptive_search.find_r_for_target(
             usage=usage
         )
 
+    # ends the script if you don't want comparisons
+    if not run_comparisons:
+        logger.info("\nEXPERIMENT FINISHED")
+        return
+    
+    logger.info("\nRUNNING DEFAULT SR")
+
+    softmax_response: SoftmaxResponse = SoftmaxResponse(
+        val_dl=val_dl,
+        test_dl=test_dl,
+        file_folder=file_folder
+    )
+
+    softmax_response.get_softmax_thresholds(
+        usage_list=usage_values
+    )
+
+    

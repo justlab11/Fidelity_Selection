@@ -8,8 +8,8 @@ import os
 import logging
 from torch.utils.data import DataLoader
 
-from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset, FE_Dataset
-from custom_types import ConfigOptions, DatasetSettings
+from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset
+from custom_types import ConfigOptions
 from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead
 from losses import MetaLossFunction
 
@@ -676,8 +676,8 @@ class AdaptiveGridSearch:
         logger.info(f"\nTook {reruns} passes to find best r value")
         logger.info(f"For usage {usage}:")
         logger.info(f"\tBest r: {r_high}")
-        logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]}")
-        logger.info(f"\tTest usage: {test_use} / Test acc: {test_acc}")
+        logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]:.4f}")
+        logger.info(f"\tTest usage: {test_use:.4f} / Test acc: {test_acc*100:.2f}")
         
         return r_high, test_acc, test_use
     

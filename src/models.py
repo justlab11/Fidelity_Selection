@@ -371,14 +371,14 @@ class UNet(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-        layers = []
+        layers = {}
 
         encoder_features = self.encoder(x)[::-1]
-        layers.append(encoder_features[0])
+        layers["latent"] = encoder_features[0]
 
         x = self.decoder(encoder_features[0], encoder_features[1:])
         x = self.output(x)
-        layers.append(x)
+        layers["output"] = x
         
         return layers
 
