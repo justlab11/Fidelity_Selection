@@ -1,16 +1,363 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from torch.utils.data import DataLoader, Subset
-from torchvision.models.feature_extraction import create_feature_extractor
-from models import build_mlp, build_resnet
-from custom_types import Options, MetaData, PerformanceData
+import random
+import torchvision.transforms as transforms
 import yaml
-from os import path
-from datasets import *
+import os
+import logging
+from torch.utils.data import DataLoader
 
+from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset
+from custom_types import ConfigOptions
+from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead
+from losses import MetaLossFunction
 
-def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, scheduler=None):
+logger = logging.getLogger(__name__)
+
+def load_yaml_options(config_file: str) -> ConfigOptions:
+    with open(config_file, 'r') as file:
+        yaml_data = yaml.safe_load(file)
+
+    return ConfigOptions(**yaml_data)
+
+def set_all_seeds(seed=42):
+    random.seed(seed)  # Python random module
+    np.random.seed(seed)  # NumPy
+    torch.manual_seed(seed)  # PyTorch CPU
+    torch.cuda.manual_seed(seed)  # PyTorch current GPU
+    torch.cuda.manual_seed_all(seed)  # PyTorch all GPUs (if using multi-GPU)
+    torch.backends.cudnn.deterministic = True  # Ensures deterministic behavior
+    torch.backends.cudnn.benchmark = False  # Disables benchmark for reproducibility
+
+    return True
+
+class AddGaussianNoise(object):
+    def __init__(self, std):
+        self.std = std
+    def __call__(self, tensor):
+        return tensor + torch.randn_like(tensor) * self.std
+    def __repr__(self):
+        return f"{self.__class__.__name__}(std={self.std})"
+
+def build_mnist_transform(aug_name, aug_strength):
+    aug_transforms = [transforms.ToTensor()]  # Always start with ToTensor
+
+    if aug_name == "rotation":
+        aug_transforms.append(transforms.RandomRotation(degrees=aug_strength))
+    elif aug_name == "noise":
+        aug_transforms.append(AddGaussianNoise(std=aug_strength))
+    # else: no additional augmentation
+
+    # Ensure image is 3-channel for ResNet
+    def to_rgb(x):
+        return x.expand(3, -1, -1) if x.shape[0] == 1 else x
+    aug_transforms.append(transforms.Lambda(to_rgb))
+
+    # Resize and crop to match ResNet-18 input
+    aug_transforms += [
+        transforms.Resize(256, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(224),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ]
+
+    return transforms.Compose(aug_transforms)
+
+def build_dataset(dataset_name: str, seed: int, folder="../data"):
+    match dataset_name:
+        # toy example where 2d points are split into 4 clusters
+        # lf = noisy; hf = clean
+        case "toy_2d":
+            num_dims = 2
+            num_clusters = 2 ** num_dims
+            hf_std = np.random.uniform(0.25, 0.4, size=num_clusters)
+            lf_std = np.random.uniform(0.4, 0.6, size=num_clusters)
+
+            total_num_samples = 200
+            train_samples = int(total_num_samples*.8)
+            test_samples = int(total_num_samples*.1)
+            val_samples = int(total_num_samples*.1)
+
+            train_samples_per_cluster = np.full(num_clusters, train_samples // num_clusters)
+            test_samples_per_cluster = np.full(num_clusters, test_samples // num_clusters)
+            val_samples_per_cluster = np.full(num_clusters, val_samples // num_clusters)
+
+            train_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=train_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            test_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=test_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            val_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=val_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+        
+        # toy example where 5d points are split into 10 clusters
+        # lf = noisy; hf = clean
+        case "toy_5d":
+            num_dims = 5
+            num_clusters = 2 ** num_dims
+            hf_std = np.random.uniform(0.25, 0.4, size=num_clusters)
+            lf_std = np.random.uniform(0.4, 0.6, size=num_clusters)
+
+            total_num_samples = 500
+            train_samples = int(total_num_samples*.8)
+            test_samples = int(total_num_samples*.1)
+            val_samples = int(total_num_samples*.1)
+
+            train_samples_per_cluster = np.full(num_clusters, train_samples // num_clusters)
+            test_samples_per_cluster = np.full(num_clusters, test_samples // num_clusters)
+            val_samples_per_cluster = np.full(num_clusters, val_samples // num_clusters)
+
+            train_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=train_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            test_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=test_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            val_ds = HypercubeDataset(
+                num_dims=num_dims,
+                num_samples=val_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+        # mnist example 
+        # lf = noisy; hf = clean
+        case "mnist_noise":
+            hf_augment: str = "noise"
+            hf_aug_str: float = 0.0
+            
+            lf_augment: str = "noise"
+            lf_aug_str: float = 0.7
+
+            hf_transform = build_mnist_transform(
+                aug_name=hf_augment,
+                aug_strength=hf_aug_str
+            )
+
+            lf_transform = build_mnist_transform(
+                aug_name=lf_augment,
+                aug_strength=lf_aug_str
+            )
+
+            train_ds = MNISTDataset(
+                split="train",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+            test_ds = MNISTDataset(
+                split="test",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+            val_ds = MNISTDataset(
+                split="val",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+        
+        # mnist example
+        # lf = rotated; hf = clean
+        case "mnist_rotation":
+            hf_augment: str = "rotation"
+            hf_aug_str: float = 0.0
+            
+            lf_augment: str = "rotation"
+            lf_aug_str: float = 90
+
+            hf_transform = build_mnist_transform(
+                aug_name=hf_augment,
+                aug_strength=hf_aug_str
+            )
+
+            lf_transform = build_mnist_transform(
+                aug_name=lf_augment,
+                aug_strength=lf_aug_str
+            )
+
+            train_ds = MNISTDataset(
+                split="train",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+            test_ds = MNISTDataset(
+                split="test",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+            val_ds = MNISTDataset(
+                split="val",
+                root=folder,
+                seed=seed,
+                hf_transform=hf_transform,
+                lf_transform=lf_transform
+            )
+
+        # cub-200 example (200 bird classes)
+        # lf = grayscale; hf = rgb
+        case "bird_grayscale":
+            train_ds = CUBDataset(
+                root=folder,
+                split="train",
+                seed=seed,
+                grayscale=True
+            )
+
+            test_ds = CUBDataset(
+                root=folder,
+                split="test",
+                seed=seed,
+                grayscale=True
+            )
+
+            val_ds = CUBDataset(
+                root=folder,
+                split="val",
+                seed=seed,
+                grayscale=True
+            )      
+
+        # cub-200 example (200 bird classes)
+        # lf = rgb; hf = rgb (used if lf and hf are different models)
+        case "bird_color":
+            train_ds = CUBDataset(
+                root=folder,
+                split="train",
+                seed=seed,
+                grayscale=False
+            )
+
+            test_ds = CUBDataset(
+                root=folder,
+                split="test",
+                seed=seed,
+                grayscale=False
+            )
+
+            val_ds = CUBDataset(
+                root=folder,
+                split="val",
+                seed=seed,
+                grayscale=False
+            )    
+
+        # https://huggingface.co/datasets/ibm-nasa-geospatial/multi-temporal-crop-classification
+        # multi-temporal crop classification dataset
+        # lf = rgb; hf = rgb + 3 IR channels
+        case "crop":
+            train_ds = CropDataset(
+                root=folder,
+                split="train",
+                seed=seed,
+            )
+
+            test_ds = CropDataset(
+                root=folder,
+                split="test",
+                seed=seed,
+            )
+
+            val_ds = CropDataset(
+                root=folder,
+                split="val",
+                seed=seed,
+            )
+
+        case _:
+            logger.error("Dataset Name is invalid")
+            raise ValueError("Dataset Name is invalid")
+        
+    return train_ds, test_ds, val_ds
+
+def build_model(model_name, latent_size, output_size, input_size=None):
+    match model_name:
+        # multilayer perceptron used for toy dataset case
+        case "mlp":
+            if input_size is None:
+                logger.error("Parameter input_size must be set for this model")
+                raise ValueError("Parameter input_size must be set for this model")
+
+            model = CustomMLP(
+                input_size=input_size,
+                num_layers=2,
+                output_size=output_size,
+                hidden_size=latent_size
+            )
+
+        # ResNet18 used for image classification tasks (MNIST + CUB-200)
+        case "resnet":
+            if input_size is None:
+                logger.error("Parameter input_size must be set for this model")
+                raise ValueError("Parameter input_size must be set for this model")
+
+            model = CustomResNet18(
+                latent_size=latent_size,
+                num_channels=input_size,
+                output_size=output_size
+            )
+
+        # VIT used for image classification tasks (MNIST + CUB-200)
+        case "vit":
+            model = CustomViT(
+                latent_size=latent_size,
+                output_size=output_size
+            )
+
+        # UNET used for image segmentation tasks (Crop)
+        case "unet":
+            if input_size is None:
+                logger.error("Parameter input_size must be set for this model")
+                raise ValueError("Parameter input_size must be set for this model")
+
+            model = build_unet(
+                num_channels=input_size,
+                num_classes=output_size
+            )
+
+        # CNN head specifically for the FE model if the UNET is used for the LF model
+        case "cnn_head":
+            model = LatentCNNHead(
+                in_channels=input_size,
+                num_classes=output_size
+            )
+
+    return model
+
+def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, optimizer=None, scheduler=None):
     """
     Perform one run through the DataLoader.
 
@@ -37,7 +384,13 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
         for data, _, target in dataloader:
             target = target.type(torch.LongTensor)
             data, target = data.to(device, torch.float), target.to(device)
-            output = model(data)
+            
+            if train_body:
+                output = model(data)["output"]
+
+            else:
+                output = model.head(data)["output"]
+
             loss = criterion(output, target)
             if optimizer:
                 optimizer.zero_grad()
@@ -48,14 +401,22 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
             predicted = torch.argmax(output, dim=1)
             total_correct += (predicted == target).sum().item()
             total_samples += data.size(0)
+
         if scheduler:
             scheduler.step()
 
     elif fidelity == "hf":
-        for _, data, target in dataloader:
+        for lf_data, hf_data, target in dataloader:
             target = target.type(torch.LongTensor)
+            data = torch.cat([lf_data, hf_data], dim=1)
             data, target = data.to(device, torch.float), target.to(device)
-            output = model(data)
+
+            if train_body:
+                output = model(data)["output"]
+
+            else:
+                output = model.head(data)["output"]
+
             loss = criterion(output, target)
             if optimizer:
                 optimizer.zero_grad()
@@ -66,6 +427,7 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
             predicted = torch.argmax(output, dim=1)
             total_correct += (predicted == target).sum().item()
             total_samples += data.size(0)
+
         if scheduler:
             scheduler.step()
 
@@ -78,7 +440,7 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
             target = target.type(torch.LongTensor)
             target = target.to(device)
 
-            outputs = model(lf_embeddings)
+            outputs = model(lf_embeddings)[-1]
             preds = torch.stack([
                 lf_preds,
                 hf_preds
@@ -110,252 +472,258 @@ def classifier_one_run(model, dataloader, criterion, fidelity, optimizer=None, s
 
     return average_loss, accuracy
 
-class DatasetBuilder:
-    def __init__(self, config: Options):
-        self.config = config
-
-    def __make_dataloader__(self, dataset, stage):
-        train_set = dataset.train()
-        test_set = dataset.test()
-        val_set = dataset.val()
-
-        if stage == 1:
-            batch_size = self.config.stage1.batch_size
-        else:
-            batch_size = self.config.stage2.batch_size
-
-        train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(test_set, batch_size=batch_size)
-        val_loader = DataLoader(val_set, batch_size=batch_size)
-
-        return train_loader, test_loader, val_loader
-
-    def build_dataset(self, stage=1):
-        dataset_name = self.config.dataset.name
-        if dataset_name == "toy":
-            dataset = HypercubeDataset(
-                config=self.config,
-            )
-
-        else:
-            dataset = DualFidelityDataset(
-                config=self.config
-            )
-
-        train_loader, test_loader, val_loader = self.__make_dataloader__(
-            dataset=dataset,
-            stage=stage
-        )
-
-        return train_loader, test_loader, val_loader
-
-class ModelBuilder:
-    def __init__(self, config: Options, device: torch.device):
-        self.config = config
-        self.device = device
-
-        self.input_sizes = {
-            "toy": self.config.dataset.toy_dataset_parameters.num_dims,
-            "mnist": None,
-            "cifar10": None,
-            "cifar100": None,
-        }
-
-        self.output_sizes = {
-            "toy": self.config.dataset.toy_dataset_parameters.num_classes,
-            "mnist": 10,
-            "cifar10": 10,
-            "cifar100": 100,
-        }
-
-    def __build_classifier__(self, model_type, dataset_name, pretrained=None):
-        input_size = self.input_sizes[dataset_name]
-        output_size = self.output_sizes[dataset_name]
-        latent_size = self.config.parameters.latent_representation_size
-
-        if "resnet" in model_type:
-            num_layers = int(model_type[6:])
-
-            model = build_resnet(
-                resnet_size=num_layers,
-                latent_size=latent_size,
-                output_size=output_size,
-                pretrained=pretrained,
-                device=self.device
-            )
-        
-        else:
-            num_layers = self.config.stage1.hf_model.classifier.num_layers
-
-            model = build_mlp(
-                input_size=input_size,
-                num_layers=num_layers,
-                output_size=output_size
-            )
-
-        return model
-
-    def build_classifiers(self):
-        dataset_name = self.config.dataset.name
-
-        hf_model_type = self.config.stage1.hf_model.classifier.type
-        lf_model_type = self.config.stage1.lf_model.classifier.type
-
-        if dataset_name == "toy" and hf_model_type != "mlp":
-            raise ValueError("stage1.hf_model.classifier.type must be 'mlp' with the 'toy' dataset")
-        
-        if dataset_name == "toy" and lf_model_type != "mlp":
-            raise ValueError("stage1.lf_model.classifier.type must be 'mlp' with the 'toy' dataset")
-        
-        hf_pretrained = self.config.stage1.hf_model.classifier.pretrained
-        lf_pretrained = self.config.stage1.lf_model.classifier.pretrained
-
-        hf_model = self.__build_classifier__(
-            model_type=hf_model_type,
-            dataset_name=dataset_name,
-            pretrained=hf_pretrained
-        )
-
-        lf_model = self.__build_classifier__(
-            model_type=lf_model_type,
-            dataset_name=dataset_name,
-            pretrained=lf_pretrained
-        )
-
-        hf_model_path = str(self.config.stage1.hf_model.load_file)
-        if path.exists(hf_model_path):
-            hf_state_dict = torch.load(hf_model_path)
-            hf_model.load_state_dict(hf_state_dict)
-
-        lf_model_path = str(self.config.stage1.lf_model.load_file)
-        if path.exists(lf_model_path):
-            lf_state_dict = torch.load(lf_model_path)
-            lf_model.load_state_dict(lf_state_dict)
-
-        return hf_model, lf_model
-
-
-def load_yaml_options(config_file: str) -> Options:
-    with open(config_file, 'r') as file:
-        yaml_data = yaml.safe_load(file)
-
-    return Options.model_validate(yaml_data)
+def save_body(
+        lf_model: nn.Module,
+        hf_model: nn.Module,  
+        dataloader: DataLoader,
+        save_folder: str, 
+        device):
     
+    lf_model = lf_model.to(device)
+    hf_model = hf_model.to(device)
+    os.mkdir(save_folder)
 
-def config_early_stop(config: Options):
-    patience = config.stage1.early_stop.patience
-    min_delta = config.stage1.early_stop.min_delta
+    lf_model.eval()
+    hf_model.eval()
 
-    early_stopper = EarlyStopper(
-        patience=patience,
-        min_delta=min_delta
-    )
+    with torch.no_grad():
+        for batch_idx, (lf_sample, hf_sample, label) in enumerate(dataloader):
+            lf_sample = lf_sample.to(device)
+            hf_sample = hf_sample.to(device)
+            labels = labels.to(device)
 
-    return early_stopper
+            lf_out_batch = lf_model(lf_sample)["body_output"].cpu()
+            hf_out_batch = hf_model(hf_sample)["body_output"].cpu()
+            labels_batch = labels.cpu()
 
-def fe_nn_one_run(fe_model, hf_model, lf_model, dataloader, criterion, optimizer=None, scheduler=None):
-    # device = next(hf_model.parameters()).device
+            batch_size = lf_out_batch.size(0)
+            for i in range(batch_size):
+                lf_out = lf_out_batch[i]
+                hf_out = hf_out_batch[i]
+                label = labels_batch[i]
 
-    # lf_body = create_feature_extractor(
-    #     lf_model, {"7": "body"}
-    # ).to(device)
+                torch.save({
+                    "lf_body_output": lf_out,
+                    "hf_body_output": hf_out,
+                    "label": label
+                }, os.path.join(save_folder, f"sample_{batch_idx}_{i}.pt"))
 
-    # for hf_data, lf_data, target in dataloader:
-    #     target = target.type(torch.LongTensor)
-    #     hf_data = hf_data.to(device)
-    #     lf_data = lf_data.to(device)
-    #     target = target.to(device)
+    logger.info(f"Finished saving split to {save_folder}")
 
-    #     lf_embeddings = lf_body(lf_data)
-    #     lf_output = lf_model(lf_data)
-    #     hf_output = hf_model(hf_data)
+def save_latent(
+        lf_model: nn.Module,
+        hf_model: nn.Module,  
+        dataloader: DataLoader,
+        save_folder: str, 
+        train_body: bool,
+        device):
 
-    #     fe_output = fe_model(lf_embeddings)
+    lf_model = lf_model.to(device)
+    hf_model = hf_model.to(device)
+    os.mkdir(save_folder)
+
+    lf_model.eval()
+    hf_model.eval()
+
+    with torch.no_grad():
+        for batch_idx, (lf, hf, labels) in enumerate(dataloader):
+            lf = lf.to(device)
+            hf = hf.to(device)
+            labels = labels.to(device)
+
+            if train_body:
+                lf_head = lf_model(lf)
+                hf_head = hf_model(hf)
+            else:
+                lf_head = lf_model.head(lf)
+                hf_head = hf_model.head(hf)
+            
+
+            lf_latent = lf_head["latent"]
+            lf_output = lf_head["output"]
+
+            # Pass hf through hf_model head (latent + output)
+            hf_output = hf_head["output"]
+
+            lf_latent = lf_latent.cpu()
+            lf_output = lf_output.cpu()
+            hf_output = hf_output.cpu()
+            labels = labels.cpu()
+
+            batch_size = lf_latent.size(0)
+            for i in range(batch_size):
+                torch.save({
+                    "lf_latent": lf_latent[i],
+                    "lf_output": lf_output[i],
+                    "hf_output": hf_output[i],
+                    "label": labels[i]
+                }, os.path.join(save_folder, f"sample_{batch_idx}_{i}.pt"))
+
+    logger.info(f"Finished saving split to {save_folder}")
+
+def get_folder_size(folder):
+    total_size = 0
+    try:
+        for entry in os.scandir(folder):
+            if entry.is_file():
+                total_size += entry.stat().st_size
+            elif entry.is_dir():
+                total_size += get_folder_size(entry.path)
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return 0
+    return total_size
+
+def reset_all_weights(model):
+    def weight_reset(m):
+        if hasattr(m, 'reset_parameters'):
+            m.reset_parameters()
+    model.apply(weight_reset)
+
+class AdaptiveGridSearch:
+    def __init__(self, fe_model, device, train_dl, val_dl, test_dl, model_folder):
+        self.evaluated_points = []
+        self.fe_model = fe_model
+        self.device = device
+        self.train_dl = train_dl
+        self.val_dl = val_dl
+        self.test_dl = test_dl
+        self.model_folder = model_folder
+
+    def find_bracket(self, usage):
+        # Sort points by r to ensure order
+        self.evaluated_points.sort(key=lambda x: x[0])
+
+        for i in range(len(self.evaluated_points) - 1):
+            r_a, use_a = self.evaluated_points[i]
+            r_b, use_b = self.evaluated_points[i+1]
+            if use_a <= usage < use_b:
+                return r_a, r_b
+            
+        # If no exact bracket, use full range as fallback
+        return 0.001, 1
+
+    def train_fe_model(self, r_val):
+        criterion = MetaLossFunction(
+            ch=[r_val],
+            cw=1,
+            device=self.device
+        )
+
+        self.fe_model = reset_all_weights(self.fe_model)
+        self.fe_model = self.fe_model.to(self.device)
+        fe_optimizer = torch.optim.Adam(self.fe_model.parameters(), lr=3e-4, weight_decay=1e-5)
+
+        best_val_loss = float('inf')
+        fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
+
+        for epoch in range(30):
+            _, _, _ = classifier_one_run(
+                model=self.fe_model,
+                dataloader=self.train_dl,
+                criterion=criterion,
+                fidelity="gate",
+                optimizer=fe_optimizer
+            )
+
+            val_loss, _, val_use = classifier_one_run(
+                model=self.fe_model,
+                dataloader=self.val_dl,
+                criterion=criterion,
+                fidelity="gate",
+            )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(self.fe_model.state_dict(), fe_model_file)
+
+        return val_use
+
+    def evaluate_fe_model(self, r_val):
+        criterion = MetaLossFunction(
+            ch=[r_val],
+            cw=1,
+            device=self.device
+        )
+
+        fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
+        self.fe_model.load_state_dict(torch.load(fe_model_file, weights_only=True))
+        self.fe_model = self.fe_model.to(self.device)
+
+        _, test_acc, test_use = classifier_one_run(
+            model=self.fe_model,
+            dataloader=self.test_dl,
+            criterion=criterion,
+            fidelity="gate",
+        )
+
+        return test_acc, test_use
+
+    def find_r_for_target(self, usage, tolerance=1e-3):
+        r_low, r_high = self.find_bracket(usage)
+        reruns = 0
+        while r_high - r_low > tolerance:
+            reruns += 1
+            r_mid = (r_low + r_high) / 2
+            use_mid = self.train_fe_model(r_mid)
+            self.evaluated_points.append((r_mid, use_mid))
+            if use_mid > usage:
+                r_low = r_mid
+            else:
+                r_high = r_mid
+
+        test_acc, test_use = self.evaluate_fe_model(r_high)
+        test_acc *= 100
+        test_use *= 100
+
+        logger.info(f"\nTook {reruns} passes to find best r value")
+        logger.info(f"For usage {usage}:")
+        logger.info(f"\tBest r: {r_high}")
+        logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]:.4f}")
+        logger.info(f"\tTest usage: {test_use:.2f} / Test acc: {test_acc:.2f}")
         
-    #     loss = criterion(target, preds, outputs)
-    #     if optimizer:
-    #         optimizer.zero_grad()
-    #         loss.backward()
-    #         optimizer.step()
-    pass
+        return r_high, test_acc, test_use
+    
+# def fe_svm_one_run(fe_model, hf_model, lf_model, dataloader, hf_weight, mode="train"):
+#     device = next(hf_model.parameters()).device
 
-def fe_svm_one_run(fe_model, hf_model, lf_model, dataloader, hf_weight, mode="train"):
-    device = next(hf_model.parameters()).device
+#     lf_body = create_feature_extractor(
+#         lf_model, {"7": "body"}
+#     ).to(device)
 
-    lf_body = create_feature_extractor(
-        lf_model, {"7": "body"}
-    ).to(device)
+#     num_samples = len(dataloader.dataset)
+#     batch_size = dataloader.batch_size
 
-    num_samples = len(dataloader.dataset)
-    batch_size = dataloader.batch_size
+#     lf_embeddings = np.zeros((num_samples, 32))
+#     lf_preds = np.zeros((num_samples, 2))
+#     hf_preds = np.zeros((num_samples, 2))
+#     labels = np.zeros(num_samples)
 
-    lf_embeddings = np.zeros((num_samples, 32))
-    lf_preds = np.zeros((num_samples, 2))
-    hf_preds = np.zeros((num_samples, 2))
-    labels = np.zeros(num_samples)
+#     for i, (hf_data, lf_data, target) in enumerate(dataloader):
+#         target = target.type(torch.LongTensor) 
+#         hf_data = hf_data.to(device, torch.float)
+#         lf_data = lf_data.to(device, torch.float)
+#         target = target.to(device)
 
-    for i, (hf_data, lf_data, target) in enumerate(dataloader):
-        target = target.type(torch.LongTensor) 
-        hf_data = hf_data.to(device, torch.float)
-        lf_data = lf_data.to(device, torch.float)
-        target = target.to(device)
+#         lf_embs_tmp = lf_body(lf_data)["body"].detach().cpu().numpy()
+#         lf_output_tmp = lf_model(lf_data).detach().cpu().numpy()
+#         hf_output_tmp = hf_model(hf_data).detach().cpu().numpy()
 
-        lf_embs_tmp = lf_body(lf_data)["body"].detach().cpu().numpy()
-        lf_output_tmp = lf_model(lf_data).detach().cpu().numpy()
-        hf_output_tmp = hf_model(hf_data).detach().cpu().numpy()
+#         offset = len(lf_embs_tmp)
 
-        offset = len(lf_embs_tmp)
+#         lf_embeddings[i*batch_size:(i*batch_size+offset)] = lf_embs_tmp
+#         lf_preds[i*batch_size:(i*batch_size+offset)] = lf_output_tmp
+#         hf_preds[i*batch_size:(i*batch_size+offset)] = hf_output_tmp
+#         labels[i*batch_size:(i*batch_size+offset)] = target.cpu().numpy()
 
-        lf_embeddings[i*batch_size:(i*batch_size+offset)] = lf_embs_tmp
-        lf_preds[i*batch_size:(i*batch_size+offset)] = lf_output_tmp
-        hf_preds[i*batch_size:(i*batch_size+offset)] = hf_output_tmp
-        labels[i*batch_size:(i*batch_size+offset)] = target.cpu().numpy()
+#     lf_correct = np.argmax(lf_preds, axis=1) == labels
+#     hf_correct = np.argmax(hf_preds, axis=1) == labels
 
-    lf_correct = np.argmax(lf_preds, axis=1) == labels
-    hf_correct = np.argmax(hf_preds, axis=1) == labels
+#     best_choices = np.logical_and(~lf_correct, hf_correct).astype(int)
 
-    best_choices = np.logical_and(~lf_correct, hf_correct).astype(int)
-
-    if mode=="train":
-        weights = np.where(best_choices==1, hf_weight, 1)
-        fe_model.fit(lf_embeddings, labels, sample_weights=weights)
+#     if mode=="train":
+#         weights = np.where(best_choices==1, hf_weight, 1)
+#         fe_model.fit(lf_embeddings, labels, sample_weights=weights)
         
-
-
-def build_qe_model(num_classes: int=2):
-    qe_model = nn.Sequential(
-        nn.Linear(32, 64),
-        nn.ReLU(),
-        nn.Linear(64, 128),
-        nn.ReLU(),
-        nn.Linear(128, 64),
-        nn.ReLU(),
-        nn.Linear(64, num_classes),
-        nn.Softmax(dim=1)
-    )
-
-    return qe_model
-
-
-def build_dataloaders(full_dataset, noise=1):
-    # train_dataset = BinaryHypercubeDataset(1275, noise_level=noise)
-    # test_dataset = BinaryHypercubeDataset(150, noise_level=noise)
-    # val_dataset = BinaryHypercubeDataset(75, noise_level=noise)
-
-    rand_idxs = np.random.choice(3, p=[.85, .1, .05], size=len(full_dataset))
-    idxs = np.arange(len(full_dataset))
-
-    train_dataset = Subset(full_dataset, idxs[rand_idxs==0])
-
-    test_dataset = Subset(full_dataset, idxs[rand_idxs==1])
-    val_dataset = Subset(full_dataset, idxs[rand_idxs==2])
-
-    train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=512, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=512, shuffle=True)
-
-    return train_loader, test_loader, val_loader
-
 class EarlyStopper:
     def __init__(self, patience=1, min_delta=0):
         self.patience = patience
@@ -373,25 +741,3 @@ class EarlyStopper:
                 return True
         return False
     
-def build_metadata(config: Options):
-    augmentation = config.dataset.augmentation
-    dataset = config.dataset.name
-    aug_deg = config.dataset.augmentation_level
-
-    metadata = MetaData(
-        loss = PerformanceData(
-            train = [],
-            test = [],
-            val = []
-        ),
-        acc = PerformanceData(
-            train = [],
-            test = [],
-            val = []
-        ),
-        augmentation = augmentation,
-        augmentation_degree = aug_deg,
-        dataset = dataset
-    )
-
-    return metadata

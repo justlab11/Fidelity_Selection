@@ -3,54 +3,136 @@ import torch.nn as nn
 from torchvision import models
 from sklearn.svm import SVC
 
-def build_mlp(input_size, num_layers, output_size, hidden_size=64, device='cpu'):
-    layers = []
-    
-    # Input layer
-    layers.append(nn.Linear(input_size, hidden_size))
-    layers.append(nn.ReLU())
-    
-    # Hidden layers
-    for _ in range(num_layers - 1):
-        layers.append(nn.Linear(hidden_size, hidden_size))
+class CustomMLP(nn.Module):
+    def __init__(self, input_size, num_layers, output_size, hidden_size=64):
+        super().__init__()
+        layers = []
+        
+        # Input layer
+        layers.append(nn.Linear(input_size, hidden_size))
         layers.append(nn.ReLU())
-    
-    # Output layer
-    layers.append(nn.Linear(hidden_size, output_size))
-    
-    # Create the sequential model
-    model = nn.Sequential(*layers).to(device)
-    
-    return model
+        
+        # Hidden layers
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(hidden_size, hidden_size))
+            layers.append(nn.ReLU())
+        
+        # Output layer
+        self.output_layer = nn.Linear(hidden_size, output_size)
+        
+        # Create the sequential model
+        self.model = nn.Sequential(*layers)
 
-def build_resnet(latent_size, output_size, device='cpu'):
-    # Dictionary mapping resnet_size to the corresponding model function
+    def forward(self, x):
+        layers = {}
+
+        x = self.model(x)
+        layers["latent"] = x
+
+        x = self.output_layer(x)
+        layers["output"] = x
+
+        return layers
     
-    # Check if the requested ResNet size is valid    
-    # Get the appropriate ResNet model
-    model = models.resnet18(weights="DEFAULT")
+class CustomResNet18(nn.Module):
+    def __init__(self, latent_size, output_size, num_channels=3):
+        super().__init__()
+        model = models.resnet18(weights="DEFAULT")
+        if num_channels != 3:
+            model.conv1 = nn.Conv2d(num_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Identity()
+
+        self.model = model
+        self.latent_rep = nn.Sequential(
+            nn.Linear(num_ftrs, latent_size),
+            nn.Dropout(p=0.6)
+        )
+        self.output_layer = nn.Sequential(
+            nn.ReLU(),
+            nn.Dropout(p=0.6),
+            nn.Linear(latent_size, output_size),
+        )
+
+    def freeze_body(self, freeze=True):
+        for param in self.model.parameters():
+            param.requires_grad = not freeze
+
+    def head(self, x):
+        layers = {}
+
+        x = self.latent_rep(x)
+        layers["latent"] = x
+        
+        x = self.output_layer(x)
+        layers["output"] = x
+
+        return layers
+
+    def forward(self, x):
+        layers = {}
+
+        x = self.model(x)
+        layers["body_output"] = x
+
+        x = self.latent_rep(x)
+        layers["latent"] = x
+        
+        x = self.output_layer(x)
+        layers["output"] = x
+
+        return layers
     
-    # Remove the original fully connected layer
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Identity()
-    
-    # Create a new sequential module for the final layers
-    new_head = nn.Sequential(
-        nn.Linear(num_ftrs, latent_size),
-        nn.ReLU(),
-        nn.Linear(latent_size, output_size)
-    )
-    
-    # Create a new sequential model combining ResNet and the new head
-    full_model = nn.Sequential(
-        model,
-        new_head
-    )
-    
-    # Move the model to the specified device
-    full_model = full_model.to(device)
-    
-    return full_model
+class CustomViT(nn.Module):
+    def __init__(self, latent_size, output_size):
+        super().__init__()
+        # Load vision transformer backbone with pretrained weights
+        model = models.vit_b_16(weights="DEFAULT")  # or weights=None for no pretrained
+        
+        # Remove the original classification head
+        num_ftrs = model.heads.head.in_features
+        model.heads.head = nn.Identity()
+        
+        self.model = model
+        self.latent_rep = nn.Sequential(
+            nn.Linear(num_ftrs, latent_size),
+            nn.Dropout(p=0.6)
+        )
+        self.output_layer = nn.Sequential(
+            nn.ReLU(),
+            nn.Dropout(p=0.6),
+            nn.Linear(latent_size, output_size)
+        )
+
+    def freeze_body(self, freeze=True):
+        for param in self.model.parameters():
+            param.requires_grad = not freeze
+
+    def head(self, x):
+        layers = {}
+
+        x = self.latent_rep(x)
+        layers["latent"] = x
+        
+        x = self.output_layer(x)
+        layers["output"] = x
+
+        return layers
+
+    def forward(self, x):
+        layers = {}
+
+        x = self.model(x)  # forward through ViT body
+        layers["body_output"] = x
+
+        x = self.latent_rep(x)
+        layers["latent"] = x
+
+        x = self.output_layer(x)
+        layers["output"] = x
+
+        return layers
 
 def build_svm(C=1.0, kernel='rbf'):
     valid_kernels = ['linear', 'poly', 'rbf', 'sigmoid', 'precomputed']
@@ -189,7 +271,6 @@ class Encoder(nn.Module):
 
         return encoder_features
 
-
 class Decoder(nn.Module):
     """The decoder part of the UNet architecture.
 
@@ -255,7 +336,6 @@ class Decoder(nn.Module):
             x = decoder_block(x)
         return x
 
-
 class UNet(nn.Module):
     """The UNet architecture.   
 
@@ -291,13 +371,73 @@ class UNet(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
+        layers = {}
+
         encoder_features = self.encoder(x)[::-1]
+        layers["latent"] = encoder_features[0]
+
         x = self.decoder(encoder_features[0], encoder_features[1:])
         x = self.output(x)
-        return x
+        layers["output"] = x
+        
+        return layers
 
-def build_unet(num_channels, device='cpu'):
-    # img size should be 256x256
-    unet = UNet(channels=[num_channels, 64, 128, 256, 512, 1024], out_channels=1)
-    unet = unet.to(device)
+def build_unet(num_channels, num_classes):
+    # img size should be 224x224
+    unet = UNet(channels=[num_channels, 64, 128, 256, 512, 1024], out_channels=num_classes)
     return unet
+
+class LatentCNNHead(nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 256, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1)  # Output: [batch, 256, 1, 1]
+        )
+        self.fc = nn.Linear(256, num_classes)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+    
+class SelectiveNet(nn.Module):
+    def __init__(self, latent_dim, num_classes):
+        super().__init__()
+        self.proj_layer = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+        )
+
+        self.selection_head = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+
+        self.pred_head = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes),
+        )
+
+        self.aux_head = nn.Sequential(
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, lf_latent):
+        proj = self.proj_layer(lf_latent)
+
+        selection_logits = self.selection_head(proj)
+        pred_logits = self.pred_head(proj)
+        aux_logits = self.aux_head(proj)
+
+        return selection_logits, pred_logits, aux_logits
+    
+    def body(self, lf_latent):
+        proj = self.proj_layer(lf_latent)
+
+        return proj

@@ -1,0 +1,26 @@
+dataset:
+  name: mnist
+  folder: ../data
+
+latent_size: 128
+random_seed: 42
+run_comparisons: False
+train_body: False
+
+classifier_training:
+  epochs: 50
+  batch_size: 32
+  loss_fun: CE
+  lf_model: resnet
+  hf_model: resnet
+  
+fe_training:
+  epochs: 40
+  batch_size: 128
+
+  r_range:
+    start: 0.0
+    stop: 1.0
+    num_steps: 100
+    scale: linear
+    direction: reversed # normal: 0 -> 1, reversed 1 -> 0

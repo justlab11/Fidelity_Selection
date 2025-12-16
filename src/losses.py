@@ -1,6 +1,9 @@
 from typing import *
 import torch
 import torch.nn as nn
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MetaLossFunction(nn.Module):
     def __init__(self, ch: List[float], cw: float, device: str, loss_fun: str="CE"):
@@ -25,29 +28,60 @@ class MetaLossFunction(nn.Module):
                 self.loss_fun = nn.L1Loss(reduction="none")
             case default:
                 raise ValueError("Invalid loss function")
-
-    def forward(self, y_true: torch.tensor, y_preds: torch.tensor, choices: torch.tensor):
-        batch_size = len(y_true)
+            
+    def forward(self, y_true, y_preds, choices):
+        # y_preds: List of tensors, length n_f, each (batch_size, num_classes)
+        # choices: (batch_size, n_f)  # FE selection probabilities
+        choices = nn.Softmax(dim=1)(choices)
+        choices = choices.to(self.device) 
+        
+        # Compute per-fidelity losses for each sample, stack as (batch_size, n_f)
         model_losses = []
+        for i, pred in enumerate(y_preds):
+            loss = self.loss_fun(pred, y_true)  # shape: (batch_size,)
+            model_losses.append(loss)
 
-        with torch.no_grad():
-            for pred in y_preds:
-                loss = self.loss_fun(pred, y_true)
-                model_losses.append(loss)
+        model_losses_tensor = torch.stack(model_losses, dim=1)  # (batch_size, n_f)
+        model_losses_tensor = model_losses_tensor.to(self.device)
 
-        model_losses_tensor = torch.stack(model_losses)
+        # Cost ratio vector; shape (n_f,)
+        ch_vec = torch.tensor(self.ch, device=self.device).float()
 
-        cw_matrix = self.cw * torch.ones_like(model_losses_tensor)
+        # For each sample, total cost: cost ratio + loss
+        total_costs = model_losses_tensor + ch_vec  # broadcasting: (batch_size, n_f)
 
-        ch_matrix = torch.tensor(self.ch)
-        ch_matrix = ch_matrix.view(-1, len(self.ch))
-        ch_matrix = ch_matrix.repeat(batch_size, 1).T
+        # For each sample, expected cost under FE probabilities:
+        expected_costs = torch.sum(choices * total_costs, dim=1)  # (batch_size,)
 
-        cw_matrix = cw_matrix.to(self.device)
-        ch_matrix = ch_matrix.to(self.device)
+        # Mean over batch
+        return expected_costs.mean()
+    
+    # def forward(self, y_true: torch.tensor, y_preds: torch.tensor, choices: torch.tensor):
+    #     batch_size = len(y_true)
+    #     model_losses = []
+    #     choices = nn.Softmax(dim=1)(choices)
+    #     choices = choices.to(self.device)
 
-        model_loss_weights = model_losses_tensor * (cw_matrix + ch_matrix)
+    #     with torch.no_grad():
+    #         for pred in y_preds:
+    #             loss = self.loss_fun(pred, y_true)
+    #             model_losses.append(loss)
 
-        self.meta_loss = choices.T * model_loss_weights
+    #     model_losses_tensor = torch.stack(model_losses)
 
-        return torch.sum(self.meta_loss)
+    #     cw_matrix = self.cw * torch.ones_like(model_losses_tensor)
+
+    #     ch_matrix = torch.tensor(self.ch)
+    #     ch_matrix = ch_matrix.view(-1, len(self.ch))
+    #     ch_matrix = ch_matrix.repeat(batch_size, 1).T
+
+    #     cw_matrix = cw_matrix.to(self.device)
+    #     ch_matrix = ch_matrix.to(self.device)
+    #     model_losses_tensor = model_losses_tensor.to(self.device)
+
+    #     model_loss_weights = model_losses_tensor * (cw_matrix + ch_matrix)
+    #     meta_loss = choices.T * model_loss_weights
+
+    #     loss_result = torch.sum(meta_loss) / batch_size
+
+    #     return loss_result
