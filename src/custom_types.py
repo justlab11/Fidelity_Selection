@@ -1,5 +1,6 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Literal, List
+import numpy as np
 
 class SplitData(BaseModel):
     train: List[float]
@@ -36,3 +37,9 @@ class ConfigOptions(BaseModel):
     num_reruns: int
     classifier_training: ClassifierSettings
     fe_training: FESettings
+
+class FEResult(BaseModel):
+    r: float
+    loss: float
+    usage: float
+    accuracy: float

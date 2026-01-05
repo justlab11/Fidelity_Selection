@@ -7,9 +7,12 @@ import yaml
 import os
 import logging
 from torch.utils.data import DataLoader
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel
+from scipy.optimize import minimize
 
 from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset
-from custom_types import ConfigOptions
+from custom_types import ConfigOptions, FEResult
 from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead
 from losses import MetaLossFunction
 
@@ -579,6 +582,160 @@ def reset_all_weights(model):
             m.reset_parameters()
     model.apply(weight_reset)
 
+class GaussianProcessSearch:
+    def __init__(self, fe_model, device, train_dl, val_dl, test_dl, model_folder):
+        self.evaluated_points = []
+        self.fe_model = fe_model
+        self.device = device
+        self.train_dl = train_dl
+        self.val_dl = val_dl
+        self.test_dl = test_dl
+        self.model_folder = model_folder
+
+    def expected_improvement(X, X_sample, gp, xi=0.01):
+        mu, sigma = gp.predict(X, return_std=True)
+        mu_sample = gp.predict(X_sample)
+
+        sigma = sigma.reshape(-1, 1)
+        mu_sample_opt = np.max(mu_sample)
+
+        with np.errstate(divide='warn'):
+            imp = mu - mu_sample_opt - xi
+            Z = imp / sigma
+            from scipy.stats import norm
+            ei = imp * norm.cdf(Z) + sigma * norm.pdf(Z)
+            ei[sigma == 0.0] = 0.0
+        return ei
+
+    def propose_location(acquisition, X_sample, gp, bounds, n_restarts=25):
+        dim = X_sample.shape[1]
+        min_val = 1e20
+        min_x = None
+        
+        def min_obj(X):
+            return -acquisition(X.reshape(-1, dim), X_sample, gp)
+        
+        for x0 in np.random.uniform(bounds[:, 0], bounds[:, 1], size=(n_restarts, dim)):
+            res = minimize(min_obj, x0=x0, bounds=bounds, method='L-BFGS-B')
+            if res.fun < min_val:
+                min_val = res.fun
+                min_x = res.x
+                
+        return min_x.reshape(-1, dim)
+    
+    def train_fe_model(self, r_val):
+        criterion = MetaLossFunction(
+            ch=[r_val],
+            cw=1,
+            device=self.device
+        )
+
+        self.fe_model = reset_all_weights(self.fe_model)
+        self.fe_model = self.fe_model.to(self.device)
+        fe_optimizer = torch.optim.Adam(self.fe_model.parameters(), lr=3e-4, weight_decay=1e-5)
+
+        best_val_loss = float('inf')
+        best_val_acc = float('inf')
+        best_val_use = float('inf')
+        fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
+
+        for _ in range(30):
+            _, _, _ = classifier_one_run(
+                model=self.fe_model,
+                dataloader=self.train_dl,
+                criterion=criterion,
+                fidelity="gate",
+                optimizer=fe_optimizer
+            )
+
+            val_loss, val_acc, val_use = classifier_one_run(
+                model=self.fe_model,
+                dataloader=self.val_dl,
+                criterion=criterion,
+                fidelity="gate",
+            )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_val_acc = val_acc
+                best_val_use = val_use
+                torch.save(self.fe_model.state_dict(), fe_model_file)
+
+        return best_val_loss, best_val_acc, best_val_use
+
+    def evaluate_fe_model(self, r_val):
+        criterion = MetaLossFunction(
+            ch=[r_val],
+            cw=1,
+            device=self.device
+        )
+
+        fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
+        self.fe_model.load_state_dict(torch.load(fe_model_file, weights_only=True))
+        self.fe_model = self.fe_model.to(self.device)
+
+        _, test_acc, test_use = classifier_one_run(
+            model=self.fe_model,
+            dataloader=self.test_dl,
+            criterion=criterion,
+            fidelity="gate",
+        )
+
+        return test_acc, test_use
+
+    def find_r_for_target(self, usage, tolerance=1e-3):
+        kernel = ConstantKernel(1.0, (0.1, 10)) * RBF(length_scale=0.1, length_scale_bounds=(0.01, 0.5))
+
+        closest_usage = 10000
+        reruns = 0
+        while abs(usage - closest_usage) > tolerance:
+            reruns += 1
+            if self.evaluated_points == []:
+                loss, acc, use = self.train_fe_model(0)
+                self.evaluated_points.append(
+                    FEResult(
+                        r = 0, loss = loss,
+                        accuracy = acc, usage = use 
+                    )
+                )
+                closest_usage = use
+                continue
+
+            r_vals = np.array([point.r for point in self.evaluated_points])
+            usages = np.array([point.usage for point in self.evaluated_points])
+
+            gp = GaussianProcessRegressor(kernel=kernel, alpha=1e-6, normalize_y=False)
+            gp.fit(r_vals, usages)
+            bounds = np.array([[0, 1]])  # Adjust to your parameter space
+            next_point = self.propose_location(self.expected_improvement, r_vals, gp, bounds)
+
+            loss, acc, use = self.train_fe_model(next_point)
+            self.evaluated_points.append(
+                FEResult(
+                    r = next_point, loss = loss,
+                    accuracy = acc, usage = use 
+                )
+            )
+
+            usages = np.append(usages, use)
+            idx = np.argmin(np.abs(usages - usage))
+            closest_usage = usages[idx]
+
+        idx = np.argmin(np.abs([point.usage for point in self.evaluated_points] - usage))
+        best_point = self.evaluated_points[idx]
+
+        test_acc, test_use = self.evaluate_fe_model(best_point.r)
+        test_acc *= 100
+        test_use *= 100
+
+        logger.info(f"\nTook {reruns} passes to find best r value")
+        logger.info(f"For usage {usage}:")
+        logger.info(f"\tBest r: {best_point.r}")
+        logger.info(f"\tClosest val usage: {best_point.use:.4f}")
+        logger.info(f"\tTest usage: {test_use:.2f} / Test acc: {test_acc:.2f}")
+
+        return best_point
+
 class AdaptiveGridSearch:
     def __init__(self, fe_model, device, train_dl, val_dl, test_dl, model_folder):
         self.evaluated_points = []
@@ -683,7 +840,7 @@ class AdaptiveGridSearch:
         
         return r_high, test_acc, test_use
     
-# def fe_svm_one_run(fe_model, hf_model, lf_model, dataloader, hf_weight, mode="train"):
+# def fe_svm_one_run(fe_m odel, hf_model, lf_model, dataloader, hf_weight, mode="train"):
 #     device = next(hf_model.parameters()).device
 
 #     lf_body = create_feature_extractor(
