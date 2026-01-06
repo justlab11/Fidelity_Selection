@@ -406,5 +406,11 @@ def main(config_file):
     )
 
     logger.info("\nRUNNING DEFAULT SELECTIVENET")
+    selnet_model: nn.Module = build_model(
+        model_name=lf_model_name,
+        input_size=lf_input_size,
+        output_size=output_size,
+        latent_size=latent_size
+    )    
 
     

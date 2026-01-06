@@ -69,19 +69,108 @@ class SoftmaxResponseMethod:
         return accuracy, usage
 
 class SelectiveNetMethod:
-    def __init__(self, train_dl, val_dl, test_dl, model_folder):
-        self.train_dl = train_dl
-        self.val_dl = val_dl
-        self.test_dl = test_dl
+    def __init__(self, model_folder, alpha=.7):
         self.model_folder = model_folder
+        self.alpha = alpha
 
-    
-
-    def selective_loss(self, y_true, selection_logits, lf_logits, lamda=32, c=0.8):
+    def selective_loss_class(self, y_true, selection_logits, lf_logits, lamda=32, c=0.8):
         selection_prob = torch.sigmoid(selection_logits)
+
         ce = F.cross_entropy(lf_logits, y_true.argmax(dim=1), reduction='none')
         weighted_ce = selection_prob.view(-1) * ce
         ce_loss = weighted_ce.mean()
+
         coverage = selection_prob.mean()
         penalty = lamda * torch.clamp(-coverage + c, min=0) ** 2
+
         return ce_loss + penalty
+
+    def selective_loss_seg(self, y_true, selection_logits, lf_logits, lamda=32, c=0.8):
+        # selection per pixel: (B, 1, H, W) -> (B, H, W)
+        selection_prob = torch.sigmoid(selection_logits).squeeze(1)
+
+        # per-pixel CE: (B, H, W)
+        ce = F.cross_entropy(lf_logits, y_true, reduction='none')
+
+        # gate by selection prob, then normalize by number of selected pixels
+        # (to avoid the model minimizing loss by selecting almost nothing)
+        weighted_ce = selection_prob * ce
+        # add a small eps to avoid division-by-zero early in training
+        eps = 1e-6
+        ce_loss = weighted_ce.sum() / (selection_prob.sum() + eps)
+
+        # coverage is now fraction of selected pixels
+        coverage = selection_prob.mean()
+
+        # same coverage penalty as in classification
+        penalty = lamda * torch.clamp(-coverage + c, min=0) ** 2
+
+        return ce_loss + penalty
+    
+    def selective_loss(self, y_true, selection_logits, lf_logits, lamda=32, c=0.8):
+        if lf_logits.dim() == 2:  # [B, C]
+            return self.selective_loss_class(y_true, selection_logits, lf_logits,
+                                            lamda=lamda, c=c)
+        elif lf_logits.dim() == 4:  # [B, C, H, W]
+            return self.selective_loss_seg(y_true, selection_logits, lf_logits,
+                                        lamda=lamda, c=c)
+        else:
+            raise ValueError(f"Unsupported lf_logits shape: {lf_logits.shape}")
+
+    def aux_ce_loss(self, y_true, aux_logits):
+        if aux_logits.dim() == 2:
+            # classification: aux_logits [B, C], y_true [B] (class indices)
+            return F.cross_entropy(aux_logits, y_true, reduction='mean')
+        elif aux_logits.dim() == 4:
+            # segmentation: aux_logits [B, C, H, W], y_true [B, H, W]
+            return F.cross_entropy(aux_logits, y_true, reduction='mean')
+        else:
+            raise ValueError(f"Unsupported aux_logits shape: {aux_logits.shape}")
+
+    def one_run(self, model, dataloader, train_body=True, optimizer=None):
+        model.train(mode=bool(optimizer))
+        device = next(model.parameters()).device
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        total_high = 0
+
+        for data, _, target in dataloader:
+            target = target.type(torch.LongTensor)
+            data, target = data.to(device, torch.float), target.to(device)
+            
+            if train_body:
+                layers = model.selective_forward(data)
+                output = layers["output"]
+                aux = layers["aux"]
+                select = layers["select"]
+
+            else:
+                layers = model.selective_head(data)
+                output = layers["output"]
+                aux = layers["aux"]
+                select = layers["select"]
+
+            sel_loss = self.selective_loss(
+                y_true = target,
+                selection_logits = select,
+                lf_logits = output
+            )
+            aux_loss = self.aux_ce_loss(
+                y_true = target,
+                aux_logits = aux
+            )
+
+            loss = self.alpha * sel_loss + (1-self.alpha) * aux_loss
+
+            if optimizer:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            total_loss += loss.item() * data.size(0)
+            predicted = torch.argmax(output, dim=1)
+            total_correct += (predicted == target).sum().item()
+            total_samples += data.size(0)
+
+

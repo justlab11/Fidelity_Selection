@@ -23,16 +23,37 @@ class CustomMLP(nn.Module):
         # Create the sequential model
         self.model = nn.Sequential(*layers)
 
+        # extra selectivenet heads
+        self.aux_head = nn.Linear(hidden_size, output_size)
+        self.selective_head = nn.Linear(hidden_size, 1)
+
     def forward(self, x):
         layers = {}
 
-        x = self.model(x)
-        layers["latent"] = x
+        latent = self.model(x)
+        layers["latent"] = latent
 
-        x = self.output_layer(x)
-        layers["output"] = x
+        output = self.output_layer(latent)
+        layers["output"] = output
 
-        return layers
+        return layers  
+
+    def selective_forward(self, x):    
+        layers = {}
+
+        latent = self.model(x)
+        layers["latent"] = latent
+
+        output = self.output_layer(latent)
+        layers["output"] = output
+
+        aux = self.aux_head(latent)
+        layers["aux"] = aux
+
+        select = self.selective_head(latent)
+        layers["select"] = select
+
+        return layers 
     
 class CustomResNet18(nn.Module):
     def __init__(self, latent_size, output_size, num_channels=3):
@@ -53,6 +74,18 @@ class CustomResNet18(nn.Module):
             nn.ReLU(),
             nn.Dropout(p=0.6),
             nn.Linear(latent_size, output_size),
+        )
+
+        # extra selectivenet heads
+        self.aux_head = nn.Sequential(
+            nn.ReLU(),
+            nn.Dropout(p=0.6),
+            nn.Linear(latent_size, output_size),
+        )
+        self.selective_head = nn.Sequential(
+            nn.ReLU(),
+            nn.Dropout(p=0.6),
+            nn.Linear(latent_size, 1),
         )
 
     def freeze_body(self, freeze=True):
@@ -84,6 +117,43 @@ class CustomResNet18(nn.Module):
 
         return layers
     
+    def selective_forward(self, x):    
+        layers = {}
+
+        body = self.model(x)
+        layers["body_output"] = body
+
+        latent = self.latent_rep(body)
+        layers["latent"] = latent
+        
+        output = self.output_layer(latent)
+        layers["output"] = output
+
+        aux = self.aux_head(latent)
+        layers["aux"] = aux
+
+        select = self.selective_head(latent)
+        layers["select"] = select
+
+        return layers 
+    
+    def selective_head(self, x):
+        layers = {}
+
+        latent = self.latent_rep(x)
+        layers["latent"] = latent
+        
+        output = self.output_layer(latent)
+        layers["output"] = output
+
+        aux = self.aux_head(latent)
+        layers["aux"] = aux
+
+        select = self.selective_head(latent)
+        layers["select"] = select
+
+        return layers 
+    
 class CustomViT(nn.Module):
     def __init__(self, latent_size, output_size):
         super().__init__()
@@ -103,6 +173,18 @@ class CustomViT(nn.Module):
             nn.ReLU(),
             nn.Dropout(p=0.6),
             nn.Linear(latent_size, output_size)
+        )
+
+        # extra selectivenet heads
+        self.aux_head = nn.Sequential(
+            nn.ReLU(),
+            nn.Dropout(p=0.6),
+            nn.Linear(latent_size, output_size),
+        )
+        self.selective_head = nn.Sequential(
+            nn.ReLU(),
+            nn.Dropout(p=0.6),
+            nn.Linear(latent_size, 1),
         )
 
     def freeze_body(self, freeze=True):
@@ -133,6 +215,44 @@ class CustomViT(nn.Module):
         layers["output"] = x
 
         return layers
+    
+    def selective_forward(self, x):    
+        layers = {}
+
+        body = self.model(x)
+        layers["body_output"] = body
+
+        latent = self.latent_rep(body)
+        layers["latent"] = latent
+        
+        output = self.output_layer(latent)
+        layers["output"] = output
+
+        aux = self.aux_head(latent)
+        layers["aux"] = aux
+
+        select = self.selective_head(latent)
+        layers["select"] = select
+
+        return layers 
+    
+    def selective_head(self, x):    
+        layers = {}
+
+        latent = self.latent_rep(x)
+        layers["latent"] = latent
+        
+        output = self.output_layer(latent)
+        layers["output"] = output
+
+        aux = self.aux_head(latent)
+        layers["aux"] = aux
+
+        select = self.selective_head(latent)
+        layers["select"] = select
+
+        return layers
+
 
 def build_svm(C=1.0, kernel='rbf'):
     valid_kernels = ['linear', 'poly', 'rbf', 'sigmoid', 'precomputed']
@@ -362,25 +482,44 @@ class UNet(nn.Module):
         self.decoder = Decoder(channels[::-1][:-1])
         self.output = nn.Conv2d(channels[1], out_channels, kernel_size=1)
 
+        # extra selectivenet heads
+        self.aux_head = nn.Conv2d(channels[1], out_channels, kernel_size=1)
+        self.selective_head = nn.Conv2d(channels[1], 1, kernel_size=1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the UNet architecture.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The output tensor.
-        """
         layers = {}
 
         encoder_features = self.encoder(x)[::-1]
-        layers["latent"] = encoder_features[0]
+        layers["body"] = encoder_features[0]
 
         x = self.decoder(encoder_features[0], encoder_features[1:])
+        layers["latent"] = x
+
         x = self.output(x)
         layers["output"] = x
         
         return layers
+    
+    def selective_forward(self, x):    
+        layers = {}
+
+        encoder_features = self.encoder(x)[::-1]
+        layers["body"] = encoder_features[0]
+
+        latent = self.decoder(encoder_features[0], encoder_features[1:])
+        layers["latent"] = latent
+
+        output = self.output(latent)
+        layers["output"] = output
+
+        aux = self.aux_head(latent)
+        layers["aux"] = aux
+
+        select = self.selective_head(latent)
+        layers["select"] = select
+
+        return layers 
+
 
 def build_unet(num_channels, num_classes):
     # img size should be 224x224
