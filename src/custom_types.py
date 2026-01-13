@@ -34,7 +34,8 @@ class ConfigOptions(BaseModel):
     dataset: DatasetSettings
     latent_size: int
     random_seed: int
-    num_reruns: int
+    run_comparisons: bool
+    train_body: bool
     classifier_training: ClassifierSettings
     fe_training: FESettings
 

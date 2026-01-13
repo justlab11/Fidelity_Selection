@@ -1,18 +1,18 @@
 dataset:
-  name: mnist
+  name: crop
   folder: ../data
 
 latent_size: 128
 random_seed: 42
 run_comparisons: False
-train_body: False
+train_body: True
 
 classifier_training:
   epochs: 50
   batch_size: 32
   loss_fun: CE
-  lf_model: resnet
-  hf_model: resnet
+  lf_model: unet
+  hf_model: unet
   
 fe_training:
   epochs: 40
