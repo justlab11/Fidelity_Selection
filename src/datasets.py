@@ -185,6 +185,7 @@ class CropDataset(Dataset):
         assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
 
         self.fileset = []
+        self.generator = torch.Generator().manual_seed(seed)
 
         self.img_transform = transforms.Compose([
             transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
@@ -255,7 +256,7 @@ class CropDataset(Dataset):
     def __len__(self):
         return len(self.fileset)
     
-    def _compute_dataset_stats(self, root, split):
+    def _compute_dataset_stats(self):
         """Compute global mean/std from unique chips in this split only"""
         unique_chips = set(f[0] for f in self.fileset)  # Remove timestep/quadrant duplicates
         
@@ -269,8 +270,6 @@ class CropDataset(Dataset):
         self.mean = all_data.mean(axis=(0,1,2))    # [18]
         self.std = all_data.std(axis=(0,1,2)) + 1e-8  # [18]
         
-        print(f"Split {split}: mean={self.mean[:3].round(3)}, std={self.std[:3].round(3)}...")
-
     def __getitem__(self, idx:int):
         base_fname, timestep, quadrant = self.fileset[idx]
         mask_fname = base_fname + ".mask.tif"

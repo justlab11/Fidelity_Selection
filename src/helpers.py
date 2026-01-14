@@ -380,10 +380,12 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
 
     model.train(mode=bool(optimizer))
     device = next(model.parameters()).device
+
     total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
+    total_correct = 0.0
+    total_samples = 0.0
     total_high = 0
+
     if fidelity == "lf":
         for data, _, target in dataloader:
             target = target.type(torch.LongTensor)
@@ -403,8 +405,14 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
 
             total_loss += loss.item() * data.size(0)
             predicted = torch.argmax(output, dim=1)
-            total_correct += (predicted == target).sum().item()
-            total_samples += data.size(0)
+
+            is_segmentation = (output.ndim == 4 and target.ndim >= 3)
+            if is_segmentation:
+                total_correct += (predicted == target).float().sum().item()
+                total_samples += predicted.numel()  # B*C*H*W but C=1 after argmax
+            else:
+                total_correct += (predicted == target).sum().item()
+                total_samples += data.size(0)
 
         if scheduler:
             scheduler.step()
@@ -429,8 +437,14 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
 
             total_loss += loss.item() * data.size(0)
             predicted = torch.argmax(output, dim=1)
-            total_correct += (predicted == target).sum().item()
-            total_samples += data.size(0)
+
+            is_segmentation = (output.ndim == 4 and target.ndim >= 3)
+            if is_segmentation:
+                total_correct += (predicted == target).float().sum().item()
+                total_samples += predicted.numel()  # B*C*H*W but C=1 after argmax
+            else:
+                total_correct += (predicted == target).sum().item()
+                total_samples += data.size(0)
 
         if scheduler:
             scheduler.step()
