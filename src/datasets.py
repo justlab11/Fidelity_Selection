@@ -193,9 +193,8 @@ class CropDataset(Dataset):
         ])
         
         self.mask_transform = transforms.Compose([
-            transforms.ToTensor(),  # Converts (H, W) to (1, H, W)
+            transforms.Lambda(lambda x: torch.from_numpy(x).long()),  # uint8→long DIRECTLY
             transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.NEAREST),
-            transforms.Lambda(lambda x: x.squeeze(0).long())  # Remove channel dim and ensure integer type
         ])
 
         if split == "val":
@@ -215,6 +214,8 @@ class CropDataset(Dataset):
                 for t in range(3): # timestep 
                     for q in range(4): # quandrant of the image
                         self.fileset.append((val_filenames[i], t, q))
+            
+            self._compute_dataset_stats()
 
         else:
             train_folder = path.join(root, "multi-temporal-crop-classification", "training_data.txt")
@@ -243,6 +244,8 @@ class CropDataset(Dataset):
                 for t in range(3): # timestep 
                     for q in range(4): # quandrant of the image
                         self.fileset.append((train_test_filenames[i], t, q))
+            
+            self._compute_dataset_stats()
 
     def get_num_classes(self):
         return 14
@@ -261,7 +264,7 @@ class CropDataset(Dataset):
         unique_chips = set(f[0] for f in self.fileset)  # Remove timestep/quadrant duplicates
         
         all_data = []
-        for chip_path, _, _ in unique_chips:  # Just one sample per unique chip
+        for chip_path in unique_chips:  # Just one sample per unique chip
             image_fname = chip_path + "_merged.tif"
             image_set = tif.imread(image_fname)
             all_data.append(image_set)
