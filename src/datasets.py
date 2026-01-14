@@ -185,7 +185,6 @@ class CropDataset(Dataset):
         assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
 
         self.fileset = []
-        self.generator = torch.Generator().manual_seed(seed)
 
         self.img_transform = transforms.Compose([
             transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
@@ -250,39 +249,48 @@ class CropDataset(Dataset):
     def get_lf_input_size(self):
         return 3
     
-    def get_lf_input_size(self):
+    def get_hf_input_size(self):
         return 6
 
     def __len__(self):
         return len(self.fileset)
     
+    def _compute_dataset_stats(self, root, split):
+        """Compute global mean/std from unique chips in this split only"""
+        unique_chips = set(f[0] for f in self.fileset)  # Remove timestep/quadrant duplicates
+        
+        all_data = []
+        for chip_path, _, _ in unique_chips:  # Just one sample per unique chip
+            image_fname = chip_path + "_merged.tif"
+            image_set = tif.imread(image_fname)
+            all_data.append(image_set)
+        
+        all_data = np.stack(all_data, axis=0)  # [N_chips, H, W, 18]
+        self.mean = all_data.mean(axis=(0,1,2))    # [18]
+        self.std = all_data.std(axis=(0,1,2)) + 1e-8  # [18]
+        
+        print(f"Split {split}: mean={self.mean[:3].round(3)}, std={self.std[:3].round(3)}...")
+
     def __getitem__(self, idx:int):
-        base_fname, timestep, _ = self.fileset[idx]
+        base_fname, timestep, quadrant = self.fileset[idx]
         mask_fname = base_fname + ".mask.tif"
         image_fname = base_fname + "_merged.tif"
 
         mask = tif.imread(mask_fname)
         image_set = tif.imread(image_fname)
 
-        img_min = image_set.min()
-        img_max = image_set.max()
+        if self.mean is not None:
+            image_set = (image_set - self.mean[None, None, :]) / self.std[None, None, :]
 
-        image_set = (image_set - img_min) / (img_max - img_min + 1e-8)
-
-        x_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
-        x_end = x_start + 56
-
-        y_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
-        y_end = y_start + 56
-
-        hf_image = image_set[x_start:x_end, y_start:y_end, 6*timestep:6*(timestep+1)]
+        q_x, q_y = (quadrant // 2) * 112, (quadrant % 2) * 112
+        hf_image = image_set[q_x:q_x+112, q_y:q_y+112, 6*timestep:6*(timestep+1)]
         hf_image[:,:,:3] = hf_image[:, :, [2, 1, 0]]
         hf_image = self.img_transform(hf_image)
 
         lf_image = hf_image[:3]
         hf_image = hf_image[3:] # we concatenate later in the code so we split here
 
-        mask = mask[x_start:x_end, y_start:y_end]
+        mask = mask[q_x:q_x+112, q_y:q_y+112]
         mask = self.mask_transform(mask)
 
         return lf_image, hf_image, mask
