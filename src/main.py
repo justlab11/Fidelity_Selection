@@ -199,57 +199,106 @@ def main(config_file):
     lf_model_file = os.path.join(model_folder, "lf_model.pt")
     hf_model_file = os.path.join(model_folder, "hf_model.pt")
 
-    for epoch in range(config.classifier_training.epochs):
-        lf_train_loss, lf_train_acc = classifier_one_run(
-            model=lf_model,
-            dataloader=train_dl,
-            criterion=nn.CrossEntropyLoss(),
-            fidelity="lf",
-            train_body=train_body,
-            optimizer=lf_optimizer
-        )
+    # if the user provides models, use theirs
+    train_lf_model = True
+    trained_lf_path = config.classifier_training.trained_lf_model
 
-        hf_train_loss, hf_train_acc = classifier_one_run(
-            model=hf_model,
-            dataloader=train_dl,
-            criterion=nn.CrossEntropyLoss(),
-            fidelity="hf",
-            train_body=train_body,
-            optimizer=hf_optimizer
-        )
+    if trained_lf_path is not None:
+        trained_lf_path = os.abspath(trained_lf_path)
+        try:
+            lf_model.load_state_dict(
+                torch.load(
+                    trained_lf_path, 
+                    weights_only=True
+            ))
+            train_lf_model = False
+            torch.save(lf_model.state_dict(), lf_model_file)
+            logger.info("Pretrained LF model found; skipping LF train")
+        except:
+            logger.info("Pretrained LF model failed to load; training LF model")
+    else:
+        logger.info("Pretrained LF model not provided; training LF model")
 
-        lf_val_loss, lf_val_acc = classifier_one_run(
-            model=lf_model,
-            dataloader=val_dl,
-            criterion=nn.CrossEntropyLoss(),
-            fidelity="lf",
-            train_body=train_body,
-        )
+    train_hf_model = True
+    trained_hf_path = config.classifier_training.trained_hf_model
 
-        hf_val_loss, hf_val_acc = classifier_one_run(
-            model=hf_model,
-            dataloader=val_dl,
-            criterion=nn.CrossEntropyLoss(),
-            fidelity="hf",
-            train_body=train_body,
-        )
+    if trained_hf_path is not None:
+        trained_hf_path = os.abspath(trained_hf_path)
+        try:
+            hf_model.load_state_dict(
+                torch.load(
+                    trained_hf_path, 
+                    weights_only=True
+            ))
+            train_hf_model = False
+            logger.info("Pretrained HF model found; skipping HF train")
+        except:
+            logger.info("Pretrained HF model failed to load; training HF model")
+    else:
+        logger.info("Pretrained HF model not provided; training HF model")
 
-        if lf_val_acc > lf_best_acc:
-            lf_best_acc = lf_val_acc
-            lf_state_dict = torch.save(lf_model.state_dict(), lf_model_file)
+    num_classifier_epochs: int = config.classifier_training.epochs
+    # dont retrain if user provided models
+    if not train_lf_model and not train_hf_model:
+        num_classifier_epochs = 0
+        logger.info("Both models provided; skipping classifier training")
 
-        if hf_val_acc > hf_best_acc:
-            hf_best_acc = hf_val_acc
-            hf_state_dict = torch.save(hf_model.state_dict(), hf_model_file)
-
+    for epoch in range(num_classifier_epochs):
         logger.info(f"Epoch {epoch+1} Summary:")
-        logger.info(f"\tLF Train  Loss: {lf_train_loss:.4f} | Accuracy: {100 * lf_train_acc:.2f}%")
-        logger.info(f"\tHF Train  Loss: {hf_train_loss:.4f} | Accuracy: {100 * hf_train_acc:.2f}%")
-        logger.info(f"\tLF Val    Loss: {lf_val_loss:.4f}   | Accuracy: {100 * lf_val_acc:.2f}%")
-        logger.info(f"\tHF Val    Loss: {hf_val_loss:.4f}   | Accuracy: {100 * hf_val_acc:.2f}%")
+        if train_lf_model:
+            lf_train_loss, lf_train_acc = classifier_one_run(
+                model=lf_model,
+                dataloader=train_dl,
+                criterion=nn.CrossEntropyLoss(),
+                fidelity="lf",
+                train_body=train_body,
+                optimizer=lf_optimizer
+            )
 
-    lf_model.load_state_dict(torch.load(lf_state_dict, weights_only=True))
-    hf_model.load_state_dict(torch.load(hf_state_dict, weights_only=True))
+            lf_val_loss, lf_val_acc = classifier_one_run(
+                model=lf_model,
+                dataloader=val_dl,
+                criterion=nn.CrossEntropyLoss(),
+                fidelity="lf",
+                train_body=train_body,
+            )
+
+            if lf_val_acc > lf_best_acc:
+                lf_best_acc = lf_val_acc
+                lf_state_dict = lf_model.state_dict()
+                torch.save(lf_state_dict, lf_model_file)
+
+            logger.info(f"\tLF Train  Loss: {lf_train_loss:.4f} | Accuracy: {100 * lf_train_acc:.2f}%")
+            logger.info(f"\tLF Val    Loss: {lf_val_loss:.4f}   | Accuracy: {100 * lf_val_acc:.2f}%")
+
+        if train_hf_model:
+            hf_train_loss, hf_train_acc = classifier_one_run(
+                model=hf_model,
+                dataloader=train_dl,
+                criterion=nn.CrossEntropyLoss(),
+                fidelity="hf",
+                train_body=train_body,
+                optimizer=hf_optimizer
+            )
+
+            hf_val_loss, hf_val_acc = classifier_one_run(
+                model=hf_model,
+                dataloader=val_dl,
+                criterion=nn.CrossEntropyLoss(),
+                fidelity="hf",
+                train_body=train_body,
+            )
+
+            if hf_val_acc > hf_best_acc:
+                hf_best_acc = hf_val_acc
+                hf_state_dict = hf_model.state_dict()
+                torch.save(hf_state_dict, hf_model_file)
+
+            logger.info(f"\tHF Train  Loss: {hf_train_loss:.4f} | Accuracy: {100 * hf_train_acc:.2f}%")
+            logger.info(f"\tHF Val    Loss: {hf_val_loss:.4f}   | Accuracy: {100 * hf_val_acc:.2f}%")
+
+    lf_model.load_state_dict(torch.load(lf_model_file, weights_only=True))
+    hf_model.load_state_dict(torch.load(hf_model_file, weights_only=True))
 
     lf_test_loss, lf_test_acc = classifier_one_run(
         model=lf_model,

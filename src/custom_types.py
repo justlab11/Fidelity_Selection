@@ -17,6 +17,8 @@ class ClassifierSettings(BaseModel):
     loss_fun: Literal["CE"]
     lf_model: Literal["mlp", "resnet", "vit", "unet"]
     hf_model: Literal["mlp", "resnet", "vit", "unet"]
+    trained_lf_model: str | None
+    trained_hf_model: str | None
 
 class ThresholdSettings(BaseModel):
     start: float
