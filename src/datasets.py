@@ -174,7 +174,8 @@ class MNISTDataset(Dataset):
 
         return lf_img, hf_img, target
     
-class CropDataset(Dataset):
+
+class CropDatasetOld(Dataset):
     def __init__(
         self,
         root: str,
@@ -193,8 +194,140 @@ class CropDataset(Dataset):
         ])
         
         self.mask_transform = transforms.Compose([
-            transforms.Lambda(lambda x: torch.from_numpy(x).long()),  # uint8→long DIRECTLY
+            transforms.Lambda(lambda x: torch.from_numpy(x).long().unsqueeze(0)),  # uint8→long DIRECTLY
             transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.Lambda(lambda x: x.squeeze(0))
+        ])
+
+        if split == "val":
+            val_folder = path.join(root, "multi-temporal-crop-classification", "validation_data.txt")
+            with open(val_folder, "r") as f:
+                val_chips = f.readlines()
+
+            val_filenames = [
+                path.join(
+                    root, 
+                    "multi-temporal-crop-classification", 
+                    "validation_chips", "validation_chips", line.strip()
+                ) for line in val_chips
+            ]
+
+            for i in range(len(val_filenames)):
+                for t in range(3): # timestep 
+                    for q in range(4): # quandrant of the image
+                        self.fileset.append((val_filenames[i], t, q))
+            
+            self._compute_dataset_stats()
+
+        else:
+            train_folder = path.join(root, "multi-temporal-crop-classification", "training_data.txt")
+            with open(train_folder, "r") as f:
+                train_chips = f.readlines()
+
+            train_test_filenames = [
+                path.join(
+                    root, 
+                    "multi-temporal-crop-classification", 
+                    "training_chips", "training_chips", line.strip()
+                ) for line in train_chips
+            ]
+
+            n = len(train_test_filenames)
+            test_size = int(n * test_ratio)
+            train_size = n - test_size
+
+            train_set, test_set = random_split(train_test_filenames, [train_size, test_size], generator=self.generator)
+            if split == "train":
+                indices = train_set.indices
+            else:
+                indices = test_set.indices
+
+            for i in indices:
+                for t in range(3): # timestep 
+                    for q in range(4): # quandrant of the image
+                        self.fileset.append((train_test_filenames[i], t, q))
+            
+            self._compute_dataset_stats()
+
+    def get_num_classes(self):
+        return 14
+
+    def get_lf_input_size(self):
+        return 3
+    
+    def get_hf_input_size(self):
+        return 6
+
+    def __len__(self):
+        return len(self.fileset)
+    
+    def _compute_dataset_stats(self):
+        """Compute global mean/std from unique chips in this split only"""
+        unique_chips = set(f[0] for f in self.fileset)  # Remove timestep/quadrant duplicates
+        
+        all_data = []
+        for chip_path in unique_chips:  # Just one sample per unique chip
+            image_fname = chip_path + "_merged.tif"
+            image_set = tif.imread(image_fname)
+            all_data.append(image_set)
+        
+        all_data = np.stack(all_data, axis=0)  # [N_chips, H, W, 18]
+        self.mean = all_data.mean(axis=(0,1,2))    # [18]
+        self.std = all_data.std(axis=(0,1,2)) + 1e-8  # [18]
+        
+    def __getitem__(self, idx:int):
+        base_fname, timestep, _ = self.fileset[idx]
+        mask_fname = base_fname + ".mask.tif"
+        image_fname = base_fname + "_merged.tif"
+
+        mask = tif.imread(mask_fname)
+        image_set = tif.imread(image_fname)
+
+        if self.mean is not None:
+            image_set = (image_set - self.mean[None, None, :]) / self.std[None, None, :]
+
+        x_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
+        x_end = x_start + 56
+
+        y_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
+        y_end = y_start + 56
+
+        hf_image = image_set[x_start:x_end, y_start:y_end, 6*timestep:6*(timestep+1)]
+        hf_image[:,:,:3] = hf_image[:, :, [2, 1, 0]]
+        hf_image = self.img_transform(hf_image)
+
+        lf_image = hf_image[:3]
+        hf_image = hf_image[3:] # we concatenate later in the code so we split here
+
+        mask = mask[x_start:x_end, y_start:y_end]
+        mask = self.mask_transform(mask)
+
+        return lf_image, hf_image, mask
+
+
+
+class CropDatasetOld(Dataset):
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        seed: int = 42,
+        test_ratio: float = 0.2
+    ):
+        assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
+
+        self.fileset = []
+        self.generator = torch.Generator().manual_seed(seed)
+
+        self.img_transform = transforms.Compose([
+            transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
+            transforms.Resize((224, 224)),  # Resize to model input size
+        ])
+        
+        self.mask_transform = transforms.Compose([
+            transforms.Lambda(lambda x: torch.from_numpy(x).long().unsqueeze(0)),  # uint8→long DIRECTLY
+            transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.NEAREST),
+            transforms.Lambda(lambda x: x.squeeze(0))
         ])
 
         if split == "val":
