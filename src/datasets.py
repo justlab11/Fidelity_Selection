@@ -304,8 +304,6 @@ class CropDatasetOld(Dataset):
 
         return lf_image, hf_image, mask
 
-
-
 class CropDatasetOld(Dataset):
     def __init__(
         self,

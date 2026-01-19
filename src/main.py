@@ -77,10 +77,10 @@ def main(config_file):
     logger.info(f"Latent Size: {latent_size}")
     logger.info(f"Run Comparisons: {run_comparisons}")
 
-    logger.info(f"\nSETTING SEED")
+    logger.info(f"SETTING SEED")
     set_all_seeds(seed=seed)
 
-    logger.info(f"\nBUILDING DATASET & DATALOADERS")
+    logger.info(f"BUILDING DATASET & DATALOADERS")
     train_ds, test_ds, val_ds = build_dataset(
         dataset_name=dataset_name,
         seed=seed,
@@ -102,8 +102,15 @@ def main(config_file):
         val_ds,
         batch_size=config.classifier_training.batch_size,
     )
+    train_size = len(train_ds)
+    test_size = len(test_ds)
+    val_size = len(val_ds)
 
-    logger.info(f"\nBUILDING MODELS")
+    logger.info(f"Train Dataset Size: {train_size:,}")
+    logger.info(f"Test Dataset Size: {test_size:,}")
+    logger.info(f"Validation Dataset Size: {val_size:,}")
+
+    logger.info(f"BUILDING MODELS")
     lf_input_size: int = train_ds.get_lf_input_size()
     hf_input_size: int = train_ds.get_hf_input_size()
     output_size: int = train_ds.get_num_classes()
@@ -183,7 +190,7 @@ def main(config_file):
             batch_size=config.classifier_training.batch_size,
         )
 
-    logger.info(f"\nTRAINING HF AND LF MODELS")
+    logger.info(f"TRAINING HF AND LF MODELS")
     lf_model: nn.Module = lf_model.to(DEVICE)
     hf_model: nn.Module = hf_model.to(DEVICE)
 
@@ -320,7 +327,7 @@ def main(config_file):
     logger.info(f"\tLF Test   Loss: {lf_test_loss:.4f}  | Accuracy: {100 * lf_test_acc:.2f}%")
     logger.info(f"\tHF Test   Loss: {hf_test_loss:.4f}  | Accuracy: {100 * hf_test_acc:.2f}%")
 
-    logger.info("\nSAVING LATENT REPRESENTATIONS")
+    logger.info("SAVING LATENT REPRESENTATIONS")
     train_latent_folder: str = os.path.join(latent_folder, "train")
     save_latent(
         lf_model=lf_model,
@@ -393,7 +400,7 @@ def main(config_file):
             latent_size=None
         )
 
-    logger.info("\nRUNNING DEFAULT FE")
+    logger.info("RUNNING DEFAULT FE")
     adaptive_search: AdaptiveGridSearch = AdaptiveGridSearch(
         fe_model=fe_model,
         device=DEVICE,
@@ -428,10 +435,10 @@ def main(config_file):
 
     # ends the script if you don't want comparisons
     if not run_comparisons:
-        logger.info("\nEXPERIMENT FINISHED")
+        logger.info("EXPERIMENT FINISHED")
         return
     
-    logger.info("\nRUNNING DEFAULT SOFTMAX RESPONSE")
+    logger.info("RUNNING DEFAULT SOFTMAX RESPONSE")
 
     softmax_response: SoftmaxResponseMethod = SoftmaxResponseMethod(
         val_dl=val_dl,
@@ -454,7 +461,7 @@ def main(config_file):
         thresholds=thresholds
     )
 
-    logger.info("\nRUNNING DEFAULT SELECTIVENET")
+    logger.info("RUNNING DEFAULT SELECTIVENET")
     selnet_model: nn.Module = build_model(
         model_name=lf_model_name,
         input_size=lf_input_size,

@@ -896,40 +896,6 @@ class AdaptiveGridSearch:
 #         weights = np.where(best_choices==1, hf_weight, 1)
 #         fe_model.fit(lf_embeddings, labels, sample_weights=weights)
 
-def selnet_one_run(model, dataloader, train_body=True, optimizer=None):
-    model.train(mode=bool(optimizer))
-    device = next(model.parameters()).device
-    total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
-    total_high = 0
-
-
-    for data, _, target in dataloader:
-        target = target.type(torch.LongTensor)
-        data, target = data.to(device, torch.float), target.to(device)
-        
-        if train_body:
-            output = model(data)["output"]
-
-        else:
-            output = model.head(data)["output"]
-
-        loss = criterion(output, target)
-        if optimizer:
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        total_loss += loss.item() * data.size(0)
-        predicted = torch.argmax(output, dim=1)
-        total_correct += (predicted == target).sum().item()
-        total_samples += data.size(0)
-
-    if scheduler:
-        scheduler.step()
-
-
 class EarlyStopper:
     def __init__(self, patience=1, min_delta=0):
         self.patience = patience

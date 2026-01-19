@@ -69,108 +69,122 @@ class SoftmaxResponseMethod:
         return accuracy, usage
 
 class SelectiveNetMethod:
-    def __init__(self, model_folder, alpha=.7):
+    def __init__(self, model_folder, alpha=0.5, c=0.8):
         self.model_folder = model_folder
         self.alpha = alpha
+        self.c = c
 
     def selective_loss_class(self, y_true, selection_logits, lf_logits, lamda=32, c=0.8):
         selection_prob = torch.sigmoid(selection_logits)
-
-        ce = F.cross_entropy(lf_logits, y_true.argmax(dim=1), reduction='none')
+        ce = F.cross_entropy(lf_logits, y_true, reduction='none')
         weighted_ce = selection_prob.view(-1) * ce
+
         ce_loss = weighted_ce.mean()
-
         coverage = selection_prob.mean()
+        
         penalty = lamda * torch.clamp(-coverage + c, min=0) ** 2
-
         return ce_loss + penalty
 
     def selective_loss_seg(self, y_true, selection_logits, lf_logits, lamda=32, c=0.8):
-        # selection per pixel: (B, 1, H, W) -> (B, H, W)
-        selection_prob = torch.sigmoid(selection_logits).squeeze(1)
-
-        # per-pixel CE: (B, H, W)
-        ce = F.cross_entropy(lf_logits, y_true, reduction='none')
-
-        # gate by selection prob, then normalize by number of selected pixels
-        # (to avoid the model minimizing loss by selecting almost nothing)
+        selection_prob = torch.sigmoid(selection_logits).squeeze(1)  # (B, H, W)
+        ce = F.cross_entropy(lf_logits, y_true, reduction='none')  # (B, H, W)
         weighted_ce = selection_prob * ce
-        # add a small eps to avoid division-by-zero early in training
+        
         eps = 1e-6
-        ce_loss = weighted_ce.sum() / (selection_prob.sum() + eps)
-
-        # coverage is now fraction of selected pixels
+        ce_loss = weighted_ce.sum() / (selection_prob.sum().detach() + eps)
         coverage = selection_prob.mean()
-
-        # same coverage penalty as in classification
         penalty = lamda * torch.clamp(-coverage + c, min=0) ** 2
-
         return ce_loss + penalty
     
     def selective_loss(self, y_true, selection_logits, lf_logits, lamda=32, c=0.8):
         if lf_logits.dim() == 2:  # [B, C]
-            return self.selective_loss_class(y_true, selection_logits, lf_logits,
-                                            lamda=lamda, c=c)
+            return self.selective_loss_class(y_true, selection_logits, lf_logits, lamda=lamda, c=c)
         elif lf_logits.dim() == 4:  # [B, C, H, W]
-            return self.selective_loss_seg(y_true, selection_logits, lf_logits,
-                                        lamda=lamda, c=c)
+            return self.selective_loss_seg(y_true, selection_logits, lf_logits, lamda=lamda, c=c)
         else:
             raise ValueError(f"Unsupported lf_logits shape: {lf_logits.shape}")
 
     def aux_ce_loss(self, y_true, aux_logits):
         if aux_logits.dim() == 2:
-            # classification: aux_logits [B, C], y_true [B] (class indices)
             return F.cross_entropy(aux_logits, y_true, reduction='mean')
         elif aux_logits.dim() == 4:
-            # segmentation: aux_logits [B, C, H, W], y_true [B, H, W]
             return F.cross_entropy(aux_logits, y_true, reduction='mean')
         else:
             raise ValueError(f"Unsupported aux_logits shape: {aux_logits.shape}")
 
-    def one_run(self, model, dataloader, train_body=True, optimizer=None):
-        model.train(mode=bool(optimizer))
+    def one_run(self, model, dataloader, hf_model=None, threshold=0.5, train_body=True, optimizer=None):
+        is_training = bool(optimizer)
+        model.train(mode=is_training)
         device = next(model.parameters()).device
+        
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-        total_high = 0
-
-        for data, _, target in dataloader:
-            target = target.type(torch.LongTensor)
-            data, target = data.to(device, torch.float), target.to(device)
-            
-            if train_body:
-                layers = model.selective_forward(data)
-                output = layers["output"]
-                aux = layers["aux"]
-                select = layers["select"]
-
-            else:
-                layers = model.selective_head(data)
-                output = layers["output"]
-                aux = layers["aux"]
-                select = layers["select"]
-
-            sel_loss = self.selective_loss(
-                y_true = target,
-                selection_logits = select,
-                lf_logits = output
-            )
-            aux_loss = self.aux_ce_loss(
-                y_true = target,
-                aux_logits = aux
-            )
-
-            loss = self.alpha * sel_loss + (1-self.alpha) * aux_loss
-
-            if optimizer:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-            total_loss += loss.item() * data.size(0)
-            predicted = torch.argmax(output, dim=1)
-            total_correct += (predicted == target).sum().item()
-            total_samples += data.size(0)
-
-
+        total_high_conf = 0
+        total_coverage = 0.0
+        
+        context_manager = torch.no_grad() if not is_training else torch.enable_grad()
+        
+        with context_manager:
+            for lf_data, hf_data, target in dataloader:
+                hf_data = torch.cat([lf_data, hf_data], dim=1)
+                hf_data = hf_data.to(device, torch.float)
+                lf_data = lf_data.to(device, torch.float)
+                target = target.type(torch.LongTensor).to(device)
+                
+                # SelectiveNet ALWAYS uses LF data
+                if train_body:
+                    sel_layers = model.selective_forward(lf_data)
+                else:
+                    sel_layers = model.selective_head(lf_data)
+                
+                sel_output = sel_layers["output"]
+                sel_aux = sel_layers["aux"]
+                sel_select = sel_layers["select"]
+                
+                if optimizer:
+                    # Training: selective loss only
+                    sel_loss = self.selective_loss(target, sel_select, sel_output, c=self.c)
+                    aux_loss = self.aux_ce_loss(target, sel_aux)
+                    loss = self.alpha * sel_loss + (1-self.alpha) * aux_loss
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += loss.item() * lf_data.size(0)
+                
+                # Selection logic
+                if sel_select.dim() == 2:  # Classification
+                    select_prob = torch.sigmoid(sel_select).squeeze(1)
+                else:  # Segmentation
+                    select_prob = torch.sigmoid(sel_select).squeeze(1).mean(dim=(1,2))
+                
+                cascade_mask = (select_prob >= threshold).float()
+                coverage = select_prob.mean().item()
+                total_coverage += coverage
+                
+                # SelectiveNet predictions where confident
+                sel_pred = torch.argmax(sel_output, dim=1)
+                sel_correct = (sel_pred[cascade_mask.bool()] == target[cascade_mask.bool()]).sum().item()
+                
+                # HF model on abstained (cat LF+HF)
+                hf_correct = 0
+                if hf_model is not None and (1-cascade_mask).sum() > 0:
+                    abstained_mask = (1-cascade_mask).bool()
+                    abstained_data = torch.cat([lf_data[abstained_mask], hf_data[abstained_mask]], dim=1)
+                    hf_layers = hf_model(abstained_data)
+                    hf_pred = torch.argmax(hf_layers["output"], dim=1)
+                    hf_correct = (hf_pred == target[abstained_mask]).sum().item()
+                
+                total_correct += sel_correct + hf_correct
+                total_samples += lf_data.size(0)
+                total_high_conf += cascade_mask.sum().item()
+        
+        avg_loss = total_loss / max(total_samples, 1)
+        avg_coverage = total_coverage / len(dataloader)
+        accuracy = total_correct / total_samples
+        high_conf_rate = total_high_conf / total_samples
+        
+        return {
+            'loss': avg_loss, 'accuracy': accuracy, 'coverage': avg_coverage,
+            'high_conf_rate': high_conf_rate, 'total_samples': total_samples
+        }
