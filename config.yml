@@ -13,6 +13,8 @@ classifier_training:
   loss_fun: CE
   lf_model: unet
   hf_model: unet
+  trained_lf_model: None
+  trained_hf_model: None
   
 fe_training:
   epochs: 40
