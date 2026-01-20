@@ -175,7 +175,7 @@ class MNISTDataset(Dataset):
         return lf_img, hf_img, target
     
 
-class CropDatasetOld(Dataset):
+class CropDataset(Dataset):
     def __init__(
         self,
         root: str,
