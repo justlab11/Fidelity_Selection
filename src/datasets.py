@@ -7,6 +7,7 @@ from PIL import Image
 import os.path as path
 import tifffile as tif
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -181,12 +182,13 @@ class CropDataset(Dataset):
         root: str,
         split: str,
         seed: int = 42,
-        test_ratio: float = 0.2
+        test_ratio: float = 0.2,
     ):
         assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
 
         self.fileset = []
         self.generator = torch.Generator().manual_seed(seed)
+        self.split = split
 
         self.img_transform = transforms.Compose([
             transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
@@ -198,6 +200,9 @@ class CropDataset(Dataset):
             transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.NEAREST),
             transforms.Lambda(lambda x: x.squeeze(0))
         ])
+
+        self.mean = 0
+        self.std = 0
 
         if split == "val":
             val_folder = path.join(root, "multi-temporal-crop-classification", "validation_data.txt")
@@ -216,9 +221,7 @@ class CropDataset(Dataset):
                 for t in range(3): # timestep 
                     for q in range(4): # quandrant of the image
                         self.fileset.append((val_filenames[i], t, q))
-            
-            self._compute_dataset_stats()
-
+        
         else:
             train_folder = path.join(root, "multi-temporal-crop-classification", "training_data.txt")
             with open(train_folder, "r") as f:
@@ -247,7 +250,8 @@ class CropDataset(Dataset):
                     for q in range(4): # quandrant of the image
                         self.fileset.append((train_test_filenames[i], t, q))
             
-            self._compute_dataset_stats()
+            if split == "train":
+                self._compute_dataset_stats()
 
     def get_num_classes(self):
         return 14
@@ -285,14 +289,20 @@ class CropDataset(Dataset):
 
         if self.mean is not None:
             image_set = (image_set - self.mean[None, None, :]) / self.std[None, None, :]
+        else:
+            warnings.warn("Please set self.mean and self.std to the values from the train set")
 
-        x_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
-        x_end = x_start + 56
+        if self.split == "test":
+            hf_image = image_set[:56, :56, 6*timestep:6*(timestep+1)]
+        else:
+            x_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
+            x_end = x_start + 56
 
-        y_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
-        y_end = y_start + 56
+            y_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
+            y_end = y_start + 56
 
-        hf_image = image_set[x_start:x_end, y_start:y_end, 6*timestep:6*(timestep+1)]
+            hf_image = image_set[x_start:x_end, y_start:y_end, 6*timestep:6*(timestep+1)]
+
         hf_image[:,:,:3] = hf_image[:, :, [2, 1, 0]]
         hf_image = self.img_transform(hf_image)
 

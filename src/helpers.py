@@ -288,18 +288,24 @@ def build_dataset(dataset_name: str, seed: int, folder="../data"):
                 split="train",
                 seed=seed,
             )
+            mean = train_ds.mean
+            std = train_ds.std
 
             test_ds = CropDataset(
                 root=folder,
                 split="test",
                 seed=seed,
             )
+            test_ds.mean = mean
+            test_ds.std = std
 
             val_ds = CropDataset(
                 root=folder,
                 split="val",
                 seed=seed,
             )
+            val_ds.mean = mean
+            val_ds.std = std
 
         case _:
             logger.error("Dataset Name is invalid")

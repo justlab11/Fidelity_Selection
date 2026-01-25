@@ -69,10 +69,11 @@ class SoftmaxResponseMethod:
         return accuracy, usage
 
 class SelectiveNetMethod:
-    def __init__(self, model_folder, alpha=0.5, c=0.8):
+    def __init__(self, model_folder, alpha=0.5, c=0.8, lmda=32):
         self.model_folder = model_folder
         self.alpha = alpha
         self.c = c
+        self.lmda = lmda
 
     def selective_loss_class(self, y_true, selection_logits, lf_logits, lamda=32, c=0.8):
         selection_prob = torch.sigmoid(selection_logits)
@@ -153,7 +154,7 @@ class SelectiveNetMethod:
                     is_segmentation = (selnet_output.dim() == 4)
                 
                 if optimizer:
-                    selnet_loss = self.selective_loss(target, selnet_select, selnet_output, c=self.c)
+                    selnet_loss = self.selective_loss(target, selnet_select, selnet_output, c=self.c, lamda=self.lmda)
                     aux_loss = self.aux_ce_loss(target, selnet_aux)
                     loss = self.alpha * selnet_loss + (1-self.alpha) * aux_loss
                     optimizer.zero_grad()
