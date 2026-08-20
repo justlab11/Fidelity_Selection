@@ -82,7 +82,7 @@ class CustomResNet18(nn.Module):
             nn.Dropout(p=0.6),
             nn.Linear(latent_size, output_size),
         )
-        self.selective_head = nn.Sequential(
+        self.selective_head_layer = nn.Sequential(
             nn.ReLU(),
             nn.Dropout(p=0.6),
             nn.Linear(latent_size, 1),
@@ -97,7 +97,7 @@ class CustomResNet18(nn.Module):
 
         x = self.latent_rep(x)
         layers["latent"] = x
-        
+
         x = self.output_layer(x)
         layers["output"] = x
 
@@ -111,13 +111,13 @@ class CustomResNet18(nn.Module):
 
         x = self.latent_rep(x)
         layers["latent"] = x
-        
+
         x = self.output_layer(x)
         layers["output"] = x
 
         return layers
-    
-    def selective_forward(self, x):    
+
+    def selective_forward(self, x):
         layers = {}
 
         body = self.model(x)
@@ -125,31 +125,31 @@ class CustomResNet18(nn.Module):
 
         latent = self.latent_rep(body)
         layers["latent"] = latent
-        
+
         output = self.output_layer(latent)
         layers["output"] = output
 
         aux = self.aux_head(latent)
         layers["aux"] = aux
 
-        select = self.selective_head(latent)
+        select = self.selective_head_layer(latent)
         layers["select"] = select
 
-        return layers 
-    
+        return layers
+
     def selective_head(self, x):
         layers = {}
 
         latent = self.latent_rep(x)
         layers["latent"] = latent
-        
+
         output = self.output_layer(latent)
         layers["output"] = output
 
         aux = self.aux_head(latent)
         layers["aux"] = aux
 
-        select = self.selective_head(latent)
+        select = self.selective_head_layer(latent)
         layers["select"] = select
 
         return layers 
@@ -181,7 +181,7 @@ class CustomViT(nn.Module):
             nn.Dropout(p=0.6),
             nn.Linear(latent_size, output_size),
         )
-        self.selective_head = nn.Sequential(
+        self.selective_head_layer = nn.Sequential(
             nn.ReLU(),
             nn.Dropout(p=0.6),
             nn.Linear(latent_size, 1),
@@ -196,7 +196,7 @@ class CustomViT(nn.Module):
 
         x = self.latent_rep(x)
         layers["latent"] = x
-        
+
         x = self.output_layer(x)
         layers["output"] = x
 
@@ -215,8 +215,8 @@ class CustomViT(nn.Module):
         layers["output"] = x
 
         return layers
-    
-    def selective_forward(self, x):    
+
+    def selective_forward(self, x):
         layers = {}
 
         body = self.model(x)
@@ -224,31 +224,31 @@ class CustomViT(nn.Module):
 
         latent = self.latent_rep(body)
         layers["latent"] = latent
-        
+
         output = self.output_layer(latent)
         layers["output"] = output
 
         aux = self.aux_head(latent)
         layers["aux"] = aux
 
-        select = self.selective_head(latent)
+        select = self.selective_head_layer(latent)
         layers["select"] = select
 
-        return layers 
-    
-    def selective_head(self, x):    
+        return layers
+
+    def selective_head(self, x):
         layers = {}
 
         latent = self.latent_rep(x)
         layers["latent"] = latent
-        
+
         output = self.output_layer(latent)
         layers["output"] = output
 
         aux = self.aux_head(latent)
         layers["aux"] = aux
 
-        select = self.selective_head(latent)
+        select = self.selective_head_layer(latent)
         layers["select"] = select
 
         return layers
@@ -539,7 +539,7 @@ class LatentCNNHead(nn.Module):
     def forward(self, x):
         x = self.conv(x)
         x = x.view(x.size(0), -1)
-        return self.fc(x)
+        return {"output": self.fc(x)}
     
 class SelectiveNet(nn.Module):
     def __init__(self, latent_dim, num_classes):

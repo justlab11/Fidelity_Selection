@@ -6,6 +6,9 @@ import torchvision.transforms as transforms
 import yaml
 import os
 import logging
+import time
+import math
+import csv
 from torch.utils.data import DataLoader
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
@@ -464,7 +467,7 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
             target = target.type(torch.LongTensor)
             target = target.to(device)
 
-            outputs = model(lf_embeddings)[-1]
+            outputs = model(lf_embeddings)["output"]
             preds = torch.stack([
                 lf_preds,
                 hf_preds
@@ -514,11 +517,11 @@ def save_body(
         for batch_idx, (lf_sample, hf_sample, label) in enumerate(dataloader):
             lf_sample = lf_sample.to(device)
             hf_sample = hf_sample.to(device)
-            labels = labels.to(device)
+            label = label.to(device)
 
             lf_out_batch = lf_model(lf_sample)["body_output"].cpu()
             hf_out_batch = hf_model(hf_sample)["body_output"].cpu()
-            labels_batch = labels.cpu()
+            labels_batch = label.cpu()
 
             batch_size = lf_out_batch.size(0)
             for i in range(batch_size):
@@ -760,6 +763,8 @@ class GaussianProcessSearch:
 class AdaptiveGridSearch:
     def __init__(self, fe_model, device, train_dl, val_dl, test_dl, model_folder):
         self.evaluated_points = []
+        self.epoch_log = []
+        self.search_diagnostics = []
         self.fe_model = fe_model
         self.device = device
         self.train_dl = train_dl
@@ -772,13 +777,15 @@ class AdaptiveGridSearch:
         self.evaluated_points.sort(key=lambda x: x[0])
 
         for i in range(len(self.evaluated_points) - 1):
-            r_a, use_a = self.evaluated_points[i]
-            r_b, use_b = self.evaluated_points[i+1]
+            r_a, use_a, *_ = self.evaluated_points[i]
+            r_b, use_b, *_ = self.evaluated_points[i+1]
             if use_a <= usage < use_b:
-                return r_a, r_b
-            
-        # If no exact bracket, use full range as fallback
-        return 0.001, 1
+                return r_a, r_b, False
+
+        # If no exact bracket, use full range as fallback — this is the concrete
+        # signal that a target usage may end up unreachable within tolerance.
+        logger.warning(f"No bracket found for usage={usage}; falling back to full range [0.001, 1]")
+        return 0.001, 1, True
 
     def train_fe_model(self, r_val):
         criterion = MetaLossFunction(
@@ -792,10 +799,14 @@ class AdaptiveGridSearch:
         fe_optimizer = torch.optim.Adam(self.fe_model.parameters(), lr=3e-4, weight_decay=1e-5)
 
         best_val_loss = float('inf')
+        best_val_acc = None
+        best_val_use = None
         fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
 
         for epoch in range(30):
-            _, _, _ = classifier_one_run(
+            epoch_start = time.perf_counter()
+
+            train_loss, _, _ = classifier_one_run(
                 model=self.fe_model,
                 dataloader=self.train_dl,
                 criterion=criterion,
@@ -803,18 +814,69 @@ class AdaptiveGridSearch:
                 optimizer=fe_optimizer
             )
 
-            val_loss, _, val_use = classifier_one_run(
+            val_loss, val_acc, val_use = classifier_one_run(
                 model=self.fe_model,
                 dataloader=self.val_dl,
                 criterion=criterion,
                 fidelity="gate",
             )
 
+            epoch_time_sec = time.perf_counter() - epoch_start
+
+            if not math.isfinite(val_loss):
+                logger.warning(f"Non-finite val_loss ({val_loss}) training gate model at r_val={r_val}, epoch={epoch}")
+
+            self.epoch_log.append({
+                "r_val": r_val, "epoch": epoch, "train_loss": train_loss,
+                "val_loss": val_loss, "val_acc": val_acc, "val_usage": val_use,
+                "epoch_time_sec": epoch_time_sec
+            })
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_val_acc = val_acc
+                best_val_use = val_use
                 torch.save(self.fe_model.state_dict(), fe_model_file)
 
-        return val_use
+        return best_val_use, best_val_acc
+
+    def save_epoch_log(self, file_path):
+        if not self.epoch_log:
+            logger.warning("AdaptiveGridSearch.epoch_log is empty; nothing to save")
+            return
+
+        fieldnames = list(self.epoch_log[0].keys())
+        with open(file_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.epoch_log)
+        logger.info(f"Saved {len(self.epoch_log)} gate-model epoch rows to {file_path}")
+
+    def save_search_diagnostics(self, file_path):
+        if not self.search_diagnostics:
+            logger.warning("AdaptiveGridSearch.search_diagnostics is empty; nothing to save")
+            return
+
+        fieldnames = list(self.search_diagnostics[0].keys())
+        with open(file_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.search_diagnostics)
+        logger.info(f"Saved {len(self.search_diagnostics)} search diagnostic rows to {file_path}")
+
+    def save_evaluated_points(self, file_path):
+        if not self.evaluated_points:
+            logger.warning("AdaptiveGridSearch.evaluated_points is empty; nothing to save")
+            return
+
+        points = np.array(self.evaluated_points, dtype=float)
+        np.savez(
+            file_path,
+            r_values=points[:, 0],
+            usage_values=points[:, 1],
+            acc_values=points[:, 2]
+        )
+        logger.info(f"Saved {len(self.evaluated_points)} (r, usage, acc) points to {file_path}")
 
     def evaluate_fe_model(self, r_val):
         criterion = MetaLossFunction(
@@ -837,13 +899,13 @@ class AdaptiveGridSearch:
         return test_acc, test_use
 
     def find_r_for_target(self, usage, tolerance=1e-3):
-        r_low, r_high = self.find_bracket(usage)
+        r_low, r_high, bracket_fallback_used = self.find_bracket(usage)
         reruns = 0
         while r_high - r_low > tolerance:
             reruns += 1
             r_mid = (r_low + r_high) / 2
-            use_mid = self.train_fe_model(r_mid)
-            self.evaluated_points.append((r_mid, use_mid))
+            use_mid, acc_mid = self.train_fe_model(r_mid)
+            self.evaluated_points.append((r_mid, use_mid, acc_mid))
             if use_mid > usage:
                 r_low = r_mid
             else:
@@ -853,12 +915,18 @@ class AdaptiveGridSearch:
         test_acc *= 100
         test_use *= 100
 
+        self.search_diagnostics.append({
+            "target_usage": usage, "reruns": reruns,
+            "bracket_fallback_used": bracket_fallback_used,
+            "final_r": r_high, "final_test_usage": test_use, "final_test_acc": test_acc
+        })
+
         logger.info(f"\nTook {reruns} passes to find best r value")
         logger.info(f"For usage {usage}:")
         logger.info(f"\tBest r: {r_high}")
         logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]:.4f}")
         logger.info(f"\tTest usage: {test_use:.2f} / Test acc: {test_acc:.2f}")
-        
+
         return r_high, test_acc, test_use
     
 # def fe_svm_one_run(fe_m odel, hf_model, lf_model, dataloader, hf_weight, mode="train"):

@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import logging
+from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,7 @@ class SelectiveNetMethod:
                     abstained_mask = ~cascade_mask
                     if hf_model is not None and abstained_mask.sum() > 0:
                         abstained_data = torch.cat([lf_data[abstained_mask], hf_data[abstained_mask]], dim=1)
-                        hf_layers = hf_model(abstained_data)
+                        hf_layers = hf_model(abstained_data) if train_body else hf_model.head(abstained_data)
                         hf_pred = torch.argmax(hf_layers["output"], dim=1)
                         hf_correct = (hf_pred == target[abstained_mask]).sum().item()
                     
@@ -213,7 +214,7 @@ class SelectiveNetMethod:
                     if hf_model is not None and abstained_mask.sum() > 0:
                         # Run HF model on entire abstained images
                         combined_data = torch.cat([lf_data[abstained_mask], hf_data[abstained_mask]], dim=1)
-                        hf_layers = hf_model(combined_data)
+                        hf_layers = hf_model(combined_data) if train_body else hf_model.head(combined_data)
                         hf_output = hf_layers["output"]  # [num_abstained, C, H, W]
                         hf_pred = torch.argmax(hf_output, dim=1)  # [num_abstained, H, W]
                         
@@ -242,3 +243,156 @@ class SelectiveNetMethod:
             'selection_rate': selection_rate,  # % of images using SelectiveNet
             'usage': usage
         }
+
+class IndexedDataset(Dataset):
+    """Wraps a dataset to also yield each sample's absolute index, so a per-sample
+    EMA target buffer can be kept correct under a shuffled DataLoader."""
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        return (idx, *self.base_dataset[idx])
+
+class SelfAdaptiveTrainingMethod:
+    """Self-Adaptive Training, selective-classification application (Eq. 12): the
+    model gets one extra 'abstain' output class, a per-sample EMA-tracked soft
+    target is held across epochs, and inference escalates to the HF model whenever
+    the abstain probability exceeds tau (mirroring how SelectiveNet/SR are already
+    adapted to this repo's LF/HF cascade convention).
+    """
+    def __init__(self, num_train_samples, num_classes, alpha=0.99, warmup_epochs=0,
+                 is_segmentation=False, device="cpu"):
+        self.num_classes = num_classes
+        self.alpha = alpha
+        self.warmup_epochs = warmup_epochs
+        self.is_segmentation = is_segmentation
+        self.device = device
+        self.targets = torch.zeros(num_train_samples, num_classes + 1, device=device)
+
+    def initialize_targets(self, indexed_dataloader):
+        with torch.no_grad():
+            for idx, _, _, target in indexed_dataloader:
+                idx = idx.to(self.device)
+                if self.is_segmentation:
+                    target = torch.mode(target.reshape(target.size(0), -1), dim=1).values
+                target = target.long().to(self.device)
+
+                one_hot = torch.zeros(target.size(0), self.num_classes + 1, device=self.device)
+                one_hot.scatter_(1, target.unsqueeze(1), 1.0)
+                self.targets[idx] = one_hot
+
+    def update_targets(self, idx, probs, epoch):
+        # E_s (warmup_epochs) = 0 for the selective-classification defaults, so
+        # updates start from the very first epoch (no warmup).
+        if epoch < self.warmup_epochs:
+            return
+        with torch.no_grad():
+            self.targets[idx] = self.alpha * self.targets[idx] + (1 - self.alpha) * probs.detach()
+
+    def sat_loss(self, logits, target_y, idx, eps=1e-8):
+        probs = F.softmax(logits, dim=1)
+        t_scalar = self.targets[idx, target_y]
+        p_true = probs.gather(1, target_y.unsqueeze(1)).squeeze(1)
+        p_abstain = probs[:, self.num_classes]
+
+        loss = -(t_scalar * torch.log(p_true + eps) + (1 - t_scalar) * torch.log(p_abstain + eps))
+        return loss.mean()
+
+    def one_run(self, model, dataloader, hf_model, tau=0.5, train_body=True, optimizer=None, epoch=0):
+        is_training = bool(optimizer)
+        model.train(mode=is_training)
+        device = next(model.parameters()).device
+        hf_model.eval()
+
+        total_loss = 0.0
+        total_correct = 0.0
+        total_samples = 0.0
+        total_escalated = 0
+        total_units = 0  # images (segmentation) or samples (classification)
+
+        context_manager = torch.no_grad() if not is_training else torch.enable_grad()
+
+        with context_manager:
+            for idx, lf_data, hf_data, target in dataloader:
+                idx = idx.to(device)
+                lf_data = lf_data.to(device, torch.float)
+                hf_data = hf_data.to(device, torch.float)
+                target = target.type(torch.LongTensor).to(device)
+
+                logits = model(lf_data)["output"] if train_body else model.head(lf_data)["output"]
+
+                if not self.is_segmentation:
+                    probs = F.softmax(logits, dim=1)
+
+                    if is_training:
+                        self.update_targets(idx, probs, epoch)
+                        loss = self.sat_loss(logits, target, idx)
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        total_loss += loss.item() * lf_data.size(0)
+                        probs = probs.detach()
+
+                    abstain_prob = probs[:, self.num_classes]
+                    escalate_mask = abstain_prob > tau
+                    kept_mask = ~escalate_mask
+
+                    own_pred = torch.argmax(logits[:, :self.num_classes], dim=1)
+                    correct = (own_pred[kept_mask] == target[kept_mask]).sum().item()
+
+                    if hf_model is not None and escalate_mask.sum() > 0:
+                        escalated_data = torch.cat([lf_data[escalate_mask], hf_data[escalate_mask]], dim=1)
+                        hf_layers = hf_model(escalated_data) if train_body else hf_model.head(escalated_data)
+                        hf_pred = torch.argmax(hf_layers["output"], dim=1)
+                        correct += (hf_pred == target[escalate_mask]).sum().item()
+
+                    total_correct += correct
+                    total_samples += lf_data.size(0)
+                    total_escalated += escalate_mask.sum().item()
+                    total_units += lf_data.size(0)
+
+                else:
+                    # Per-pixel EMA targets are intractable at full resolution, so
+                    # SAT tracks/decides at image level here (mean-pooled logits,
+                    # majority-vote pixel label) — same granularity SelectiveNet's
+                    # own segmentation branch already uses for its bookkeeping.
+                    image_logits = logits.mean(dim=(2, 3))
+                    majority_label = torch.mode(target.reshape(target.size(0), -1), dim=1).values
+
+                    probs_image = F.softmax(image_logits, dim=1)
+
+                    if is_training:
+                        self.update_targets(idx, probs_image, epoch)
+                        loss = self.sat_loss(image_logits, majority_label, idx)
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        total_loss += loss.item() * lf_data.size(0)
+                        probs_image = probs_image.detach()
+
+                    abstain_prob = probs_image[:, self.num_classes]
+                    escalate_mask = abstain_prob > tau
+                    kept_mask = ~escalate_mask
+
+                    own_pred = torch.argmax(logits[:, :self.num_classes], dim=1)  # [B, H, W]
+                    correct = (own_pred[kept_mask] == target[kept_mask]).sum().item()
+
+                    if hf_model is not None and escalate_mask.sum() > 0:
+                        escalated_data = torch.cat([lf_data[escalate_mask], hf_data[escalate_mask]], dim=1)
+                        hf_layers = hf_model(escalated_data) if train_body else hf_model.head(escalated_data)
+                        hf_pred = torch.argmax(hf_layers["output"], dim=1)
+                        correct += (hf_pred == target[escalate_mask]).sum().item()
+
+                    total_correct += correct
+                    total_samples += target.numel()
+                    total_escalated += escalate_mask.sum().item()
+                    total_units += lf_data.size(0)
+
+        average_loss = total_loss / total_units if total_units > 0 else 0.0
+        accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+        usage = total_escalated / total_units if total_units > 0 else 0.0
+
+        return {'loss': average_loss, 'accuracy': accuracy, 'usage': usage}

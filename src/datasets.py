@@ -258,9 +258,9 @@ class CropDataset(Dataset):
 
     def get_lf_input_size(self):
         return 3
-    
+
     def get_hf_input_size(self):
-        return 6
+        return 3
 
     def __len__(self):
         return len(self.fileset)
@@ -458,11 +458,13 @@ class CUBDataset(Dataset):
                 transforms.Grayscale(num_output_channels=3),  # Convert image to grayscale with 3 channels
                 transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
                 transforms.Resize((224, 224)),  # Resize to model input size
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
 
         self.hf_transform = transforms.Compose([
             transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
             transforms.Resize((224, 224)),  # Resize to model input size
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
         image_split = self.get_split()
@@ -510,8 +512,8 @@ class CUBDataset(Dataset):
 
     def get_lf_input_size(self):
         return 3
-    
-    def get_lf_input_size(self):
+
+    def get_hf_input_size(self):
         return 3
 
     def __len__(self):
