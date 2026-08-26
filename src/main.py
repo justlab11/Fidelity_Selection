@@ -20,12 +20,21 @@ from experiment_logging import (
     count_parameters, reset_peak_memory, get_peak_memory_mb,
     measure_inference_latency, format_duration, EpochMetricsLogger
 )
+from plot_gate_sensitivity import (
+    load_gate_log, dedupe_and_sort, compute_usage_derivative,
+    plot_derivative, find_zoom_range, plot_zoom, report_max_usage
+)
+from plot_pareto_curves import load_pareto_curves, render_pareto_plot
 
 from custom_types import ConfigOptions
 
 @click.command()
 @click.option("--config_file", default="../config.yml")
 def main(config_file):
+    # ================================================================
+    # INITIALIZATION
+    # config, folders, logging, seed, dataset/dataloaders, model building
+    # ================================================================
     experiment_start_time = time.perf_counter()
     DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -161,6 +170,9 @@ def main(config_file):
     run_summary["cost_realism"]["lf"] = {"num_parameters": lf_param_count}
     run_summary["cost_realism"]["hf"] = {"num_parameters": hf_param_count}
 
+    # ================================================================
+    # LF & HF MODEL TRAINING
+    # ================================================================
     if not train_body:
         logger.info(f"Parameter 'train_body' was set to False, saving the body outputs for faster running")
         
@@ -427,6 +439,10 @@ def main(config_file):
     run_summary["final_accuracy"]["lf_test_acc"] = lf_test_acc
     run_summary["final_accuracy"]["hf_test_acc"] = hf_test_acc
 
+    # ================================================================
+    # FE MODEL TRAINING
+    # save LF/HF latents, then AdaptiveGridSearch over usage_values
+    # ================================================================
     logger.info("SAVING LATENT REPRESENTATIONS")
     train_latent_folder: str = os.path.join(latent_folder, "train")
     save_latent(
@@ -556,6 +572,34 @@ def main(config_file):
     )
     run_summary["result_files"].append("fe_results.npz")
 
+    # ================================================================
+    # FE EVALUATION PLOTS
+    # gate (c_h) sensitivity — only depends on the FE search above, so this
+    # runs even when run_comparisons is False
+    # ================================================================
+    logger.info("PLOTTING FE GATE SENSITIVITY")
+
+    gate_r, gate_usage, gate_acc = load_gate_log(file_folder)
+    gate_r_sorted, gate_usage_sorted, gate_acc_sorted = dedupe_and_sort(gate_r, gate_usage, gate_acc)
+
+    gate_derivative = compute_usage_derivative(gate_r_sorted, gate_usage_sorted)
+    plot_derivative(
+        gate_r_sorted, gate_derivative,
+        os.path.join(image_folder, "gate_sensitivity_derivative.png")
+    )
+
+    gate_zoom_range = find_zoom_range(gate_r_sorted, gate_usage_sorted, low=0.7, high=0.9)
+    plot_zoom(
+        gate_r_sorted, gate_usage_sorted, gate_zoom_range,
+        os.path.join(image_folder, "gate_sensitivity_zoom.png")
+    )
+
+    gate_max_usage, gate_r_at_max = report_max_usage(gate_r_sorted, gate_usage_sorted)
+    logger.info(
+        f"Max achievable usage under the current c_h sampling grid: {gate_max_usage * 100:.2f}% "
+        f"at c_h={gate_r_at_max:.4f}"
+    )
+
     # ends the script if you don't want comparisons
     if not run_comparisons:
         run_summary["timing"]["total_experiment_sec"] = time.perf_counter() - experiment_start_time
@@ -564,6 +608,9 @@ def main(config_file):
         logger.info("EXPERIMENT FINISHED")
         return
 
+    # ================================================================
+    # SOFTMAX RESPONSE (SR) BASELINE
+    # ================================================================
     logger.info("RUNNING DEFAULT SOFTMAX RESPONSE")
 
     softmax_response: SoftmaxResponseMethod = SoftmaxResponseMethod(
@@ -588,6 +635,10 @@ def main(config_file):
     )
     run_summary["result_files"].append("sr_results.npz")
 
+    # ================================================================
+    # SELECTIVENET MODEL TRAINING
+    # one model per c in usage_values, then a (c, threshold) grid search
+    # ================================================================
     num_baseline_epochs: int = config.classifier_training.epochs
     threshold_grid: List[float] = list(np.linspace(0.0, 1.0, 21))
     c_grid: List[float] = usage_values
@@ -755,6 +806,11 @@ def main(config_file):
     )
     run_summary["result_files"].append("selectivenet_grid.npz")
 
+    # ================================================================
+    # SAT MODEL TRAINING
+    # a single model, then a threshold grid search (mirrors SelectiveNet's
+    # selection logic but with no c dimension)
+    # ================================================================
     logger.info("RUNNING DEFAULT SELF-ADAPTIVE TRAINING (SAT)")
     sat_model: nn.Module = build_model(
         model_name=lf_model_name,
@@ -931,6 +987,18 @@ def main(config_file):
         test_acc_grid=sat_test_acc_grid
     )
     run_summary["result_files"].append("sat_grid.npz")
+
+    # ================================================================
+    # FINAL PLOTS
+    # Pareto overlay of every baseline that produced a *_results.npz
+    # ================================================================
+    logger.info("PLOTTING PARETO CURVES")
+
+    pareto_curves = load_pareto_curves(file_folder)
+    render_pareto_plot(
+        pareto_curves, dataset_label=dataset_name,
+        save_path=os.path.join(image_folder, "pareto.png")
+    )
 
     run_summary["timing"]["total_experiment_sec"] = time.perf_counter() - experiment_start_time
     logger.info(f"Total experiment time: {format_duration(run_summary['timing']['total_experiment_sec'])}")
