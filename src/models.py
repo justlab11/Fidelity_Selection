@@ -60,7 +60,18 @@ class CustomResNet18(nn.Module):
         super().__init__()
         model = models.resnet18(weights="DEFAULT")
         if num_channels != 3:
-            model.conv1 = nn.Conv2d(num_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            old_conv1 = model.conv1
+            new_conv1 = nn.Conv2d(num_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+            with torch.no_grad():
+                # Tile the pretrained RGB filters across the extra channel groups instead of
+                # randomly reinitializing, so the stem starts from meaningful features rather
+                # than noise (e.g. num_channels=6 for grayscale+RGB fusion). Divide by the
+                # number of tiled groups to keep the output magnitude roughly calibrated to
+                # what the rest of the pretrained backbone expects.
+                reps = -(-num_channels // 3)  # ceil division
+                tiled = old_conv1.weight.repeat(1, reps, 1, 1)[:, :num_channels, :, :]
+                new_conv1.weight.copy_(tiled / reps)
+            model.conv1 = new_conv1
 
         num_ftrs = model.fc.in_features
         model.fc = nn.Identity()

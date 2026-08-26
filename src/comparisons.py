@@ -307,6 +307,13 @@ class SelfAdaptiveTrainingMethod:
         device = next(model.parameters()).device
         hf_model.eval()
 
+        # self.targets (and everything indexed alongside it, e.g. target_y in
+        # sat_loss) must live on the same device as the model — sync once here
+        # instead of trusting the constructor's device arg to already match.
+        if self.targets.device != device:
+            self.targets = self.targets.to(device)
+        self.device = device
+
         total_loss = 0.0
         total_correct = 0.0
         total_samples = 0.0
@@ -320,7 +327,7 @@ class SelfAdaptiveTrainingMethod:
                 idx = idx.to(device)
                 lf_data = lf_data.to(device, torch.float)
                 hf_data = hf_data.to(device, torch.float)
-                target = target.type(torch.LongTensor).to(device)
+                target = target.long().to(device)
 
                 logits = model(lf_data)["output"] if train_body else model.head(lf_data)["output"]
 

@@ -434,7 +434,8 @@ def main(config_file):
         hf_model=hf_model,
         dataloader=train_dl,
         save_folder=train_latent_folder,
-        train_body=train_body
+        train_body=train_body,
+        device=DEVICE
     )
 
     test_latent_folder: str = os.path.join(latent_folder, "test")
@@ -443,7 +444,8 @@ def main(config_file):
         hf_model=hf_model,
         dataloader=test_dl,
         save_folder=test_latent_folder,
-        train_body=train_body
+        train_body=train_body,
+        device=DEVICE
     )
 
     val_latent_folder: str = os.path.join(latent_folder, "val")
@@ -452,7 +454,8 @@ def main(config_file):
         hf_model=hf_model,
         dataloader=val_dl,
         save_folder=val_latent_folder,
-        train_body=train_body
+        train_body=train_body,
+        device=DEVICE
     )
     folder_size: float = get_folder_size(latent_folder)/1e6
     logger.info(f"Total size of {latent_folder}: {folder_size:,} MB")
@@ -587,102 +590,170 @@ def main(config_file):
 
     num_baseline_epochs: int = config.classifier_training.epochs
     threshold_grid: List[float] = list(np.linspace(0.0, 1.0, 21))
+    c_grid: List[float] = usage_values
 
-    logger.info("RUNNING DEFAULT SELECTIVENET")
-    selnet_model: nn.Module = build_model(
-        model_name=lf_model_name,
-        input_size=lf_input_size,
-        output_size=output_size,
-        latent_size=latent_size
-    ).to(DEVICE)
+    logger.info("RUNNING SELECTIVENET (c GRID)")
 
-    selnet_param_count = count_parameters(selnet_model)
-    logger.info(f"SelectiveNet model parameters: {selnet_param_count:,}")
-    run_summary["cost_realism"]["selectivenet"] = {"num_parameters": selnet_param_count}
+    n_c = len(c_grid)
+    n_t = len(threshold_grid)
 
-    selnet_optimizer = torch.optim.Adam(selnet_model.parameters(), lr=1e-3, weight_decay=1e-5)
-    selnet_method: SelectiveNetMethod = SelectiveNetMethod(model_folder=model_folder)
-    selnet_model_file = os.path.join(model_folder, "selnet_model.pt")
-    selnet_best_acc: float = 0.0
+    # rows = c (train-time coverage penalty), cols = threshold (inference-time cutoff)
+    selnet_val_usage_grid = np.zeros((n_c, n_t))
+    selnet_val_acc_grid = np.zeros((n_c, n_t))
+    selnet_test_usage_grid = np.zeros((n_c, n_t))
+    selnet_test_acc_grid = np.zeros((n_c, n_t))
 
+    selnet_param_count = None
     reset_peak_memory(DEVICE)
     selnet_train_start = time.perf_counter()
-    selnet_epoch_logger = EpochMetricsLogger(
-        os.path.join(file_folder, "selnet_epoch_metrics.csv"),
-        ["epoch", "train_loss", "train_acc", "train_usage", "val_loss", "val_acc", "val_usage", "epoch_time_sec"]
-    )
 
-    for epoch in range(num_baseline_epochs):
-        selnet_epoch_start = time.perf_counter()
+    for c_idx, c_val in enumerate(c_grid):
+        logger.info(f"SelectiveNet c={c_val:.2f}")
 
-        selnet_train_metrics = selnet_method.one_run(
-            model=selnet_model,
-            dataloader=cascade_train_dl,
-            hf_model=hf_model,
-            threshold=0.5,
-            train_body=train_body,
-            optimizer=selnet_optimizer
+        selnet_model: nn.Module = build_model(
+            model_name=lf_model_name,
+            input_size=lf_input_size,
+            output_size=output_size,
+            latent_size=latent_size
+        ).to(DEVICE)
+
+        if selnet_param_count is None:
+            selnet_param_count = count_parameters(selnet_model)
+            logger.info(f"SelectiveNet model parameters: {selnet_param_count:,}")
+            run_summary["cost_realism"]["selectivenet"] = {"num_parameters": selnet_param_count}
+
+        selnet_optimizer = torch.optim.Adam(selnet_model.parameters(), lr=1e-3, weight_decay=1e-5)
+        selnet_method: SelectiveNetMethod = SelectiveNetMethod(model_folder=model_folder, c=c_val)
+        selnet_model_file = os.path.join(model_folder, f"selnet_model_c{c_val:.2f}.pt")
+        selnet_best_acc: float = 0.0
+
+        selnet_epoch_logger = EpochMetricsLogger(
+            os.path.join(file_folder, f"selnet_epoch_metrics_c{c_val:.2f}.csv"),
+            ["epoch", "train_loss", "train_acc", "train_usage", "val_loss", "val_acc", "val_usage", "epoch_time_sec"]
         )
 
-        selnet_val_metrics = selnet_method.one_run(
-            model=selnet_model,
-            dataloader=cascade_val_dl,
-            hf_model=hf_model,
-            threshold=0.5,
-            train_body=train_body,
-        )
+        for epoch in range(40):
+            selnet_epoch_start = time.perf_counter()
 
-        selnet_epoch_time_sec = time.perf_counter() - selnet_epoch_start
+            selnet_train_metrics = selnet_method.one_run(
+                model=selnet_model,
+                dataloader=cascade_train_dl,
+                hf_model=hf_model,
+                threshold=0.5,
+                train_body=train_body,
+                optimizer=selnet_optimizer
+            )
 
-        if selnet_val_metrics["accuracy"] > selnet_best_acc:
-            selnet_best_acc = selnet_val_metrics["accuracy"]
-            torch.save(selnet_model.state_dict(), selnet_model_file)
+            selnet_val_metrics = selnet_method.one_run(
+                model=selnet_model,
+                dataloader=cascade_val_dl,
+                hf_model=hf_model,
+                threshold=0.5,
+                train_body=train_body,
+            )
 
-        selnet_epoch_logger.log_epoch(
-            epoch=epoch+1,
-            train_loss=selnet_train_metrics["loss"], train_acc=selnet_train_metrics["accuracy"],
-            train_usage=selnet_train_metrics["usage"],
-            val_loss=selnet_val_metrics["loss"], val_acc=selnet_val_metrics["accuracy"],
-            val_usage=selnet_val_metrics["usage"], epoch_time_sec=selnet_epoch_time_sec
-        )
+            selnet_epoch_time_sec = time.perf_counter() - selnet_epoch_start
 
-        logger.info(f"SelectiveNet Epoch {epoch+1} Summary:")
-        logger.info(f"\tTrain Loss: {selnet_train_metrics['loss']:.4f} | Accuracy: {100 * selnet_train_metrics['accuracy']:.2f}% | Usage: {100 * selnet_train_metrics['usage']:.2f}%")
-        logger.info(f"\tVal   Loss: {selnet_val_metrics['loss']:.4f}   | Accuracy: {100 * selnet_val_metrics['accuracy']:.2f}%   | Usage: {100 * selnet_val_metrics['usage']:.2f}%")
+            if selnet_val_metrics["accuracy"] > selnet_best_acc:
+                selnet_best_acc = selnet_val_metrics["accuracy"]
+                torch.save(selnet_model.state_dict(), selnet_model_file)
+
+            selnet_epoch_logger.log_epoch(
+                epoch=epoch+1,
+                train_loss=selnet_train_metrics["loss"], train_acc=selnet_train_metrics["accuracy"],
+                train_usage=selnet_train_metrics["usage"],
+                val_loss=selnet_val_metrics["loss"], val_acc=selnet_val_metrics["accuracy"],
+                val_usage=selnet_val_metrics["usage"], epoch_time_sec=selnet_epoch_time_sec
+            )
+
+            logger.info(f"SelectiveNet c={c_val:.2f} Epoch {epoch+1} Summary:")
+            logger.info(f"\tTrain Loss: {selnet_train_metrics['loss']:.4f} | Accuracy: {100 * selnet_train_metrics['accuracy']:.2f}% | Usage: {100 * selnet_train_metrics['usage']:.2f}%")
+            logger.info(f"\tVal   Loss: {selnet_val_metrics['loss']:.4f}   | Accuracy: {100 * selnet_val_metrics['accuracy']:.2f}%   | Usage: {100 * selnet_val_metrics['usage']:.2f}%")
+
+        selnet_model.load_state_dict(torch.load(selnet_model_file, weights_only=True))
+
+        for t_idx, threshold in enumerate(threshold_grid):
+            selnet_val_grid_metrics = selnet_method.one_run(
+                model=selnet_model,
+                dataloader=cascade_val_dl,
+                hf_model=hf_model,
+                threshold=float(threshold),
+                train_body=train_body,
+            )
+
+            selnet_test_grid_metrics = selnet_method.one_run(
+                model=selnet_model,
+                dataloader=cascade_test_dl,
+                hf_model=hf_model,
+                threshold=float(threshold),
+                train_body=train_body,
+            )
+
+            selnet_val_usage_grid[c_idx, t_idx] = selnet_val_grid_metrics["usage"]
+            selnet_val_acc_grid[c_idx, t_idx] = selnet_val_grid_metrics["accuracy"]
+            selnet_test_usage_grid[c_idx, t_idx] = selnet_test_grid_metrics["usage"]
+            selnet_test_acc_grid[c_idx, t_idx] = selnet_test_grid_metrics["accuracy"]
 
     selnet_train_time_sec = time.perf_counter() - selnet_train_start
     selnet_peak_mem_mb = get_peak_memory_mb(DEVICE)
-    logger.info(f"SelectiveNet train time: {format_duration(selnet_train_time_sec)}")
+    logger.info(f"SelectiveNet train time (all c values): {format_duration(selnet_train_time_sec)}")
     logger.info(f"SelectiveNet phase peak GPU memory: {selnet_peak_mem_mb:.1f} MB")
 
     run_summary["timing"]["selectivenet_train_sec"] = selnet_train_time_sec
     run_summary["peak_gpu_memory_mb"]["selectivenet_phase"] = selnet_peak_mem_mb
 
-    selnet_model.load_state_dict(torch.load(selnet_model_file, weights_only=True))
-
+    # For each target usage, pick the (c, threshold) cell whose val usage is the
+    # largest one still <= target (closest without going over the budget). If no
+    # cell meets the budget, fall back to whichever cell's val usage is closest
+    # to the target overall, and warn since the budget was violated.
     selnet_usage_vals: List[float] = []
     selnet_acc_vals: List[float] = []
+    selnet_chosen_c: List[float] = []
+    selnet_chosen_threshold: List[float] = []
 
-    for threshold in threshold_grid:
-        selnet_test_metrics = selnet_method.one_run(
-            model=selnet_model,
-            dataloader=cascade_test_dl,
-            hf_model=hf_model,
-            threshold=float(threshold),
-            train_body=train_body,
-        )
+    flat_val_usage = selnet_val_usage_grid.ravel()
 
-        selnet_usage_vals.append(100 * selnet_test_metrics["usage"])
-        selnet_acc_vals.append(100 * selnet_test_metrics["accuracy"])
+    for target_usage in usage_values:
+        under_budget = np.where(flat_val_usage <= target_usage)[0]
+
+        if under_budget.size > 0:
+            best_flat_idx = under_budget[np.argmax(flat_val_usage[under_budget])]
+        else:
+            logger.warning(
+                f"No (c, threshold) combo has val usage <= {target_usage}; "
+                f"falling back to the closest val usage overall"
+            )
+            best_flat_idx = np.argmin(np.abs(flat_val_usage - target_usage))
+
+        c_idx, t_idx = np.unravel_index(best_flat_idx, selnet_val_usage_grid.shape)
+
+        selnet_usage_vals.append(100 * selnet_test_usage_grid[c_idx, t_idx])
+        selnet_acc_vals.append(100 * selnet_test_acc_grid[c_idx, t_idx])
+        selnet_chosen_c.append(c_grid[c_idx])
+        selnet_chosen_threshold.append(threshold_grid[t_idx])
 
     selectivenet_data_path: str = os.path.join(file_folder, "selectivenet_results.npz")
     np.savez(
         selectivenet_data_path,
         usage=np.array(selnet_usage_vals),
         acc=np.array(selnet_acc_vals),
-        thresholds=np.array(threshold_grid)
+        target_usage=np.array(usage_values),
+        chosen_c=np.array(selnet_chosen_c),
+        chosen_threshold=np.array(selnet_chosen_threshold)
     )
     run_summary["result_files"].append("selectivenet_results.npz")
+
+    selectivenet_grid_path: str = os.path.join(file_folder, "selectivenet_grid.npz")
+    np.savez(
+        selectivenet_grid_path,
+        c_grid=np.array(c_grid),
+        threshold_grid=np.array(threshold_grid),
+        val_usage_grid=selnet_val_usage_grid,
+        val_acc_grid=selnet_val_acc_grid,
+        test_usage_grid=selnet_test_usage_grid,
+        test_acc_grid=selnet_test_acc_grid
+    )
+    run_summary["result_files"].append("selectivenet_grid.npz")
 
     logger.info("RUNNING DEFAULT SELF-ADAPTIVE TRAINING (SAT)")
     sat_model: nn.Module = build_model(
@@ -784,10 +855,20 @@ def main(config_file):
 
     sat_model.load_state_dict(torch.load(sat_model_file, weights_only=True))
 
-    sat_usage_vals: List[float] = []
-    sat_acc_vals: List[float] = []
+    sat_val_usage_grid: List[float] = []
+    sat_val_acc_grid: List[float] = []
+    sat_test_usage_grid: List[float] = []
+    sat_test_acc_grid: List[float] = []
 
     for tau in threshold_grid:
+        sat_val_metrics = sat_method.one_run(
+            model=sat_model,
+            dataloader=sat_val_dl,
+            hf_model=hf_model,
+            tau=float(tau),
+            train_body=train_body,
+            epoch=num_baseline_epochs
+        )
         sat_test_metrics = sat_method.one_run(
             model=sat_model,
             dataloader=sat_test_dl,
@@ -797,17 +878,59 @@ def main(config_file):
             epoch=num_baseline_epochs
         )
 
-        sat_usage_vals.append(100 * sat_test_metrics["usage"])
-        sat_acc_vals.append(100 * sat_test_metrics["accuracy"])
+        sat_val_usage_grid.append(sat_val_metrics["usage"])
+        sat_val_acc_grid.append(sat_val_metrics["accuracy"])
+        sat_test_usage_grid.append(sat_test_metrics["usage"])
+        sat_test_acc_grid.append(sat_test_metrics["accuracy"])
+
+    sat_val_usage_grid = np.array(sat_val_usage_grid)
+    sat_val_acc_grid = np.array(sat_val_acc_grid)
+    sat_test_usage_grid = np.array(sat_test_usage_grid)
+    sat_test_acc_grid = np.array(sat_test_acc_grid)
+
+    # For each target usage, pick the threshold whose val usage is the largest
+    # one still <= target (closest without going over the budget) — same
+    # selection rule already used for SelectiveNet's (c, threshold) grid.
+    sat_usage_vals: List[float] = []
+    sat_acc_vals: List[float] = []
+    sat_chosen_threshold: List[float] = []
+
+    for target_usage in usage_values:
+        under_budget = np.where(sat_val_usage_grid <= target_usage)[0]
+
+        if under_budget.size > 0:
+            best_idx = under_budget[np.argmax(sat_val_usage_grid[under_budget])]
+        else:
+            logger.warning(
+                f"No threshold has val usage <= {target_usage}; "
+                f"falling back to the closest val usage overall"
+            )
+            best_idx = np.argmin(np.abs(sat_val_usage_grid - target_usage))
+
+        sat_usage_vals.append(100 * sat_test_usage_grid[best_idx])
+        sat_acc_vals.append(100 * sat_test_acc_grid[best_idx])
+        sat_chosen_threshold.append(threshold_grid[best_idx])
 
     sat_data_path: str = os.path.join(file_folder, "sat_results.npz")
     np.savez(
         sat_data_path,
         usage=np.array(sat_usage_vals),
         acc=np.array(sat_acc_vals),
-        thresholds=np.array(threshold_grid)
+        target_usage=np.array(usage_values),
+        chosen_threshold=np.array(sat_chosen_threshold)
     )
     run_summary["result_files"].append("sat_results.npz")
+
+    sat_grid_path: str = os.path.join(file_folder, "sat_grid.npz")
+    np.savez(
+        sat_grid_path,
+        threshold_grid=np.array(threshold_grid),
+        val_usage_grid=sat_val_usage_grid,
+        val_acc_grid=sat_val_acc_grid,
+        test_usage_grid=sat_test_usage_grid,
+        test_acc_grid=sat_test_acc_grid
+    )
+    run_summary["result_files"].append("sat_grid.npz")
 
     run_summary["timing"]["total_experiment_sec"] = time.perf_counter() - experiment_start_time
     logger.info(f"Total experiment time: {format_duration(run_summary['timing']['total_experiment_sec'])}")

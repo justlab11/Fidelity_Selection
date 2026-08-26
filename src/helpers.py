@@ -429,7 +429,7 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
     elif fidelity == "hf":
         for lf_data, hf_data, target in dataloader:
             target = target.type(torch.LongTensor)
-            data = torch.cat([lf_data, hf_data], dim=1)
+            data = torch.cat([lf_data, hf_data], dim=1) if train_body else hf_data
             data, target = data.to(device, torch.float), target.to(device)
 
             if train_body:
@@ -515,6 +515,8 @@ def save_body(
 
     with torch.no_grad():
         for batch_idx, (lf_sample, hf_sample, label) in enumerate(dataloader):
+            hf_sample = torch.cat([lf_sample, hf_sample], dim=1)
+
             lf_sample = lf_sample.to(device)
             hf_sample = hf_sample.to(device)
             label = label.to(device)
@@ -543,7 +545,7 @@ def save_latent(
         dataloader: DataLoader,
         save_folder: str, 
         train_body: bool,
-        device):
+        device="cpu"):
 
     lf_model = lf_model.to(device)
     hf_model = hf_model.to(device)
@@ -554,6 +556,8 @@ def save_latent(
 
     with torch.no_grad():
         for batch_idx, (lf, hf, labels) in enumerate(dataloader):
+            hf = torch.cat([lf, hf], dim=1)
+
             lf = lf.to(device)
             hf = hf.to(device)
             labels = labels.to(device)
@@ -779,7 +783,9 @@ class AdaptiveGridSearch:
         for i in range(len(self.evaluated_points) - 1):
             r_a, use_a, *_ = self.evaluated_points[i]
             r_b, use_b, *_ = self.evaluated_points[i+1]
-            if use_a <= usage < use_b:
+            # usage decreases as r increases (see the bisection direction in
+            # find_r_for_target), so for r_a < r_b we expect use_a >= use_b
+            if use_b <= usage <= use_a:
                 return r_a, r_b, False
 
         # If no exact bracket, use full range as fallback — this is the concrete
@@ -794,7 +800,7 @@ class AdaptiveGridSearch:
             device=self.device
         )
 
-        self.fe_model = reset_all_weights(self.fe_model)
+        reset_all_weights(self.fe_model)
         self.fe_model = self.fe_model.to(self.device)
         fe_optimizer = torch.optim.Adam(self.fe_model.parameters(), lr=3e-4, weight_decay=1e-5)
 
