@@ -22,7 +22,10 @@ from experiment_logging import (
 )
 from plot_gate_sensitivity import (
     load_gate_log, dedupe_and_sort, compute_usage_derivative,
-    plot_derivative, find_zoom_range, plot_zoom, report_max_usage
+    plot_derivative, find_zoom_range, plot_zoom, plot_full_curve, report_max_usage
+)
+from plot_gate_routing import (
+    load_routing_snapshots, compute_oracle_curve, plot_pca_routing_grid, plot_routing_table_grid
 )
 from plot_pareto_curves import load_pareto_curves, render_pareto_plot
 
@@ -509,7 +512,7 @@ def main(config_file):
             model_name="mlp",
             input_size=latent_size,
             output_size=2,
-            latent_size=128
+            latent_size=256
         )
     else:
         fe_model: nn.Module = build_model(
@@ -537,17 +540,18 @@ def main(config_file):
     gate_search_start = time.perf_counter()
 
     usage_values: List[float] = [i/10 for i in range(1, 11)]
+    fe_reruns: int = config.fe_training.reruns
+    logger.info(f"FE reruns: {fe_reruns}")
 
-    fe_usage_vals: List[float] = []
-    fe_acc_vals: List[float] = []
+    fe_usage_runs, fe_acc_runs = adaptive_search.run_reruns(
+        usage_values=usage_values,
+        n_reruns=fe_reruns
+    )
 
-    for usage in usage_values:
-        _, test_acc, test_use = adaptive_search.find_r_for_target(
-            usage=usage
-        )
-
-        fe_usage_vals.append(test_use)
-        fe_acc_vals.append(test_acc)
+    fe_usage_vals = fe_usage_runs.mean(axis=0)
+    fe_acc_vals = fe_acc_runs.mean(axis=0)
+    fe_usage_std = fe_usage_runs.std(axis=0)
+    fe_acc_std = fe_acc_runs.std(axis=0)
 
     gate_search_time_sec = time.perf_counter() - gate_search_start
     gate_peak_mem_mb = get_peak_memory_mb(DEVICE)
@@ -560,15 +564,17 @@ def main(config_file):
     adaptive_search.save_evaluated_points(os.path.join(file_folder, "gate_search_log.npz"))
     adaptive_search.save_epoch_log(os.path.join(file_folder, "gate_epoch_metrics.csv"))
     adaptive_search.save_search_diagnostics(os.path.join(file_folder, "gate_search_diagnostics.csv"))
-
-    fe_usage_vals = np.array(fe_usage_vals)
-    fe_acc_vals = np.array(fe_acc_vals)
+    adaptive_search.save_routing_snapshots(os.path.join(file_folder, "gate_routing_snapshots.npz"))
 
     fe_data_path: str = os.path.join(file_folder, "fe_results.npz")
     np.savez(
         fe_data_path,
         usage=fe_usage_vals,
-        acc=fe_acc_vals
+        acc=fe_acc_vals,
+        usage_std=fe_usage_std,
+        acc_std=fe_acc_std,
+        usage_runs=fe_usage_runs,
+        acc_runs=fe_acc_runs
     )
     run_summary["result_files"].append("fe_results.npz")
 
@@ -588,11 +594,28 @@ def main(config_file):
         os.path.join(image_folder, "gate_sensitivity_derivative.png")
     )
 
+    plot_full_curve(
+        gate_r_sorted, gate_usage_sorted,
+        os.path.join(image_folder, "gate_sensitivity_full.png")
+    )
+
     gate_zoom_range = find_zoom_range(gate_r_sorted, gate_usage_sorted, low=0.7, high=0.9)
     plot_zoom(
         gate_r_sorted, gate_usage_sorted, gate_zoom_range,
         os.path.join(image_folder, "gate_sensitivity_zoom.png")
     )
+
+    logger.info("PLOTTING GATE ROUTING (PCA + confusion tables)")
+    routing_snapshots = load_routing_snapshots(file_folder)
+    for rerun_idx in range(fe_reruns):
+        plot_pca_routing_grid(
+            routing_snapshots, rerun_idx,
+            os.path.join(image_folder, f"gate_routing_pca_rerun{rerun_idx}.png")
+        )
+        plot_routing_table_grid(
+            routing_snapshots, rerun_idx,
+            os.path.join(image_folder, f"gate_routing_table_rerun{rerun_idx}.png")
+        )
 
     gate_max_usage, gate_r_at_max = report_max_usage(gate_r_sorted, gate_usage_sorted)
     logger.info(
@@ -673,7 +696,7 @@ def main(config_file):
             logger.info(f"SelectiveNet model parameters: {selnet_param_count:,}")
             run_summary["cost_realism"]["selectivenet"] = {"num_parameters": selnet_param_count}
 
-        selnet_optimizer = torch.optim.Adam(selnet_model.parameters(), lr=1e-3, weight_decay=1e-5)
+        selnet_optimizer = torch.optim.Adam(selnet_model.parameters(), lr=1e-5, weight_decay=1e-5)
         selnet_method: SelectiveNetMethod = SelectiveNetMethod(model_folder=model_folder, c=c_val)
         selnet_model_file = os.path.join(model_folder, f"selnet_model_c{c_val:.2f}.pt")
         selnet_best_acc: float = 0.0
@@ -823,7 +846,7 @@ def main(config_file):
     logger.info(f"SAT model parameters: {sat_param_count:,}")
     run_summary["cost_realism"]["sat"] = {"num_parameters": sat_param_count}
 
-    sat_optimizer = torch.optim.Adam(sat_model.parameters(), lr=1e-3, weight_decay=1e-5)
+    sat_optimizer = torch.optim.Adam(sat_model.parameters(), lr=1e-5, weight_decay=1e-5)
     sat_method: SelfAdaptiveTrainingMethod = SelfAdaptiveTrainingMethod(
         num_train_samples=len(cascade_train_ds),
         num_classes=output_size,
@@ -994,10 +1017,19 @@ def main(config_file):
     # ================================================================
     logger.info("PLOTTING PARETO CURVES")
 
+    # lf_correct/hf_correct only depend on the LF/HF models' own predictions on
+    # the fixed test set, not on which gate model produced a given snapshot —
+    # so any single snapshot's arrays (here, the first) give the ground truth.
+    oracle_acc = compute_oracle_curve(
+        routing_snapshots["lf_correct"][0], routing_snapshots["hf_correct"][0], usage_values
+    )
+    oracle = (np.array(usage_values) * 100, oracle_acc)
+
     pareto_curves = load_pareto_curves(file_folder)
     render_pareto_plot(
         pareto_curves, dataset_label=dataset_name,
-        save_path=os.path.join(image_folder, "pareto.png")
+        save_path=os.path.join(image_folder, "pareto.png"),
+        oracle=oracle
     )
 
     run_summary["timing"]["total_experiment_sec"] = time.perf_counter() - experiment_start_time

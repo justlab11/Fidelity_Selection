@@ -8,6 +8,7 @@ import os.path as path
 import tifffile as tif
 import os
 import warnings
+import logging
 
 import numpy as np
 import torch
@@ -15,6 +16,9 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 import torch
+import psutil
+
+logger = logging.getLogger(__name__)
 
 class HypercubeDataset(Dataset):
     def __init__(
@@ -558,16 +562,53 @@ class BodyDataset(Dataset):
         return lf_body_output, hf_body_output, label
 
 class FE_Dataset(Dataset):
+    # Only cache in memory if the estimated footprint stays under this fraction
+    # of currently available RAM, leaving headroom for the OS/rest of the process.
+    MAX_MEMORY_FRACTION = 0.7
+
     def __init__(self, folder_path):
         self.folder_path = folder_path
         self.files = sorted(os.listdir(folder_path))  # Sorted list of .pt file names
+
+        self._in_memory = False
+        self._cache = None
+
+        if self.files:
+            # Measure the real on-disk size of one sample rather than deriving it
+            # from config (e.g. latent_size) — that formula breaks for datasets
+            # like "crop" where the cached tensors are spatial maps, not vectors.
+            sample_bytes = os.path.getsize(os.path.join(folder_path, self.files[0]))
+            estimated_bytes = sample_bytes * len(self.files)
+            available_bytes = psutil.virtual_memory().available
+            budget_bytes = available_bytes * self.MAX_MEMORY_FRACTION
+
+            if estimated_bytes <= budget_bytes:
+                logger.info(
+                    f"FE_Dataset({folder_path}): caching {len(self.files)} samples "
+                    f"(~{estimated_bytes / 1e6:.1f} MB) in memory "
+                    f"({available_bytes / 1e6:.1f} MB available)"
+                )
+                self._cache = [
+                    torch.load(os.path.join(folder_path, fname))
+                    for fname in self.files
+                ]
+                self._in_memory = True
+            else:
+                logger.info(
+                    f"FE_Dataset({folder_path}): estimated size ~{estimated_bytes / 1e6:.1f} MB "
+                    f"exceeds {self.MAX_MEMORY_FRACTION:.0%} of available RAM "
+                    f"({available_bytes / 1e6:.1f} MB available); falling back to per-sample disk loads"
+                )
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
-        file_path = os.path.join(self.folder_path, self.files[idx])
-        data = torch.load(file_path)
+        if self._in_memory:
+            data = self._cache[idx]
+        else:
+            file_path = os.path.join(self.folder_path, self.files[idx])
+            data = torch.load(file_path)
 
         lf_latent = data['lf_latent']
         lf_output = data['lf_output']

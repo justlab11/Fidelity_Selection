@@ -30,6 +30,7 @@ class ThresholdSettings(BaseModel):
 class FESettings(BaseModel):
     epochs: int
     batch_size: int
+    reruns: int = 1
     r_range: ThresholdSettings
 
 class ConfigOptions(BaseModel):

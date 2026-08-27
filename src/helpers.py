@@ -12,6 +12,7 @@ import csv
 from torch.utils.data import DataLoader
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
+from sklearn.decomposition import PCA
 from scipy.optimize import minimize
 
 from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset
@@ -369,6 +370,43 @@ def build_model(model_name, latent_size, output_size, input_size=None):
             )
 
     return model
+
+def compute_gate_routing_details(model, dataloader, device):
+    """One no-grad pass over a "gate"-fidelity dataloader (lf_embeddings, lf_preds,
+    hf_preds, target), returning per-sample arrays: the gate's routing decision and
+    both models' own correctness — everything needed to build the ground-truth
+    "HF needed" / "LF fine" labels and the routing confusion counts, without
+    duplicating classifier_one_run's loss/aggregate-accuracy bookkeeping.
+
+    Assumes lf_embeddings is a flat (B, latent_dim) vector — true for the
+    classification FE model ("mlp"), not for the segmentation "cnn_head" case.
+    """
+    model.eval()
+
+    lf_latents, lf_corrects, hf_corrects, choices, labels = [], [], [], [], []
+
+    with torch.no_grad():
+        for lf_embeddings, lf_preds, hf_preds, target in dataloader:
+            lf_embeddings = lf_embeddings.to(device, torch.float)
+            lf_preds = lf_preds.to(device, torch.float)
+            hf_preds = hf_preds.to(device, torch.float)
+            target = target.long().to(device)
+
+            choice = torch.argmax(model(lf_embeddings)["output"], dim=1)  # 0=LF, 1=HF
+
+            lf_latents.append(lf_embeddings.cpu().numpy())
+            lf_corrects.append((torch.argmax(lf_preds, dim=1) == target).cpu().numpy())
+            hf_corrects.append((torch.argmax(hf_preds, dim=1) == target).cpu().numpy())
+            choices.append(choice.cpu().numpy())
+            labels.append(target.cpu().numpy())
+
+    return {
+        "lf_latent": np.concatenate(lf_latents, axis=0),
+        "lf_correct": np.concatenate(lf_corrects, axis=0),
+        "hf_correct": np.concatenate(hf_corrects, axis=0),
+        "choice": np.concatenate(choices, axis=0),
+        "label": np.concatenate(labels, axis=0),
+    }
 
 def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, optimizer=None, scheduler=None):
     """
@@ -766,15 +804,74 @@ class GaussianProcessSearch:
 
 class AdaptiveGridSearch:
     def __init__(self, fe_model, device, train_dl, val_dl, test_dl, model_folder):
+        # evaluated_points is reset at the start of every rerun (see run_reruns) so
+        # each rerun's bracket search is a genuinely independent sweep, not warm-
+        # started off a previous rerun's history. all_evaluated_points pools every
+        # rerun's points instead — more raw (r, usage, acc) samples only helps
+        # plot_gate_sensitivity.py's derivative/zoom analysis, so nothing is reset there.
         self.evaluated_points = []
+        self.all_evaluated_points = []
         self.epoch_log = []
         self.search_diagnostics = []
+        # One entry per find_r_for_target call: the final gate model's per-sample
+        # routing decision + both models' correctness, tagged by rerun/target_usage.
+        # Feeds the PCA routing plot and the routing confusion-table plot.
+        self.routing_snapshots = []
+        self.rerun_idx = 0
         self.fe_model = fe_model
         self.device = device
         self.train_dl = train_dl
         self.val_dl = val_dl
         self.test_dl = test_dl
         self.model_folder = model_folder
+
+        # lf_latent is the same fixed test-set data on every call (it's precomputed
+        # LF-model output, independent of the gate model), so the PCA basis is
+        # fit once and reused everywhere — every snapshot's 2D coordinates line
+        # up in the same space.
+        self.latent_pca = None
+        self.boundary_xx = None
+        self.boundary_yy = None
+
+    def _project_latent(self, lf_latent, grid_size=120, pad_frac=0.05):
+        """Fits (once) a 2D PCA basis on lf_latent and a matching decision-
+        boundary meshgrid in that PCA plane. Returns (coords_2d, xx, yy)."""
+        if self.latent_pca is None:
+            self.latent_pca = PCA(n_components=2)
+            coords_2d = self.latent_pca.fit_transform(lf_latent)
+
+            x_min, x_max = coords_2d[:, 0].min(), coords_2d[:, 0].max()
+            y_min, y_max = coords_2d[:, 1].min(), coords_2d[:, 1].max()
+            x_pad = (x_max - x_min) * pad_frac
+            y_pad = (y_max - y_min) * pad_frac
+            self.boundary_xx, self.boundary_yy = np.meshgrid(
+                np.linspace(x_min - x_pad, x_max + x_pad, grid_size),
+                np.linspace(y_min - y_pad, y_max + y_pad, grid_size)
+            )
+        else:
+            coords_2d = self.latent_pca.transform(lf_latent)
+
+        return coords_2d
+
+    def _compute_decision_boundary(self):
+        """Runs the *actual* trained self.fe_model (not a proxy classifier) over
+        grid points in the cached PCA plane, reconstructed back to the real
+        latent dimensionality via inverse_transform. This is a genuine slice of
+        the real decision surface through that 2D plane — necessarily an
+        approximation (the plane can't capture the other latent_dim-2 axes), but
+        it reflects the model's own nonlinearity rather than a re-fit linear
+        stand-in.
+        """
+        grid_2d = np.column_stack([self.boundary_xx.ravel(), self.boundary_yy.ravel()])
+        grid_latent = self.latent_pca.inverse_transform(grid_2d).astype(np.float32)
+
+        self.fe_model.eval()
+        with torch.no_grad():
+            grid_tensor = torch.from_numpy(grid_latent).to(self.device)
+            logits = self.fe_model(grid_tensor)["output"]
+            hf_prob = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+
+        return hf_prob.reshape(self.boundary_xx.shape)
 
     def find_bracket(self, usage):
         # Sort points by r to ensure order
@@ -833,7 +930,7 @@ class AdaptiveGridSearch:
                 logger.warning(f"Non-finite val_loss ({val_loss}) training gate model at r_val={r_val}, epoch={epoch}")
 
             self.epoch_log.append({
-                "r_val": r_val, "epoch": epoch, "train_loss": train_loss,
+                "rerun": self.rerun_idx, "r_val": r_val, "epoch": epoch, "train_loss": train_loss,
                 "val_loss": val_loss, "val_acc": val_acc, "val_usage": val_use,
                 "epoch_time_sec": epoch_time_sec
             })
@@ -871,69 +968,135 @@ class AdaptiveGridSearch:
         logger.info(f"Saved {len(self.search_diagnostics)} search diagnostic rows to {file_path}")
 
     def save_evaluated_points(self, file_path):
-        if not self.evaluated_points:
-            logger.warning("AdaptiveGridSearch.evaluated_points is empty; nothing to save")
+        if not self.all_evaluated_points:
+            logger.warning("AdaptiveGridSearch.all_evaluated_points is empty; nothing to save")
             return
 
-        points = np.array(self.evaluated_points, dtype=float)
+        points = np.array(self.all_evaluated_points, dtype=float)
         np.savez(
             file_path,
             r_values=points[:, 0],
             usage_values=points[:, 1],
-            acc_values=points[:, 2]
+            acc_values=points[:, 2],
+            rerun_values=points[:, 3]
         )
-        logger.info(f"Saved {len(self.evaluated_points)} (r, usage, acc) points to {file_path}")
+        logger.info(f"Saved {len(self.all_evaluated_points)} (r, usage, acc, rerun) points to {file_path}")
+
+    def save_routing_snapshots(self, file_path):
+        if not self.routing_snapshots:
+            logger.warning("AdaptiveGridSearch.routing_snapshots is empty; nothing to save")
+            return
+
+        # latent_2d/boundary_xx/boundary_yy are identical for every snapshot (same
+        # fixed test-set lf_latent, same cached PCA/grid), so they're saved once
+        # rather than duplicated per snapshot; only boundary_zz (the actual
+        # per-gate-model decision field) legitimately varies.
+        latent_2d = self.latent_pca.transform(self.routing_snapshots[0]["lf_latent"])
+
+        np.savez(
+            file_path,
+            rerun=np.array([s["rerun"] for s in self.routing_snapshots]),
+            target_usage=np.array([s["target_usage"] for s in self.routing_snapshots]),
+            lf_latent=np.stack([s["lf_latent"] for s in self.routing_snapshots], axis=0),
+            lf_correct=np.stack([s["lf_correct"] for s in self.routing_snapshots], axis=0),
+            hf_correct=np.stack([s["hf_correct"] for s in self.routing_snapshots], axis=0),
+            choice=np.stack([s["choice"] for s in self.routing_snapshots], axis=0),
+            label=np.stack([s["label"] for s in self.routing_snapshots], axis=0),
+            latent_2d=latent_2d,
+            boundary_xx=self.boundary_xx,
+            boundary_yy=self.boundary_yy,
+            boundary_zz=np.stack([s["boundary_zz"] for s in self.routing_snapshots], axis=0)
+        )
+        logger.info(f"Saved {len(self.routing_snapshots)} routing snapshots to {file_path}")
 
     def evaluate_fe_model(self, r_val):
-        criterion = MetaLossFunction(
-            ch=[r_val],
-            cw=1,
-            device=self.device
-        )
-
         fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
         self.fe_model.load_state_dict(torch.load(fe_model_file, weights_only=True))
         self.fe_model = self.fe_model.to(self.device)
 
-        _, test_acc, test_use = classifier_one_run(
-            model=self.fe_model,
-            dataloader=self.test_dl,
-            criterion=criterion,
-            fidelity="gate",
-        )
+        # Single forward pass over the test set gets us test_acc/test_use *and*
+        # everything the routing/PCA plots need, in one shot — done here (right
+        # after loading this r_val's just-trained weights) rather than reloading
+        # the checkpoint later, since fe_model-{r_val}.pt gets overwritten by the
+        # next rerun that happens to land on the same r_val.
+        details = compute_gate_routing_details(self.fe_model, self.test_dl, self.device)
 
-        return test_acc, test_use
+        correct = np.where(details["choice"] == 1, details["hf_correct"], details["lf_correct"])
+        test_acc = float(correct.mean())
+        test_use = float(details["choice"].mean())
+
+        # Decision-boundary field for the PCA routing plot: fits/caches the PCA
+        # plane on first call, then runs *this* r_val's actual fe_model (still
+        # loaded above) over the plane's grid, reconstructed back to latent
+        # space — so the contour reflects the real model, not a re-fit proxy.
+        self._project_latent(details["lf_latent"])
+        details["boundary_zz"] = self._compute_decision_boundary()
+
+        return test_acc, test_use, details
 
     def find_r_for_target(self, usage, tolerance=1e-3):
         r_low, r_high, bracket_fallback_used = self.find_bracket(usage)
-        reruns = 0
+        bisection_passes = 0
         while r_high - r_low > tolerance:
-            reruns += 1
+            bisection_passes += 1
             r_mid = (r_low + r_high) / 2
             use_mid, acc_mid = self.train_fe_model(r_mid)
             self.evaluated_points.append((r_mid, use_mid, acc_mid))
+            self.all_evaluated_points.append((r_mid, use_mid, acc_mid, self.rerun_idx))
             if use_mid > usage:
                 r_low = r_mid
             else:
                 r_high = r_mid
 
-        test_acc, test_use = self.evaluate_fe_model(r_high)
+        test_acc, test_use, gate_details = self.evaluate_fe_model(r_high)
         test_acc *= 100
         test_use *= 100
 
+        self.routing_snapshots.append({
+            "rerun": self.rerun_idx,
+            "target_usage": usage,
+            **gate_details
+        })
+
         self.search_diagnostics.append({
-            "target_usage": usage, "reruns": reruns,
+            "rerun": self.rerun_idx, "target_usage": usage, "bisection_passes": bisection_passes,
             "bracket_fallback_used": bracket_fallback_used,
             "final_r": r_high, "final_test_usage": test_use, "final_test_acc": test_acc
         })
 
-        logger.info(f"\nTook {reruns} passes to find best r value")
+        logger.info(f"\nTook {bisection_passes} passes to find best r value")
         logger.info(f"For usage {usage}:")
         logger.info(f"\tBest r: {r_high}")
         logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]:.4f}")
         logger.info(f"\tTest usage: {test_use:.2f} / Test acc: {test_acc:.2f}")
 
         return r_high, test_acc, test_use
+
+    def run_reruns(self, usage_values, n_reruns):
+        """Runs the full usage_values sweep n_reruns times, resetting the live
+        bracket-search history (evaluated_points) at the start of each rerun so
+        every rerun is a genuinely independent search — not warm-started off a
+        previous rerun's bisection results, which would understate the true
+        run-to-run variance. epoch_log/search_diagnostics/all_evaluated_points
+        keep accumulating across every rerun (each row tagged via self.rerun_idx)
+        for full traceability.
+
+        Returns (usage_runs, acc_runs), each shape (n_reruns, len(usage_values)),
+        already on the 0-100 scale find_r_for_target reports.
+        """
+        usage_runs = np.zeros((n_reruns, len(usage_values)))
+        acc_runs = np.zeros((n_reruns, len(usage_values)))
+
+        for rerun_idx in range(n_reruns):
+            self.rerun_idx = rerun_idx
+            self.evaluated_points = []
+
+            for target_idx, target_usage in enumerate(usage_values):
+                _, test_acc, test_use = self.find_r_for_target(usage=target_usage)
+                usage_runs[rerun_idx, target_idx] = test_use
+                acc_runs[rerun_idx, target_idx] = test_acc
+
+        return usage_runs, acc_runs
     
 # def fe_svm_one_run(fe_m odel, hf_model, lf_model, dataloader, hf_weight, mode="train"):
 #     device = next(hf_model.parameters()).device

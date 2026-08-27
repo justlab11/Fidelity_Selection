@@ -4,8 +4,9 @@ dataset:
 
 latent_size: 128
 random_seed: 42
-run_comparisons: True
+run_comparisons: False
 train_body: True
+
 
 classifier_training:
   epochs: 200
@@ -13,12 +14,13 @@ classifier_training:
   loss_fun: CE
   lf_model: resnet
   hf_model: resnet
-  trained_lf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\src\results\bird_grayscale-resnet-resnet-42-128\models\lf_model.pt
-  trained_hf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\src\results\bird_grayscale-resnet-resnet-42-128\models\hf_model.pt
+  trained_lf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\src\results\bird_grayscale-resnet-resnet-42-128_GOOD\models\lf_model.pt
+  trained_hf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\src\results\bird_grayscale-resnet-resnet-42-128_GOOD\models\hf_model.pt
   
 fe_training:
   epochs: 40
   batch_size: 128
+  reruns: 1
 
   r_range:
     start: 0.0

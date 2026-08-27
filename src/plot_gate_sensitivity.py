@@ -149,6 +149,28 @@ def plot_zoom(r_sorted: np.ndarray, usage_sorted: np.ndarray, zoom_range, save_p
     logger.info(f"Saved zoomed usage plot to {save_path}")
 
 
+def plot_full_curve(r_sorted: np.ndarray, usage_sorted: np.ndarray, save_path: str) -> None:
+    """Same usage-vs-c_h curve as plot_zoom, but over the full sampled range
+    instead of a masked crossing window."""
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
+    fig.patch.set_facecolor("#fcfcfb")
+    ax.set_facecolor("#fcfcfb")
+    _style_axes(ax)
+
+    ax.plot(r_sorted, usage_sorted * 100, color=SERIES_COLOR, linewidth=2,
+             marker="o", markersize=5, markerfacecolor=SERIES_COLOR, markeredgewidth=0, zorder=3)
+
+    ax.set_xlabel("c_h", color=INK_SECONDARY)
+    ax.set_ylabel("Usage (%)", color=INK_PRIMARY)
+    ax.set_title("Usage vs c_h (full sampled range)", color=INK_PRIMARY, fontweight="bold")
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    logger.info(f"Saved full usage-vs-c_h plot to {save_path}")
+
+
 @click.command()
 @click.option("--results_folder", required=True, help="Experiment result dir, e.g. results/bird_grayscale-resnet-resnet-42-128")
 @click.option("--low", default=0.7, type=float, help="Lower usage bound for the zoom window (fraction, e.g. 0.7 = 70%)")
@@ -174,6 +196,8 @@ def main(results_folder, low, high, round_decimals, smooth_window):
 
     derivative = compute_usage_derivative(r_sorted, usage_sorted, smooth_window)
     plot_derivative(r_sorted, derivative, os.path.join(image_folder, "gate_sensitivity_derivative.png"))
+
+    plot_full_curve(r_sorted, usage_sorted, os.path.join(image_folder, "gate_sensitivity_full.png"))
 
     zoom_range = find_zoom_range(r_sorted, usage_sorted, low, high)
     plot_zoom(r_sorted, usage_sorted, zoom_range, os.path.join(image_folder, "gate_sensitivity_zoom.png"))
