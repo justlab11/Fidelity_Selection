@@ -120,7 +120,9 @@ class SelectiveNetMethod:
         else:
             raise ValueError(f"Unsupported aux_logits shape: {aux_logits.shape}")
 
-    def one_run(self, model, dataloader, hf_model, threshold=0.5, train_body=True, optimizer=None):
+    def one_run(self, model, dataloader, hf_model, threshold=0.5, train_body=True, optimizer=None, hf_input_mode: str = "concat"):
+        from helpers import assemble_hf_input
+
         is_training = bool(optimizer)
         model.train(mode=is_training)
         device = next(model.parameters()).device
@@ -178,7 +180,7 @@ class SelectiveNetMethod:
                     hf_correct = 0
                     abstained_mask = ~cascade_mask
                     if hf_model is not None and abstained_mask.sum() > 0:
-                        abstained_data = torch.cat([lf_data[abstained_mask], hf_data[abstained_mask]], dim=1)
+                        abstained_data = assemble_hf_input(lf_data[abstained_mask], hf_data[abstained_mask], hf_input_mode)
                         hf_layers = hf_model(abstained_data) if train_body else hf_model.head(abstained_data)
                         hf_pred = torch.argmax(hf_layers["output"], dim=1)
                         hf_correct = (hf_pred == target[abstained_mask]).sum().item()
@@ -213,7 +215,7 @@ class SelectiveNetMethod:
                     
                     if hf_model is not None and abstained_mask.sum() > 0:
                         # Run HF model on entire abstained images
-                        combined_data = torch.cat([lf_data[abstained_mask], hf_data[abstained_mask]], dim=1)
+                        combined_data = assemble_hf_input(lf_data[abstained_mask], hf_data[abstained_mask], hf_input_mode)
                         hf_layers = hf_model(combined_data) if train_body else hf_model.head(combined_data)
                         hf_output = hf_layers["output"]  # [num_abstained, C, H, W]
                         hf_pred = torch.argmax(hf_output, dim=1)  # [num_abstained, H, W]
@@ -301,7 +303,9 @@ class SelfAdaptiveTrainingMethod:
         loss = -(t_scalar * torch.log(p_true + eps) + (1 - t_scalar) * torch.log(p_abstain + eps))
         return loss.mean()
 
-    def one_run(self, model, dataloader, hf_model, tau=0.5, train_body=True, optimizer=None, epoch=0):
+    def one_run(self, model, dataloader, hf_model, tau=0.5, train_body=True, optimizer=None, epoch=0, hf_input_mode: str = "concat"):
+        from helpers import assemble_hf_input
+
         is_training = bool(optimizer)
         model.train(mode=is_training)
         device = next(model.parameters()).device
@@ -351,7 +355,7 @@ class SelfAdaptiveTrainingMethod:
                     correct = (own_pred[kept_mask] == target[kept_mask]).sum().item()
 
                     if hf_model is not None and escalate_mask.sum() > 0:
-                        escalated_data = torch.cat([lf_data[escalate_mask], hf_data[escalate_mask]], dim=1)
+                        escalated_data = assemble_hf_input(lf_data[escalate_mask], hf_data[escalate_mask], hf_input_mode)
                         hf_layers = hf_model(escalated_data) if train_body else hf_model.head(escalated_data)
                         hf_pred = torch.argmax(hf_layers["output"], dim=1)
                         correct += (hf_pred == target[escalate_mask]).sum().item()
@@ -388,7 +392,7 @@ class SelfAdaptiveTrainingMethod:
                     correct = (own_pred[kept_mask] == target[kept_mask]).sum().item()
 
                     if hf_model is not None and escalate_mask.sum() > 0:
-                        escalated_data = torch.cat([lf_data[escalate_mask], hf_data[escalate_mask]], dim=1)
+                        escalated_data = assemble_hf_input(lf_data[escalate_mask], hf_data[escalate_mask], hf_input_mode)
                         hf_layers = hf_model(escalated_data) if train_body else hf_model.head(escalated_data)
                         hf_pred = torch.argmax(hf_layers["output"], dim=1)
                         correct += (hf_pred == target[escalate_mask]).sum().item()

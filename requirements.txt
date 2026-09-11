@@ -5,3 +5,5 @@ click
 pydantic
 PyYAML
 psutil
+setuptools<81  # yolov5 (below) still imports the now-removed pkg_resources API
+yolov5

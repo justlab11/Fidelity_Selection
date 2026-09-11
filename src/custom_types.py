@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from typing import Literal, List
 import numpy as np
 
@@ -8,17 +8,26 @@ class SplitData(BaseModel):
     val: List[float]
 
 class DatasetSettings(BaseModel):
-    name: Literal["toy_2d", "toy_5d", "mnist_noise", "mnist_rotation", "bird_grayscale", "bird_color", "crop"]
+    name: Literal["toy_2d", "toy_5d", "mnist_noise", "mnist_rotation", "bird_grayscale", "bird_color", "crop", "llvip"]
     folder: str
 
 class ClassifierSettings(BaseModel):
     epochs: int
     batch_size: int
     loss_fun: Literal["CE"]
-    lf_model: Literal["mlp", "resnet", "vit", "unet"]
-    hf_model: Literal["mlp", "resnet", "vit", "unet"]
+    lf_model: Literal["mlp", "resnet", "vit", "unet", "yolo"]
+    hf_model: Literal["mlp", "resnet", "vit", "unet", "yolo"]
     trained_lf_model: str | None
     trained_hf_model: str | None
+    hf_input_mode: Literal["concat", "hf_only"] = "concat"
+
+    @model_validator(mode="after")
+    def check_yolo_requires_trained_model(self):
+        if self.lf_model == "yolo" and self.trained_lf_model is None:
+            raise ValueError("trained_lf_model must be set when lf_model is 'yolo'")
+        if self.hf_model == "yolo" and self.trained_hf_model is None:
+            raise ValueError("trained_hf_model must be set when hf_model is 'yolo'")
+        return self
 
 class ThresholdSettings(BaseModel):
     start: float
@@ -41,6 +50,15 @@ class ConfigOptions(BaseModel):
     train_body: bool
     classifier_training: ClassifierSettings
     fe_training: FESettings
+
+    @model_validator(mode="after")
+    def check_yolo_compatible_settings(self):
+        is_yolo = self.classifier_training.lf_model == "yolo" or self.classifier_training.hf_model == "yolo"
+        if is_yolo and not self.train_body:
+            raise ValueError("train_body must be True when lf_model/hf_model is 'yolo' - YOLO has no separate head to precompute body outputs for")
+        if is_yolo and self.run_comparisons:
+            raise ValueError("run_comparisons must be False when lf_model/hf_model is 'yolo' - the SelectiveNet/SAT/SR baselines assume classification-shaped models")
+        return self
 
 class FEResult(BaseModel):
     r: float

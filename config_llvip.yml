@@ -1,0 +1,31 @@
+dataset:
+  name: llvip
+  folder: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/data/LLVIP
+
+latent_size: 512
+random_seed: 42
+run_comparisons: False # must stay False for yolo - SelectiveNet/SAT/SR baselines assume classification-shaped models
+train_body: True # must stay True for yolo - there's no separate head to precompute body outputs for
+
+
+classifier_training:
+  epochs: 200 # ignored - both models are pretrained YOLO checkpoints, never trained here
+  batch_size: 8 # smaller than the resnet default - 640x640 images through YOLOv5 use much more memory
+  loss_fun: CE
+  hf_input_mode: hf_only # ignored for yolo - the HF model always gets the raw infrared image, never LF+HF concat
+  lf_model: yolo
+  hf_model: yolo
+  trained_lf_model: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/models/yolov5_visible.pt
+  trained_hf_model: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/models/yolov5_infrared.pt
+
+fe_training:
+  epochs: 40
+  batch_size: 128
+  reruns: 1
+
+  r_range:
+    start: 0.0
+    stop: 1.0
+    num_steps: 100
+    scale: linear
+    direction: reversed # normal: 0 -> 1, reversed 1 -> 0

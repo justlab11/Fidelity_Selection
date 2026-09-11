@@ -13,11 +13,12 @@ from torch.utils.data import DataLoader
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
 from scipy.optimize import minimize
 
-from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset
+from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset, LLVIPDataset
 from custom_types import ConfigOptions, FEResult
-from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead
+from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead, build_yolov5, YOLOv5FidelityModel
 from losses import MetaLossFunction
 from comparisons import SelectiveNetMethod
 
@@ -311,13 +312,35 @@ def build_dataset(dataset_name: str, seed: int, folder="../data"):
             val_ds.mean = mean
             val_ds.std = std
 
+        # https://bupt-ai-cz.github.io/LLVIP/
+        # paired visible/infrared pedestrian-detection dataset
+        # lf = visible; hf = infrared
+        case "llvip":
+            train_ds = LLVIPDataset(
+                root=folder,
+                split="train",
+                seed=seed,
+            )
+
+            test_ds = LLVIPDataset(
+                root=folder,
+                split="test",
+                seed=seed,
+            )
+
+            val_ds = LLVIPDataset(
+                root=folder,
+                split="val",
+                seed=seed,
+            )
+
         case _:
             logger.error("Dataset Name is invalid")
             raise ValueError("Dataset Name is invalid")
-        
+
     return train_ds, test_ds, val_ds
 
-def build_model(model_name, latent_size, output_size, input_size=None):
+def build_model(model_name, latent_size, output_size, input_size=None, weights_path=None, device="cpu"):
     match model_name:
         # multilayer perceptron used for toy dataset case
         case "mlp":
@@ -327,7 +350,7 @@ def build_model(model_name, latent_size, output_size, input_size=None):
 
             model = CustomMLP(
                 input_size=input_size,
-                num_layers=2,
+                num_layers=4,
                 output_size=output_size,
                 hidden_size=latent_size
             )
@@ -369,7 +392,107 @@ def build_model(model_name, latent_size, output_size, input_size=None):
                 num_classes=output_size
             )
 
+        # YOLOv5 detection model used for the LLVIP pedestrian-detection dataset.
+        # Unlike the other cases, this doesn't build a fresh model to be trained -
+        # it loads a pretrained checkpoint directly, so weights_path is required
+        # (this is why ClassifierSettings enforces trained_lf_model/trained_hf_model
+        # be set in the config whenever lf_model/hf_model is "yolo").
+        case "yolo":
+            if weights_path is None:
+                logger.error("Parameter weights_path must be set for this model")
+                raise ValueError("Parameter weights_path must be set for this model")
+
+            model = build_yolov5(
+                weights_path=weights_path,
+                device=device
+            )
+
     return model
+
+def assemble_hf_input(lf_data, hf_data, hf_input_mode: str, hf_model: nn.Module = None):
+    """Build the tensor fed into the HF model, per the configured input mode."""
+    if isinstance(hf_model, YOLOv5FidelityModel):
+        # YOLOv5's backbone expects a plain 3-channel image - hf_input_mode's
+        # "concat" (LF+HF channels stacked) doesn't apply to a pretrained
+        # detection checkpoint, so always hand it the raw HF-modality image.
+        return hf_data
+
+    if hf_input_mode == "concat":
+        return torch.cat([lf_data, hf_data], dim=1)
+    elif hf_input_mode == "hf_only":
+        return hf_data
+    else:
+        raise ValueError(f"Invalid hf_input_mode: {hf_input_mode}")
+
+def compute_yolo_detection_correctness(
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+        img_size,
+        conf_thres: float = 0.25,
+        nms_iou_thres: float = 0.45,
+        match_iou_thres: float = 0.5,
+        required_recall: float = 0.5):
+    """Turns raw YOLO detection output into a per-image correctness signal, so it
+    can stand in for classification's "argmax(output) == target" everywhere else
+    in the pipeline (gate routing, FE/gate loss, reported accuracy).
+
+    Args:
+    - preds: (B, num_anchors, 5+num_classes) raw model output, pre-NMS.
+    - targets: (B, max_boxes, 5) padded [cls, xc, yc, w, h] ground truth, with
+      xc/yc/w/h normalized to [0, 1] (LLVIPDataset's convention) and unused rows
+      padded with a class of -1.
+    - img_size: (H, W) of the letterboxed input preds/targets were computed
+      against - used to un-normalize target boxes into the pixel space
+      non_max_suppression's output is already in.
+
+    An image counts as "correct" if at least `required_recall` of its ground-
+    truth boxes are matched (IoU >= match_iou_thres, greedy by detection
+    confidence) by a surviving detection. This is a deliberately simple stand-in
+    for real mAP-based detection scoring, not a publication-grade metric - tune
+    required_recall/match_iou_thres/conf_thres to taste.
+
+    Returns a (B,) float tensor of 1.0/0.0 per image.
+    """
+    from yolov5.utils.general import non_max_suppression, xywh2xyxy, box_iou
+
+    h, w = img_size
+    scale = torch.tensor([w, h, w, h], device=targets.device, dtype=targets.dtype)
+
+    detections = non_max_suppression(preds, conf_thres=conf_thres, iou_thres=nms_iou_thres)
+
+    correct = torch.zeros(preds.size(0), dtype=torch.float32)
+    for i, det in enumerate(detections):
+        valid = targets[i, :, 0] >= 0
+        gt_boxes = xywh2xyxy(targets[i, valid, 1:5] * scale)
+        num_gt = gt_boxes.size(0)
+
+        if num_gt == 0:
+            correct[i] = 1.0 if det.size(0) == 0 else 0.0
+            continue
+
+        if det.size(0) == 0:
+            correct[i] = 0.0
+            continue
+
+        ious = box_iou(det[:, :4], gt_boxes)  # (num_det, num_gt)
+        order = torch.argsort(det[:, 4], descending=True)
+        matched_gt = torch.zeros(num_gt, dtype=torch.bool, device=ious.device)
+        matched_count = 0
+
+        for d in order:
+            if matched_gt.all():
+                break
+            row = ious[d].clone()
+            row[matched_gt] = -1
+            best_gt = torch.argmax(row)
+            if row[best_gt] >= match_iou_thres:
+                matched_gt[best_gt] = True
+                matched_count += 1
+
+        recall = matched_count / num_gt
+        correct[i] = 1.0 if recall >= required_recall else 0.0
+
+    return correct
 
 def compute_gate_routing_details(model, dataloader, device):
     """One no-grad pass over a "gate"-fidelity dataloader (lf_embeddings, lf_preds,
@@ -378,8 +501,11 @@ def compute_gate_routing_details(model, dataloader, device):
     "HF needed" / "LF fine" labels and the routing confusion counts, without
     duplicating classifier_one_run's loss/aggregate-accuracy bookkeeping.
 
-    Assumes lf_embeddings is a flat (B, latent_dim) vector — true for the
-    classification FE model ("mlp"), not for the segmentation "cnn_head" case.
+    lf_embeddings may be flat (B, latent_dim) for an "mlp" gate or spatial
+    (B, C, H, W) for a "cnn_head" gate (segmentation, or YOLO's unpooled
+    backbone feature) - model(lf_embeddings) doesn't care either way, and
+    AdaptiveGridSearch._project_latent flattens per-sample before its PCA/
+    logistic-regression projection fit.
     """
     model.eval()
 
@@ -408,7 +534,7 @@ def compute_gate_routing_details(model, dataloader, device):
         "label": np.concatenate(labels, axis=0),
     }
 
-def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, optimizer=None, scheduler=None):
+def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, optimizer=None, scheduler=None, hf_input_mode: str = "concat", grad_clip_norm: float = None):
     """
     Perform one run through the DataLoader.
 
@@ -435,9 +561,20 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
 
     if fidelity == "lf":
         for data, _, target in dataloader:
-            target = target.type(torch.LongTensor)
-            data, target = data.to(device, torch.float), target.to(device)
-            
+            data = data.to(device, torch.float)
+
+            if isinstance(model, YOLOv5FidelityModel):
+                target = target.to(device)
+                output = model(data)["output"]
+                correct = compute_yolo_detection_correctness(output, target, img_size=data.shape[-2:])
+
+                total_loss += (1 - correct).sum().item()
+                total_correct += correct.sum().item()
+                total_samples += data.size(0)
+                continue
+
+            target = target.type(torch.LongTensor).to(device)
+
             if train_body:
                 output = model(data)["output"]
 
@@ -448,6 +585,8 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
             if optimizer:
                 optimizer.zero_grad()
                 loss.backward()
+                if grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
             total_loss += loss.item() * data.size(0)
@@ -466,9 +605,20 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
 
     elif fidelity == "hf":
         for lf_data, hf_data, target in dataloader:
-            target = target.type(torch.LongTensor)
-            data = torch.cat([lf_data, hf_data], dim=1) if train_body else hf_data
-            data, target = data.to(device, torch.float), target.to(device)
+            data = assemble_hf_input(lf_data, hf_data, hf_input_mode, hf_model=model) if train_body else hf_data
+            data = data.to(device, torch.float)
+
+            if isinstance(model, YOLOv5FidelityModel):
+                target = target.to(device)
+                output = model(data)["output"]
+                correct = compute_yolo_detection_correctness(output, target, img_size=data.shape[-2:])
+
+                total_loss += (1 - correct).sum().item()
+                total_correct += correct.sum().item()
+                total_samples += data.size(0)
+                continue
+
+            target = target.type(torch.LongTensor).to(device)
 
             if train_body:
                 output = model(data)["output"]
@@ -480,6 +630,8 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
             if optimizer:
                 optimizer.zero_grad()
                 loss.backward()
+                if grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
             total_loss += loss.item() * data.size(0)
@@ -515,6 +667,8 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
             if optimizer:
                 optimizer.zero_grad()
                 loss.backward()
+                if grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
             choices = torch.argmax(outputs, dim=1)
@@ -539,11 +693,12 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
 
 def save_body(
         lf_model: nn.Module,
-        hf_model: nn.Module,  
+        hf_model: nn.Module,
         dataloader: DataLoader,
-        save_folder: str, 
-        device):
-    
+        save_folder: str,
+        device,
+        hf_input_mode: str = "concat"):
+
     lf_model = lf_model.to(device)
     hf_model = hf_model.to(device)
     os.mkdir(save_folder)
@@ -553,7 +708,7 @@ def save_body(
 
     with torch.no_grad():
         for batch_idx, (lf_sample, hf_sample, label) in enumerate(dataloader):
-            hf_sample = torch.cat([lf_sample, hf_sample], dim=1)
+            hf_sample = assemble_hf_input(lf_sample, hf_sample, hf_input_mode, hf_model=hf_model)
 
             lf_sample = lf_sample.to(device)
             hf_sample = hf_sample.to(device)
@@ -565,9 +720,14 @@ def save_body(
 
             batch_size = lf_out_batch.size(0)
             for i in range(batch_size):
-                lf_out = lf_out_batch[i]
-                hf_out = hf_out_batch[i]
-                label = labels_batch[i]
+                # .clone() detaches each sample into its own storage - without
+                # it, lf_out_batch[i] is a view still sharing the *whole batch's*
+                # underlying storage, so torch.save would silently serialize
+                # every sibling sample into each per-sample file too (an easy-to-
+                # miss ~batch_size x disk/IO blowup).
+                lf_out = lf_out_batch[i].clone()
+                hf_out = hf_out_batch[i].clone()
+                label = labels_batch[i].clone()
 
                 torch.save({
                     "lf_body_output": lf_out,
@@ -579,11 +739,12 @@ def save_body(
 
 def save_latent(
         lf_model: nn.Module,
-        hf_model: nn.Module,  
+        hf_model: nn.Module,
         dataloader: DataLoader,
-        save_folder: str, 
+        save_folder: str,
         train_body: bool,
-        device="cpu"):
+        device="cpu",
+        hf_input_mode: str = "concat"):
 
     lf_model = lf_model.to(device)
     hf_model = hf_model.to(device)
@@ -592,9 +753,14 @@ def save_latent(
     lf_model.eval()
     hf_model.eval()
 
+    lf_is_yolo = isinstance(lf_model, YOLOv5FidelityModel)
+    hf_is_yolo = isinstance(hf_model, YOLOv5FidelityModel)
+    if lf_is_yolo != hf_is_yolo:
+        raise ValueError("Mixing a YOLO model with a non-YOLO model across lf/hf is not supported")
+
     with torch.no_grad():
         for batch_idx, (lf, hf, labels) in enumerate(dataloader):
-            hf = torch.cat([lf, hf], dim=1)
+            hf = assemble_hf_input(lf, hf, hf_input_mode, hf_model=hf_model)
 
             lf = lf.to(device)
             hf = hf.to(device)
@@ -606,26 +772,48 @@ def save_latent(
             else:
                 lf_head = lf_model.head(lf)
                 hf_head = hf_model.head(hf)
-            
+
 
             lf_latent = lf_head["latent"]
-            lf_output = lf_head["output"]
 
-            # Pass hf through hf_model head (latent + output)
-            hf_output = hf_head["output"]
+            if lf_is_yolo:
+                # Redefine what "lf_output"/"hf_output"/"label" mean for a YOLO
+                # cascade: instead of raw class logits, store a per-image
+                # [incorrect, correct] pair (see compute_yolo_detection_correctness)
+                # and a constant target of 1 ("correct" is always the true class).
+                # argmax([1-correct, correct]) == 1 then reproduces `correct`
+                # exactly, so every downstream consumer (compute_gate_routing_details,
+                # the gate's CE loss, the routing plots) keeps working unmodified.
+                lf_correct = compute_yolo_detection_correctness(lf_head["output"], labels, img_size=lf.shape[-2:])
+                hf_correct = compute_yolo_detection_correctness(hf_head["output"], labels, img_size=hf.shape[-2:])
+
+                lf_output = torch.stack([1 - lf_correct, lf_correct], dim=1)
+                hf_output = torch.stack([1 - hf_correct, hf_correct], dim=1)
+                labels = torch.ones(lf.size(0), dtype=torch.long)
+            else:
+                lf_output = lf_head["output"]
+
+                # Pass hf through hf_model head (latent + output)
+                hf_output = hf_head["output"]
+                labels = labels.cpu()
 
             lf_latent = lf_latent.cpu()
             lf_output = lf_output.cpu()
             hf_output = hf_output.cpu()
-            labels = labels.cpu()
 
             batch_size = lf_latent.size(0)
             for i in range(batch_size):
+                # .clone() detaches each sample into its own storage - without
+                # it, lf_latent[i] is a view still sharing the *whole batch's*
+                # underlying storage, so torch.save would silently serialize
+                # every sibling sample into each per-sample file too (an easy-to-
+                # miss ~batch_size x disk/IO blowup - severe once lf_latent is a
+                # large spatial (C, H, W) map rather than a small flat vector).
                 torch.save({
-                    "lf_latent": lf_latent[i],
-                    "lf_output": lf_output[i],
-                    "hf_output": hf_output[i],
-                    "label": labels[i]
+                    "lf_latent": lf_latent[i].clone(),
+                    "lf_output": lf_output[i].clone(),
+                    "hf_output": hf_output[i].clone(),
+                    "label": labels[i].clone()
                 }, os.path.join(save_folder, f"sample_{batch_idx}_{i}.pt"))
 
     logger.info(f"Finished saving split to {save_folder}")
@@ -647,6 +835,29 @@ def reset_all_weights(model):
         if hasattr(m, 'reset_parameters'):
             m.reset_parameters()
     model.apply(weight_reset)
+
+def gate_logit_stats(model, dataloader, device):
+    """Min/max/mean-abs of the gate model's raw routing logits over one pass.
+    Diagnostic for softmax saturation during gate training - a routing MLP whose
+    logits blow up to e.g. [+50, -50] underflows softmax to exactly (1.0, 0.0) in
+    float32, killing the gradient for good. Watching these values climb toward
+    the tens/hundreds while val_usage/val_loss go flat is the signature of that
+    collapse (see AdaptiveGridSearch.train_fe_model's epoch_log).
+    """
+    model.eval()
+    logit_min, logit_max, abs_sum, count = float("inf"), float("-inf"), 0.0, 0
+
+    with torch.no_grad():
+        for lf_embeddings, _, _, _ in dataloader:
+            lf_embeddings = lf_embeddings.to(device, torch.float)
+            outputs = model(lf_embeddings)["output"]
+
+            logit_min = min(logit_min, outputs.min().item())
+            logit_max = max(logit_max, outputs.max().item())
+            abs_sum += outputs.abs().sum().item()
+            count += outputs.numel()
+
+    return logit_min, logit_max, abs_sum / count
 
 class GaussianProcessSearch:
     def __init__(self, fe_model, device, train_dl, val_dl, test_dl, model_folder):
@@ -803,7 +1014,9 @@ class GaussianProcessSearch:
         return best_point
 
 class AdaptiveGridSearch:
-    def __init__(self, fe_model, device, train_dl, val_dl, test_dl, model_folder):
+    def __init__(
+            self, fe_model, device, train_dl, val_dl, test_dl, model_folder,
+            class_weighted_loss=False, gate_epochs=30, gate_lr=3e-4, gate_grad_clip_norm=None):
         # evaluated_points is reset at the start of every rerun (see run_reruns) so
         # each rerun's bracket search is a genuinely independent sweep, not warm-
         # started off a previous rerun's history. all_evaluated_points pools every
@@ -815,7 +1028,7 @@ class AdaptiveGridSearch:
         self.search_diagnostics = []
         # One entry per find_r_for_target call: the final gate model's per-sample
         # routing decision + both models' correctness, tagged by rerun/target_usage.
-        # Feeds the PCA routing plot and the routing confusion-table plot.
+        # Feeds the routing projection plot and the routing confusion-table plot.
         self.routing_snapshots = []
         self.rerun_idx = 0
         self.fe_model = fe_model
@@ -824,21 +1037,74 @@ class AdaptiveGridSearch:
         self.val_dl = val_dl
         self.test_dl = test_dl
         self.model_folder = model_folder
+        self.class_weighted_loss = class_weighted_loss
+        self.gate_epochs = gate_epochs
+        self.gate_lr = gate_lr
+        self.gate_grad_clip_norm = gate_grad_clip_norm
 
         # lf_latent is the same fixed test-set data on every call (it's precomputed
-        # LF-model output, independent of the gate model), so the PCA basis is
-        # fit once and reused everywhere — every snapshot's 2D coordinates line
+        # LF-model output, independent of the gate model), so the projection basis
+        # is fit once and reused everywhere — every snapshot's 2D coordinates line
         # up in the same space.
-        self.latent_pca = None
+        self.proj_mean = None
+        self.proj_basis = None  # (latent_dim, 2), orthonormal columns
         self.boundary_xx = None
         self.boundary_yy = None
+        # Per-sample shape of the real (possibly spatial) latent, e.g. (1024,)
+        # for a flat mlp-gate latent or (1024, 20, 20) for a cnn_head-gate's
+        # spatial one — needed to reshape the flattened projection basis's
+        # reconstructions back into what self.fe_model actually expects.
+        self.latent_sample_shape = None
 
-    def _project_latent(self, lf_latent, grid_size=120, pad_frac=0.05):
-        """Fits (once) a 2D PCA basis on lf_latent and a matching decision-
-        boundary meshgrid in that PCA plane. Returns (coords_2d, xx, yy)."""
-        if self.latent_pca is None:
-            self.latent_pca = PCA(n_components=2)
-            coords_2d = self.latent_pca.fit_transform(lf_latent)
+    def _project_latent(self, lf_latent, hf_needed=None, grid_size=120, pad_frac=0.05):
+        """Fits (once) a 2D linear basis on lf_latent and a matching decision-
+        boundary meshgrid in that plane. Returns coords_2d.
+
+        Unlike plain PCA (which picks the directions of highest variance in
+        lf_latent, with no reason to align with where the gate actually
+        disagrees with itself), this basis is supervised: axis 1 is the
+        logistic-regression direction that best separates hf_needed from
+        lf_fine, axis 2 is the top PCA direction of what's left after removing
+        axis 1 (so it's orthogonal to axis 1 and still soaks up leftover
+        structure). The basis stays linear and exactly invertible — same as
+        PCA — so _compute_decision_boundary's inverse-transform trick (running
+        the real fe_model over reconstructed latents) still holds.
+
+        lf_latent may be spatial (e.g. a cnn_head gate's (N, C, H, W) YOLO/UNet
+        feature map, not just an mlp gate's flat (N, D) vector) - it's flattened
+        per-sample here purely for this 2D visualization; the real routing
+        decisions elsewhere always use the true spatial latent unflattened.
+        """
+        self.latent_sample_shape = lf_latent.shape[1:]
+        lf_latent_flat = lf_latent.reshape(lf_latent.shape[0], -1)
+
+        if self.proj_basis is None:
+            if hf_needed is None:
+                raise ValueError("hf_needed labels are required to fit the projection basis")
+
+            self.proj_mean = lf_latent_flat.mean(axis=0)
+            centered = lf_latent_flat - self.proj_mean
+
+            # Logistic regression on standardized features for a well-conditioned
+            # fit, then rescale the coefficients back into raw latent units so
+            # axis1 is a direction we can apply directly to `centered`.
+            std = centered.std(axis=0)
+            std[std == 0] = 1
+            clf = LogisticRegression(max_iter=1000)
+            clf.fit(centered / std, hf_needed.astype(int))
+            axis1 = clf.coef_[0] / std
+            axis1 /= np.linalg.norm(axis1)
+
+            # Remove axis1's component, then take the top PCA direction of the
+            # residual — orthogonal to axis1 by construction.
+            residual = centered - np.outer(centered @ axis1, axis1)
+            pca_resid = PCA(n_components=1)
+            pca_resid.fit(residual)
+            axis2 = pca_resid.components_[0]
+            axis2 /= np.linalg.norm(axis2)
+
+            self.proj_basis = np.stack([axis1, axis2], axis=1)
+            coords_2d = centered @ self.proj_basis
 
             x_min, x_max = coords_2d[:, 0].min(), coords_2d[:, 0].max()
             y_min, y_max = coords_2d[:, 1].min(), coords_2d[:, 1].max()
@@ -849,21 +1115,24 @@ class AdaptiveGridSearch:
                 np.linspace(y_min - y_pad, y_max + y_pad, grid_size)
             )
         else:
-            coords_2d = self.latent_pca.transform(lf_latent)
+            coords_2d = (lf_latent_flat - self.proj_mean) @ self.proj_basis
 
         return coords_2d
 
     def _compute_decision_boundary(self):
         """Runs the *actual* trained self.fe_model (not a proxy classifier) over
-        grid points in the cached PCA plane, reconstructed back to the real
-        latent dimensionality via inverse_transform. This is a genuine slice of
-        the real decision surface through that 2D plane — necessarily an
-        approximation (the plane can't capture the other latent_dim-2 axes), but
-        it reflects the model's own nonlinearity rather than a re-fit linear
-        stand-in.
+        grid points in the cached projection plane, reconstructed back to the
+        real latent dimensionality via the basis's transpose (exact since the
+        basis columns are orthonormal). This is a genuine slice of the real
+        decision surface through that 2D plane — necessarily an approximation
+        (the plane can't capture the other latent_dim-2 axes), but it reflects
+        the model's own nonlinearity rather than a re-fit linear stand-in.
         """
         grid_2d = np.column_stack([self.boundary_xx.ravel(), self.boundary_yy.ravel()])
-        grid_latent = self.latent_pca.inverse_transform(grid_2d).astype(np.float32)
+        grid_latent = (self.proj_mean + grid_2d @ self.proj_basis.T).astype(np.float32)
+        # Reshape the flat reconstruction back into whatever shape self.fe_model
+        # actually expects (flat for an mlp gate, spatial for a cnn_head one).
+        grid_latent = grid_latent.reshape((-1,) + self.latent_sample_shape)
 
         self.fe_model.eval()
         with torch.no_grad():
@@ -894,19 +1163,20 @@ class AdaptiveGridSearch:
         criterion = MetaLossFunction(
             ch=[r_val],
             cw=1,
-            device=self.device
+            device=self.device,
+            class_weighted=self.class_weighted_loss
         )
 
         reset_all_weights(self.fe_model)
         self.fe_model = self.fe_model.to(self.device)
-        fe_optimizer = torch.optim.Adam(self.fe_model.parameters(), lr=3e-4, weight_decay=1e-5)
+        fe_optimizer = torch.optim.Adam(self.fe_model.parameters(), lr=self.gate_lr, weight_decay=1e-5)
 
         best_val_loss = float('inf')
         best_val_acc = None
         best_val_use = None
         fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
 
-        for epoch in range(30):
+        for epoch in range(self.gate_epochs):
             epoch_start = time.perf_counter()
 
             train_loss, _, _ = classifier_one_run(
@@ -914,7 +1184,8 @@ class AdaptiveGridSearch:
                 dataloader=self.train_dl,
                 criterion=criterion,
                 fidelity="gate",
-                optimizer=fe_optimizer
+                optimizer=fe_optimizer,
+                grad_clip_norm=self.gate_grad_clip_norm
             )
 
             val_loss, val_acc, val_use = classifier_one_run(
@@ -924,14 +1195,30 @@ class AdaptiveGridSearch:
                 fidelity="gate",
             )
 
+            # Diagnostic: min/max/mean-abs of the gate's raw routing logits. Climbing
+            # toward the tens/hundreds while val_usage/val_loss go flat is the
+            # signature of softmax saturation killing the gradient - see gate_logit_stats.
+            logit_min, logit_max, logit_absmean = gate_logit_stats(self.fe_model, self.val_dl, self.device)
+
             epoch_time_sec = time.perf_counter() - epoch_start
 
             if not math.isfinite(val_loss):
                 logger.warning(f"Non-finite val_loss ({val_loss}) training gate model at r_val={r_val}, epoch={epoch}")
 
+            # Live progress - previously the only record of gate training was
+            # self.epoch_log, written to gate_epoch_metrics.csv once at the very
+            # end of the whole run, so a long search gave zero visibility into
+            # whether it was progressing or stuck.
+            logger.info(
+                f"[gate rerun={self.rerun_idx} r={r_val:.6f}] epoch {epoch + 1}/{self.gate_epochs} "
+                f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} "
+                f"val_usage={val_use:.4f} logit_absmean={logit_absmean:.2f} ({epoch_time_sec:.2f}s/epoch)"
+            )
+
             self.epoch_log.append({
                 "rerun": self.rerun_idx, "r_val": r_val, "epoch": epoch, "train_loss": train_loss,
                 "val_loss": val_loss, "val_acc": val_acc, "val_usage": val_use,
+                "logit_min": logit_min, "logit_max": logit_max, "logit_absmean": logit_absmean,
                 "epoch_time_sec": epoch_time_sec
             })
 
@@ -987,17 +1274,23 @@ class AdaptiveGridSearch:
             logger.warning("AdaptiveGridSearch.routing_snapshots is empty; nothing to save")
             return
 
-        # latent_2d/boundary_xx/boundary_yy are identical for every snapshot (same
-        # fixed test-set lf_latent, same cached PCA/grid), so they're saved once
-        # rather than duplicated per snapshot; only boundary_zz (the actual
-        # per-gate-model decision field) legitimately varies.
-        latent_2d = self.latent_pca.transform(self.routing_snapshots[0]["lf_latent"])
+        # lf_latent/latent_2d/boundary_xx/boundary_yy are identical for every
+        # snapshot (same fixed test-set lf_latent, same cached projection
+        # basis/grid), so they're saved once rather than duplicated per snapshot
+        # (this matters a lot once lf_latent is a spatial (C, H, W) feature map
+        # instead of a small flat vector — duplicating it per snapshot would
+        # multiply the file size by len(usage_values) * n_reruns for nothing);
+        # only boundary_zz (the actual per-gate-model decision field) legitimately varies.
+        lf_latent_flat = self.routing_snapshots[0]["lf_latent"].reshape(
+            self.routing_snapshots[0]["lf_latent"].shape[0], -1
+        )
+        latent_2d = (lf_latent_flat - self.proj_mean) @ self.proj_basis
 
         np.savez(
             file_path,
             rerun=np.array([s["rerun"] for s in self.routing_snapshots]),
             target_usage=np.array([s["target_usage"] for s in self.routing_snapshots]),
-            lf_latent=np.stack([s["lf_latent"] for s in self.routing_snapshots], axis=0),
+            lf_latent=self.routing_snapshots[0]["lf_latent"],
             lf_correct=np.stack([s["lf_correct"] for s in self.routing_snapshots], axis=0),
             hf_correct=np.stack([s["hf_correct"] for s in self.routing_snapshots], axis=0),
             choice=np.stack([s["choice"] for s in self.routing_snapshots], axis=0),
@@ -1015,7 +1308,7 @@ class AdaptiveGridSearch:
         self.fe_model = self.fe_model.to(self.device)
 
         # Single forward pass over the test set gets us test_acc/test_use *and*
-        # everything the routing/PCA plots need, in one shot — done here (right
+        # everything the routing/projection plots need, in one shot — done here (right
         # after loading this r_val's just-trained weights) rather than reloading
         # the checkpoint later, since fe_model-{r_val}.pt gets overwritten by the
         # next rerun that happens to land on the same r_val.
@@ -1025,11 +1318,14 @@ class AdaptiveGridSearch:
         test_acc = float(correct.mean())
         test_use = float(details["choice"].mean())
 
-        # Decision-boundary field for the PCA routing plot: fits/caches the PCA
-        # plane on first call, then runs *this* r_val's actual fe_model (still
-        # loaded above) over the plane's grid, reconstructed back to latent
-        # space — so the contour reflects the real model, not a re-fit proxy.
-        self._project_latent(details["lf_latent"])
+        # Decision-boundary field for the routing plot: fits/caches the
+        # projection plane on first call (using this call's ground truth to
+        # pick a separating basis), then runs *this* r_val's actual fe_model
+        # (still loaded above) over the plane's grid, reconstructed back to
+        # latent space — so the contour reflects the real model, not a re-fit
+        # proxy.
+        hf_needed = details["hf_correct"] & ~details["lf_correct"]
+        self._project_latent(details["lf_latent"], hf_needed)
         details["boundary_zz"] = self._compute_decision_boundary()
 
         return test_acc, test_use, details

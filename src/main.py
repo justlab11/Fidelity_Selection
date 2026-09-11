@@ -25,7 +25,7 @@ from plot_gate_sensitivity import (
     plot_derivative, find_zoom_range, plot_zoom, plot_full_curve, report_max_usage
 )
 from plot_gate_routing import (
-    load_routing_snapshots, compute_oracle_curve, plot_pca_routing_grid, plot_routing_table_grid
+    load_routing_snapshots, compute_oracle_curve, plot_routing_projection_grid, plot_routing_table_grid
 )
 from plot_pareto_curves import load_pareto_curves, render_pareto_plot
 
@@ -50,6 +50,22 @@ def main(config_file):
     hf_model_name: str = config.classifier_training.hf_model
     run_comparisons: bool = config.run_comparisons
     train_body: bool = config.train_body if dataset_name != "crop" else True
+    hf_input_mode: str = config.classifier_training.hf_input_mode
+
+    # yolov5's own module-level logging setup (triggered the first time it's
+    # imported anywhere - e.g. by LLVIPDataset or build_model's "yolo" case,
+    # both deferred imports) calls logging.config.dictConfig(), which
+    # unconditionally closes every currently registered logging handler
+    # process-wide (a documented dictConfig quirk: disable_existing_loggers
+    # only protects loggers from being disabled, not handlers from being
+    # closed). If that first import happens *after* our own logging.basicConfig
+    # below, it silently kills the file handler and every log message from
+    # then on goes nowhere - no exception, no warning, the run just stops
+    # appearing in experiment.log while continuing to execute. Importing
+    # yolov5 here, before our own basicConfig, makes its one-time logging setup
+    # happen first, so ours is what's left standing afterward.
+    if lf_model_name == "yolo" or hf_model_name == "yolo":
+        import yolov5  # noqa: F401
 
     # create folders for the dataset
     folder_name: str = os.path.join("results", f"{dataset_name}-{lf_model_name}-{hf_model_name}-{seed}-{latent_size}")
@@ -149,25 +165,43 @@ def main(config_file):
     hf_input_size: int = train_ds.get_hf_input_size()
     output_size: int = train_ds.get_num_classes()
 
+    # YOLO isn't trained fresh like the other model types - the checkpoint itself
+    # is what gets built (see helpers.build_model's "yolo" case), so its weights
+    # path has to be resolved before building rather than loaded via
+    # load_state_dict afterward. ClassifierSettings' validator already guarantees
+    # trained_lf_model/trained_hf_model is set whenever lf_model/hf_model is "yolo".
+    lf_weights_path: str | None = os.path.abspath(config.classifier_training.trained_lf_model) \
+        if lf_model_name == "yolo" else None
+    hf_weights_path: str | None = os.path.abspath(config.classifier_training.trained_hf_model) \
+        if hf_model_name == "yolo" else None
+
     lf_model: nn.Module = build_model(
         model_name=lf_model_name,
         input_size=lf_input_size,
         output_size=output_size,
-        latent_size=latent_size
+        latent_size=latent_size,
+        weights_path=lf_weights_path,
+        device=DEVICE
     )
+
+    # HF model's input size depends on hf_input_mode: "concat" feeds it the LF+HF
+    # channels concatenated (see classifier_one_run's "hf" fidelity and the
+    # SelectiveNet/SAT cascades), so its input size is the sum; "hf_only" feeds it
+    # just the HF channels, matching checkpoints pretrained on HF-only features.
+    # (Irrelevant for "yolo" - build_model ignores input_size for that case.)
+    hf_model_input_size: int = lf_input_size + hf_input_size if hf_input_mode == "concat" else hf_input_size
 
     hf_model: nn.Module = build_model(
         model_name=hf_model_name,
-        # HF model consumes the LF+HF channels concatenated (see classifier_one_run's
-        # "hf" fidelity and the SelectiveNet/SAT cascades), so its input size is the sum,
-        # not hf_input_size alone — get_hf_input_size() reports the HF-only channel count.
-        input_size=lf_input_size + hf_input_size,
+        input_size=hf_model_input_size,
         output_size=output_size,
-        latent_size=latent_size
+        latent_size=latent_size,
+        weights_path=hf_weights_path,
+        device=DEVICE
     )
 
-    lf_param_count = count_parameters(lf_model)
-    hf_param_count = count_parameters(hf_model)
+    lf_param_count = count_parameters(lf_model, trainable_only=lf_model_name != "yolo")
+    hf_param_count = count_parameters(hf_model, trainable_only=hf_model_name != "yolo")
     logger.info(f"LF model parameters: {lf_param_count:,}")
     logger.info(f"HF model parameters: {hf_param_count:,}")
     run_summary["cost_realism"]["lf"] = {"num_parameters": lf_param_count}
@@ -185,7 +219,8 @@ def main(config_file):
             hf_model=hf_model,
             dataloader=train_dl,
             save_folder=train_body_folder,
-            device=DEVICE
+            device=DEVICE,
+            hf_input_mode=hf_input_mode
         )
 
         test_body_folder: str = os.path.join(body_folder, "test")
@@ -194,7 +229,8 @@ def main(config_file):
             hf_model=hf_model,
             dataloader=test_dl,
             save_folder=test_body_folder,
-            device=DEVICE
+            device=DEVICE,
+            hf_input_mode=hf_input_mode
         )
 
         val_body_folder: str = os.path.join(body_folder, "val")
@@ -203,7 +239,8 @@ def main(config_file):
             hf_model=hf_model,
             dataloader=val_dl,
             save_folder=val_body_folder,
-            device=DEVICE
+            device=DEVICE,
+            hf_input_mode=hf_input_mode
         )
         
         folder_size: float = get_folder_size(body_folder)/1e6
@@ -257,7 +294,15 @@ def main(config_file):
     train_lf_model = True
     trained_lf_path = config.classifier_training.trained_lf_model
 
-    if trained_lf_path is not None:
+    if lf_model_name == "yolo":
+        # Already loaded straight from the checkpoint via build_model above (not
+        # via load_state_dict - the yolov5 checkpoint format doesn't match a plain
+        # state_dict), so just persist its weights so the reload later in this
+        # function behaves the same as every other model case.
+        train_lf_model = False
+        torch.save(lf_model.state_dict(), lf_model_file)
+        logger.info("LF model is YOLO; using pretrained checkpoint, skipping LF train")
+    elif trained_lf_path is not None:
         try:
             trained_lf_path = os.path.abspath(trained_lf_path)
             lf_model.load_state_dict(
@@ -276,7 +321,11 @@ def main(config_file):
     train_hf_model = True
     trained_hf_path = config.classifier_training.trained_hf_model
 
-    if trained_hf_path is not None:
+    if hf_model_name == "yolo":
+        train_hf_model = False
+        torch.save(hf_model.state_dict(), hf_model_file)
+        logger.info("HF model is YOLO; using pretrained checkpoint, skipping HF train")
+    elif trained_hf_path is not None:
         try:
             trained_hf_path = os.path.abspath(trained_hf_path)
             hf_model.load_state_dict(
@@ -287,8 +336,19 @@ def main(config_file):
             train_hf_model = False
             torch.save(hf_model.state_dict(), hf_model_file)
             logger.info("Pretrained HF model found; skipping HF train")
-        except:
+        except RuntimeError as e:
+            if "size mismatch" in str(e) or "shape" in str(e).lower():
+                logger.warning(
+                    f"Pretrained HF model failed to load, likely due to a hf_input_mode mismatch "
+                    f"(current setting: '{hf_input_mode}', expected input size: {hf_model_input_size}). "
+                    f"Check whether this checkpoint was trained with a different hf_input_mode."
+                )
+            else:
+                logger.info("Pretrained HF model failed to load; training HF model")
+            train_hf_model = True
+        except Exception:
             logger.info("Pretrained HF model failed to load; training HF model")
+            train_hf_model = True
     else:
         logger.info("Pretrained HF model not provided; training HF model")
 
@@ -355,7 +415,8 @@ def main(config_file):
                 criterion=nn.CrossEntropyLoss(),
                 fidelity="hf",
                 train_body=train_body,
-                optimizer=hf_optimizer
+                optimizer=hf_optimizer,
+                hf_input_mode=hf_input_mode
             )
 
             hf_val_loss, hf_val_acc = classifier_one_run(
@@ -364,6 +425,7 @@ def main(config_file):
                 criterion=nn.CrossEntropyLoss(),
                 fidelity="hf",
                 train_body=train_body,
+                hf_input_mode=hf_input_mode
             )
 
             hf_epoch_time_sec = time.perf_counter() - hf_epoch_start
@@ -408,6 +470,7 @@ def main(config_file):
         criterion=nn.CrossEntropyLoss(),
         fidelity="hf",
         train_body=train_body,
+        hf_input_mode=hf_input_mode
     )
 
     logger.info("Final Test Summary")
@@ -429,7 +492,7 @@ def main(config_file):
         return (lf_model(data) if train_body else lf_model.head(data))["output"]
 
     def hf_forward(batch):
-        data = torch.cat([batch[0], batch[1]], dim=1).to(DEVICE, torch.float)
+        data = assemble_hf_input(batch[0], batch[1], hf_input_mode, hf_model=hf_model).to(DEVICE, torch.float)
         return (hf_model(data) if train_body else hf_model.head(data))["output"]
 
     lf_inference_latency_ms = measure_inference_latency(lf_forward, cascade_test_dl, DEVICE)
@@ -454,7 +517,8 @@ def main(config_file):
         dataloader=train_dl,
         save_folder=train_latent_folder,
         train_body=train_body,
-        device=DEVICE
+        device=DEVICE,
+        hf_input_mode=hf_input_mode
     )
 
     test_latent_folder: str = os.path.join(latent_folder, "test")
@@ -464,7 +528,8 @@ def main(config_file):
         dataloader=test_dl,
         save_folder=test_latent_folder,
         train_body=train_body,
-        device=DEVICE
+        device=DEVICE,
+        hf_input_mode=hf_input_mode
     )
 
     val_latent_folder: str = os.path.join(latent_folder, "val")
@@ -474,7 +539,8 @@ def main(config_file):
         dataloader=val_dl,
         save_folder=val_latent_folder,
         train_body=train_body,
-        device=DEVICE
+        device=DEVICE,
+        hf_input_mode=hf_input_mode
     )
     folder_size: float = get_folder_size(latent_folder)/1e6
     logger.info(f"Total size of {latent_folder}: {folder_size:,} MB")
@@ -507,19 +573,32 @@ def main(config_file):
         batch_size=config.fe_training.batch_size,
     )
 
-    if dataset_name != "crop":
+    # cnn_head is for a spatial (C, H, W) lf_latent - crop's UNet decoder output,
+    # and now YOLO's raw (unpooled) backbone feature map, so the gate model can
+    # learn region-level routing signal instead of only ever seeing an already-
+    # pooled global summary. mlp is for a flat (D,) latent (resnet/vit/mlp).
+    is_spatial_latent = (dataset_name == "crop" or lf_model_name == "yolo")
+
+    # Either way, size the gate model off the *actual* saved latent, not
+    # config.latent_size - that assumption only holds for resnet/vit/mlp, which
+    # explicitly project their backbone output down to latent_size via a
+    # latent_rep layer. UNet's decoder output and YOLO's raw backbone feature
+    # are each a fixed channel count of their own, independent of config.latent_size.
+    lf_latent_channels: int = train_ds[0][0].shape[0]
+
+    if is_spatial_latent:
         fe_model: nn.Module = build_model(
-            model_name="mlp",
-            input_size=latent_size,
+            model_name="cnn_head",
+            input_size=lf_latent_channels,
             output_size=2,
-            latent_size=256
+            latent_size=None
         )
     else:
         fe_model: nn.Module = build_model(
-            model_name="cnn_head",
-            input_size=latent_size,
+            model_name="mlp",
+            input_size=lf_latent_channels,
             output_size=2,
-            latent_size=None
+            latent_size=256
         )
 
     fe_param_count = count_parameters(fe_model)
@@ -527,13 +606,26 @@ def main(config_file):
     run_summary["cost_realism"]["gate"] = {"num_parameters": fe_param_count}
 
     logger.info("RUNNING DEFAULT FE")
+    is_yolo_gate = (lf_model_name == "yolo" or hf_model_name == "yolo")
     adaptive_search: AdaptiveGridSearch = AdaptiveGridSearch(
         fe_model=fe_model,
         device=DEVICE,
         train_dl=train_dl,
         val_dl=val_dl,
         test_dl=test_dl,
-        model_folder=model_folder
+        model_folder=model_folder,
+        # YOLO's LF/HF only disagree on ~5% of samples - without balancing, a
+        # degenerate "always pick one fidelity" gate can minimize expected cost
+        # almost for free, drowning out the minority routing signal.
+        class_weighted_loss=is_yolo_gate,
+        # A lower LR + gradient clipping guards against the gate's routing
+        # logits blowing up into softmax saturation within the first epoch or
+        # two (observed on this task's thin, imbalanced routing signal); more
+        # epochs gives it room to actually use that stability, which is cheap
+        # here since neither LF nor HF is being trained.
+        gate_epochs=100 if is_yolo_gate else 30,
+        gate_lr=5e-5 if is_yolo_gate else 3e-4,
+        gate_grad_clip_norm=1.0 if is_yolo_gate else None
     )
 
     reset_peak_memory(DEVICE)
@@ -605,12 +697,12 @@ def main(config_file):
         os.path.join(image_folder, "gate_sensitivity_zoom.png")
     )
 
-    logger.info("PLOTTING GATE ROUTING (PCA + confusion tables)")
+    logger.info("PLOTTING GATE ROUTING (projection + confusion tables)")
     routing_snapshots = load_routing_snapshots(file_folder)
     for rerun_idx in range(fe_reruns):
-        plot_pca_routing_grid(
+        plot_routing_projection_grid(
             routing_snapshots, rerun_idx,
-            os.path.join(image_folder, f"gate_routing_pca_rerun{rerun_idx}.png")
+            os.path.join(image_folder, f"gate_routing_projection_rerun{rerun_idx}.png")
         )
         plot_routing_table_grid(
             routing_snapshots, rerun_idx,
@@ -715,7 +807,8 @@ def main(config_file):
                 hf_model=hf_model,
                 threshold=0.5,
                 train_body=train_body,
-                optimizer=selnet_optimizer
+                optimizer=selnet_optimizer,
+                hf_input_mode=hf_input_mode
             )
 
             selnet_val_metrics = selnet_method.one_run(
@@ -724,6 +817,7 @@ def main(config_file):
                 hf_model=hf_model,
                 threshold=0.5,
                 train_body=train_body,
+                hf_input_mode=hf_input_mode
             )
 
             selnet_epoch_time_sec = time.perf_counter() - selnet_epoch_start
@@ -753,6 +847,7 @@ def main(config_file):
                 hf_model=hf_model,
                 threshold=float(threshold),
                 train_body=train_body,
+                hf_input_mode=hf_input_mode
             )
 
             selnet_test_grid_metrics = selnet_method.one_run(
@@ -761,6 +856,7 @@ def main(config_file):
                 hf_model=hf_model,
                 threshold=float(threshold),
                 train_body=train_body,
+                hf_input_mode=hf_input_mode
             )
 
             selnet_val_usage_grid[c_idx, t_idx] = selnet_val_grid_metrics["usage"]
@@ -894,7 +990,8 @@ def main(config_file):
             tau=0.5,
             train_body=train_body,
             optimizer=sat_optimizer,
-            epoch=epoch
+            epoch=epoch,
+            hf_input_mode=hf_input_mode
         )
 
         sat_val_metrics = sat_method.one_run(
@@ -903,7 +1000,8 @@ def main(config_file):
             hf_model=hf_model,
             tau=0.5,
             train_body=train_body,
-            epoch=epoch
+            epoch=epoch,
+            hf_input_mode=hf_input_mode
         )
 
         sat_epoch_time_sec = time.perf_counter() - sat_epoch_start
@@ -946,7 +1044,8 @@ def main(config_file):
             hf_model=hf_model,
             tau=float(tau),
             train_body=train_body,
-            epoch=num_baseline_epochs
+            epoch=num_baseline_epochs,
+            hf_input_mode=hf_input_mode
         )
         sat_test_metrics = sat_method.one_run(
             model=sat_model,
@@ -954,7 +1053,8 @@ def main(config_file):
             hf_model=hf_model,
             tau=float(tau),
             train_body=train_body,
-            epoch=num_baseline_epochs
+            epoch=num_baseline_epochs,
+            hf_input_mode=hf_input_mode
         )
 
         sat_val_usage_grid.append(sat_val_metrics["usage"])

@@ -19,9 +19,12 @@ HF_COLOR = "#eb6834"
 
 def load_routing_snapshots(file_folder: str) -> dict:
     """Loads gate_routing_snapshots.npz, written by AdaptiveGridSearch.
-    save_routing_snapshots() after main.py's FE reruns. Every array is shape
+    save_routing_snapshots() after main.py's FE reruns. Most arrays are shape
     (n_snapshots, ...) where n_snapshots = n_reruns * len(usage_values); 'rerun'
-    and 'target_usage' (both length n_snapshots) identify each row."""
+    and 'target_usage' (both length n_snapshots) identify each row. The
+    exceptions are lf_latent/latent_2d/boundary_xx/boundary_yy, which are
+    identical across every snapshot (same fixed test-set lf_latent, same
+    cached projection basis/grid) and so are saved once, unstacked."""
     path = os.path.join(file_folder, "gate_routing_snapshots.npz")
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -89,17 +92,23 @@ def _grid_shape(n, max_cols=5):
     return nrows, ncols
 
 
-def plot_pca_routing_grid(snapshots: dict, rerun_idx: int, save_path: str) -> None:
-    """One panel per usage target (for a fixed rerun): PCA(lf_latent) scatter,
-    colored by the gate's routing decision, marker-shaped by ground-truth need.
+def plot_routing_projection_grid(snapshots: dict, rerun_idx: int, save_path: str) -> None:
+    """One panel per usage target (for a fixed rerun): a 2D scatter of
+    lf_latent, colored by the gate's routing decision, marker-shaped by
+    ground-truth need. The 2D plane is a supervised linear projection (fit in
+    AdaptiveGridSearch._project_latent) — axis 1 is a logistic-regression
+    direction separating hf_needed from lf_fine, axis 2 is the top PCA
+    direction of the leftover variance — rather than plain unsupervised PCA,
+    since PCA's top-variance directions have no reason to align with where the
+    gate actually needs to escalate.
 
     The contour is *not* a proxy classifier re-fit on the 2D points — it's
     boundary_zz, computed in AdaptiveGridSearch by running the actual trained
-    fe_model over this same PCA plane's grid (reconstructed back to the real
-    latent dimensionality via pca.inverse_transform). So it reflects that
-    model's own nonlinearity. It's still a slice/approximation, since the plane
-    can't capture the other latent_dim-2 axes — but it's the real model's slice,
-    not an independently-fit stand-in.
+    fe_model over this same plane's grid (reconstructed back to the real
+    latent dimensionality via the projection basis's transpose). So it
+    reflects that model's own nonlinearity. It's still a slice/approximation,
+    since the plane can't capture the other latent_dim-2 axes — but it's the
+    real model's slice, not an independently-fit stand-in.
 
     Assumes lf_latent is a flat (N, D) vector per sample (the classification FE
     model) — not applicable as-is to the segmentation "cnn_head" case.
@@ -149,12 +158,12 @@ def plot_pca_routing_grid(snapshots: dict, rerun_idx: int, save_path: str) -> No
         Line2D([0], [0], marker="o", color="w", markerfacecolor=INK_MUTED, label="LF fine", markersize=8),
     ]
     fig.legend(handles=legend_elems, loc="lower center", ncol=4, frameon=False, fontsize=8)
-    fig.suptitle(f"Gate routing in PCA(lf_latent) space — rerun {rerun_idx}", color=INK_PRIMARY, fontweight="bold")
+    fig.suptitle(f"Gate routing in supervised projection of lf_latent — rerun {rerun_idx}", color=INK_PRIMARY, fontweight="bold")
     fig.tight_layout(rect=[0, 0.06, 1, 0.94])
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     fig.savefig(save_path, facecolor=fig.get_facecolor())
     plt.close(fig)
-    logger.info(f"Saved PCA routing plot (rerun {rerun_idx}) to {save_path}")
+    logger.info(f"Saved routing projection plot (rerun {rerun_idx}) to {save_path}")
 
 
 def plot_routing_table_grid(snapshots: dict, rerun_idx: int, save_path: str) -> None:
@@ -220,7 +229,7 @@ def main(results_folder):
 
     snapshots = load_routing_snapshots(file_folder)
     for rerun_idx in sorted(set(snapshots["rerun"].tolist())):
-        plot_pca_routing_grid(snapshots, rerun_idx, os.path.join(image_folder, f"gate_routing_pca_rerun{rerun_idx}.png"))
+        plot_routing_projection_grid(snapshots, rerun_idx, os.path.join(image_folder, f"gate_routing_projection_rerun{rerun_idx}.png"))
         plot_routing_table_grid(snapshots, rerun_idx, os.path.join(image_folder, f"gate_routing_table_rerun{rerun_idx}.png"))
 
 

@@ -591,3 +591,125 @@ class SelectiveNet(nn.Module):
         proj = self.proj_layer(lf_latent)
 
         return proj
+
+
+def _load_yolov5_checkpoint(weights_path, device="cpu"):
+    """Loads a YOLOv5 checkpoint (.pt) via the `yolov5` pip package and returns
+    the raw DetectionModel (unwrapped from the AutoShape/DetectMultiBackend
+    inference wrapper yolov5.load() normally returns).
+
+    Two footguns worth knowing about, both handled here:
+
+    1. yolov5 checkpoints pickle their classes under bare `models.yolo` /
+       `models.common` module paths (the original ultralytics/yolov5 repo's
+       own flat layout), so yolov5.load() registers sys.modules['models']
+       (and 'models.common', 'models.yolo') pointing at *its* package
+       internals during unpickling. This project's own models.py — this file
+       — is also imported as bare `models`, so left alone that would silently
+       clobber it for the rest of the process. We snapshot and restore those
+       sys.modules entries around the call so the collision never escapes
+       this function (safe to do — already-instantiated objects keep direct
+       references to their class objects regardless of sys.modules changes
+       made afterward).
+    2. This yolov5 package predates torch's 2.6 default flip of
+       `torch.load(weights_only=...)` from False to True, so its internal
+       load call fails the new default safe-unpickling check. We patch
+       torch.load to force weights_only=False for the duration of this call
+       only (fine — these are the user's own trained checkpoints).
+    """
+    import sys
+    import functools
+    import torch
+    import yolov5
+    import yolov5.models.yolo
+    import yolov5.models.common
+    import yolov5.models.experimental
+
+    # This project's own models.py is normally already cached as bare
+    # 'models' by the time this runs (e.g. main.py's `from models import
+    # ...`), and src/ typically sits ahead of yolov5's install dir on
+    # sys.path — so even popping the cached entry isn't enough, Python would
+    # just re-resolve bare 'models' back to *this* file via the sys.path
+    # scan. Instead we pre-register the exact bare aliases the checkpoint's
+    # pickled classes expect (models, models.yolo, models.common,
+    # models.experimental), pointed at yolov5's own already-importable
+    # namespaced modules, so unpickling resolves them straight from the
+    # sys.modules cache regardless of sys.path order.
+    collision_keys = [k for k in sys.modules if k == "models" or k.startswith("models.")]
+    snapshot = {k: sys.modules.pop(k) for k in collision_keys}
+    sys.modules["models"] = yolov5.models
+    sys.modules["models.yolo"] = yolov5.models.yolo
+    sys.modules["models.common"] = yolov5.models.common
+    sys.modules["models.experimental"] = yolov5.models.experimental
+
+    # yolov5's device string parsing only strips a "cuda:" prefix (e.g.
+    # "cuda:0" -> "0"); bare "cuda" survives unstripped and is misread as N
+    # requested GPU indices (one per character), so normalize it here. The
+    # unmodified `device` (whatever the caller passed) is still what we
+    # .to(...) below — torch itself is fine with bare "cuda".
+    yolo_device = "cuda:0" if str(device) == "cuda" else str(device)
+
+    orig_torch_load = torch.load
+    torch.load = functools.partial(orig_torch_load, weights_only=False)
+    try:
+        wrapped = yolov5.load(weights_path, device=yolo_device)
+    finally:
+        torch.load = orig_torch_load
+        for k in [k for k in sys.modules if k == "models" or k.startswith("models.")]:
+            del sys.modules[k]
+        sys.modules.update(snapshot)
+
+    detection_model = wrapped.model.model  # AutoShape -> DetectMultiBackend -> DetectionModel
+    detection_model = detection_model.to(device).eval()
+    return detection_model
+
+
+class YOLOv5FidelityModel(nn.Module):
+    """Wraps a pretrained YOLOv5 checkpoint (an LF or HF backbone for the
+    LLVIP gate task) as a plain nn.Module, in the same spirit as the other
+    fidelity models in this file.
+
+    forward(x) returns:
+      - "output": raw per-anchor detection predictions, shape
+        (B, num_anchors, 5 + num_classes) = [cx, cy, w, h, objectness,
+        class_probs...], already sigmoid'd, *before* NMS — YOLOv5's own
+        inference-mode output. x must be a (B, 3, H, W) float tensor scaled
+        to [0, 1] (YOLOv5's own preprocessing convention — no ImageNet
+        mean/std normalization, unlike CustomResNet18/CustomViT above), with
+        H and W multiples of `self.stride` (32).
+      - "latent": the deepest backbone feature map (the P5 scale, captured
+        via a forward hook just before the Detect head), as the raw (B, C, H, W)
+        spatial map — NOT pooled. Pooling here would throw away exactly the
+        region-level structure (e.g. a small/occluded/distant person) that a
+        downstream gate model needs to learn "which regions does LF tend to
+        miss" rather than a single global summary. This is *not* the full
+        multi-scale representation Detect actually reads from (P3/P4/P5) —
+        just the coarsest scale, kept simple since nothing downstream consumes
+        a YOLO latent besides the gate FE model; revisit if a specific use
+        needs the finer scales too.
+
+    num_classes is 1 ("person") for the LLVIP checkpoints this wraps.
+    """
+
+    def __init__(self, weights_path, device="cpu"):
+        super().__init__()
+        self.model = _load_yolov5_checkpoint(weights_path, device)
+        self.names = self.model.names
+        self.stride = int(torch.as_tensor(self.model.stride).max())
+
+        self._latent_feat = None
+        self.model.model[-2].register_forward_hook(self._capture_latent)
+
+    def _capture_latent(self, module, inputs, output):
+        self._latent_feat = output
+
+    def forward(self, x):
+        preds = self.model(x)
+        if isinstance(preds, (tuple, list)):
+            preds = preds[0]
+
+        return {"latent": self._latent_feat, "output": preds}
+
+
+def build_yolov5(weights_path, device="cpu"):
+    return YOLOv5FidelityModel(weights_path, device=device)

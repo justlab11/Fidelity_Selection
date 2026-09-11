@@ -9,6 +9,7 @@ import tifffile as tif
 import os
 import warnings
 import logging
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import torch
@@ -543,6 +544,142 @@ class CUBDataset(Dataset):
 
         return lf_img, hf_img, label
         
+class LLVIPDataset(Dataset):
+    """Paired visible/infrared pedestrian-detection dataset (LLVIP). LF is the
+    visible-spectrum image by default (ubiquitous, cheap RGB camera hardware)
+    and HF is infrared/thermal (specialized sensor, but keeps working at
+    night/low-light where visible fails) — pass lf_modality="infrared" to
+    flip which checkpoint plays which role.
+
+    Every image has at least one annotated person (this is a pedestrian-
+    detection dataset, not a presence/absence one), so `label` here is the
+    per-image ground-truth boxes rather than a single class index: a fixed
+    (max_boxes, 5) tensor of [cls, xc, yc, w, h] normalized to the letterboxed
+    image, YOLOv5's own label convention. Unused rows are padded with -1 so a
+    plain DataLoader can batch it without a custom collate_fn — filter real
+    rows with `label[:, 0] >= 0`. Ground truth is provided so routing
+    "correctness" can be scored against it if needed, even though the
+    intended routing decision compares the two models' own detections to each
+    other, not to this ground truth directly.
+
+    No official validation split is provided (only train/test, per LLVIP's
+    own layout) — val is carved out of train the same way CUBDataset does.
+
+    lf_img/hf_img are returned as (3, img_size, img_size) float tensors
+    scaled to [0, 1] — YOLOv5's own preprocessing convention (no ImageNet
+    mean/std normalization, unlike CUBDataset/CropDataset above, which back
+    ResNet/ViT/UNet models instead).
+    """
+
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        seed: int = 42,
+        val_ratio: float = 0.1,
+        img_size: int = 640,
+        max_boxes: int = 20,
+        lf_modality: str = "visible",
+    ):
+        assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
+        assert lf_modality in ["visible", "infrared"], "lf_modality must be 'visible' or 'infrared'"
+
+        # Deferred/local: yolov5's import chain is large (pandas, ultralytics,
+        # etc.) and noisy (first-import settings-file creation), so it's only
+        # paid by callers that actually construct an LLVIPDataset.
+        from yolov5.utils.augmentations import letterbox
+        from yolov5.utils.general import xyxy2xywh
+        self._letterbox = letterbox
+        self._xyxy2xywh = xyxy2xywh
+
+        self.root = root
+        self.split = split
+        self.img_size = img_size
+        self.max_boxes = max_boxes
+        self.lf_modality = lf_modality
+        self.hf_modality = "infrared" if lf_modality == "visible" else "visible"
+        self.generator = torch.Generator().manual_seed(seed)
+
+        self.file_split = "test" if split == "test" else "train"
+        image_dir = path.join(root, "visible", self.file_split)
+        basenames = sorted(
+            f for f in os.listdir(image_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        )
+
+        if split != "test":
+            n = len(basenames)
+            val_size = int(n * val_ratio)
+            train_size = n - val_size
+            train_set, val_set = random_split(basenames, [train_size, val_size], generator=self.generator)
+            indices = train_set.indices if split == "train" else val_set.indices
+            self.basenames = [basenames[i] for i in indices]
+        else:
+            self.basenames = basenames
+
+    def get_num_classes(self):
+        return 1  # single "person" class; kept for interface parity with the other datasets
+
+    def get_lf_input_size(self):
+        return 3
+
+    def get_hf_input_size(self):
+        return 3
+
+    def __len__(self):
+        return len(self.basenames)
+
+    def _load_image(self, modality, fname):
+        fpath = path.join(self.root, modality, self.file_split, fname)
+        return np.array(Image.open(fpath).convert("RGB"))  # HWC, RGB, uint8
+
+    def _load_boxes(self, fname):
+        xml_path = path.join(self.root, "Annotations", path.splitext(fname)[0] + ".xml")
+        annotation = ET.parse(xml_path).getroot()
+        boxes = [
+            [
+                float(obj.find("bndbox/xmin").text), float(obj.find("bndbox/ymin").text),
+                float(obj.find("bndbox/xmax").text), float(obj.find("bndbox/ymax").text),
+            ]
+            for obj in annotation.findall("object")
+        ]
+        return np.array(boxes, dtype=np.float32) if boxes else np.zeros((0, 4), dtype=np.float32)
+
+    def _letterbox_image_and_boxes(self, img, boxes):
+        padded, ratio, (dw, dh) = self._letterbox(img, self.img_size, auto=False)
+        boxes = boxes.copy()
+        boxes[:, [0, 2]] = boxes[:, [0, 2]] * ratio[0] + dw
+        boxes[:, [1, 3]] = boxes[:, [1, 3]] * ratio[1] + dh
+        return padded, boxes
+
+    def __getitem__(self, idx):
+        fname = self.basenames[idx]
+
+        lf_raw = self._load_image(self.lf_modality, fname)
+        hf_raw = self._load_image(self.hf_modality, fname)
+        boxes = self._load_boxes(fname)  # xyxy, original pixel space (shared by both modalities)
+
+        # lf/hf share the same original resolution (LLVIP images are pixel-
+        # aligned pairs), so letterboxing both at the same img_size produces
+        # identical box coordinates either way — computed per-modality anyway
+        # so a future per-modality resize policy wouldn't silently desync them.
+        lf_img, lf_boxes = self._letterbox_image_and_boxes(lf_raw, boxes)
+        hf_img, _ = self._letterbox_image_and_boxes(hf_raw, boxes)
+
+        h, w = lf_img.shape[:2]
+        xywh = self._xyxy2xywh(lf_boxes)
+        xywh[:, [0, 2]] /= w
+        xywh[:, [1, 3]] /= h
+
+        n = min(len(xywh), self.max_boxes)
+        label = -np.ones((self.max_boxes, 5), dtype=np.float32)
+        label[:n, 0] = 0  # single class: person
+        label[:n, 1:] = xywh[:n]
+
+        lf_tensor = torch.from_numpy(lf_img).permute(2, 0, 1).float() / 255.0
+        hf_tensor = torch.from_numpy(hf_img).permute(2, 0, 1).float() / 255.0
+
+        return lf_tensor, hf_tensor, torch.from_numpy(label)
+
 class BodyDataset(Dataset):
     def __init__(self, folder_path):
         self.folder_path = folder_path

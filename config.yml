@@ -2,7 +2,7 @@ dataset:
   name: bird_grayscale
   folder: C:/Users/Justin/Documents/Github_Work/MetaLearner_V1_main/data/CUB_200_2011/CUB_200_2011
 
-latent_size: 128
+latent_size: 256
 random_seed: 42
 run_comparisons: False
 train_body: True
@@ -12,10 +12,11 @@ classifier_training:
   epochs: 200
   batch_size: 64
   loss_fun: CE
+  hf_input_mode: concat
   lf_model: resnet
   hf_model: resnet
-  trained_lf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\src\results\bird_grayscale-resnet-resnet-42-128_GOOD\models\lf_model.pt
-  trained_hf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\src\results\bird_grayscale-resnet-resnet-42-128_GOOD\models\hf_model.pt
+  trained_lf_model:
+  trained_hf_model:
   
 fe_training:
   epochs: 40

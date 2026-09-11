@@ -8,8 +8,17 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def count_parameters(model) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def count_parameters(model, trainable_only: bool = True) -> int:
+    """Trainable-only is the right "cost realism" signal for models this
+    pipeline actually trains (resnet/vit can be partially frozen via
+    freeze_body()) - but a YOLO checkpoint is always fully frozen here (loaded
+    pretrained, never trained), so trainable_only would report 0 regardless of
+    its real size, badly understating its actual inference cost. Pass
+    trainable_only=False for those.
+    """
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
 
 
 def format_duration(seconds: float) -> str:
