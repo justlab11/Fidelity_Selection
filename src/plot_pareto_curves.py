@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 # same color across every plot this script produces.
 BASELINE_STYLE = {
     "FE":           {"file": "fe_results.npz",           "color": "#2a78d6"},
+    "FE+SR":        {"file": "fe_sr_results.npz",         "color": "#8b5cf6"},
     "SR":           {"file": "sr_results.npz",            "color": "#eb6834"},
     "SelectiveNet": {"file": "selectivenet_results.npz",  "color": "#1baf7a"},
     "SAT":          {"file": "sat_results.npz",           "color": "#eda100"},
@@ -24,7 +25,7 @@ AXIS_LINE = "#c3c2b7"
 
 
 def load_pareto_curves(file_folder: str) -> dict:
-    """Loads whichever of {fe,sr,selectivenet,sat}_results.npz exist under
+    """Loads whichever of {fe,fe_sr,sr,selectivenet,sat}_results.npz exist under
     file_folder. Each has 'usage'/'acc' arrays on a 0-100 scale. Missing files
     are skipped (with a warning) so partial overlays still render.
 

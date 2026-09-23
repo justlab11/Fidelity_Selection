@@ -22,7 +22,8 @@ from experiment_logging import (
 )
 from plot_gate_sensitivity import (
     load_gate_log, dedupe_and_sort, compute_usage_derivative,
-    plot_derivative, find_zoom_range, plot_zoom, plot_full_curve, report_max_usage
+    plot_derivative, find_zoom_range, plot_zoom, plot_full_curve, report_max_usage,
+    plot_isotonic_smoothing
 )
 from plot_gate_routing import (
     load_routing_snapshots, compute_oracle_curve, plot_routing_projection_grid, plot_routing_table_grid
@@ -278,8 +279,8 @@ def main(config_file):
     lf_model: nn.Module = lf_model.to(DEVICE)
     hf_model: nn.Module = hf_model.to(DEVICE)
 
-    lf_optimizer = torch.optim.Adam(lf_model.parameters(), lr=1e-5, weight_decay=1e-5)
-    hf_optimizer = torch.optim.Adam(hf_model.parameters(), lr=1e-5, weight_decay=1e-5)
+    lf_optimizer = torch.optim.Adam(lf_model.parameters(), lr=config.classifier_training.lr, weight_decay=1e-5)
+    hf_optimizer = torch.optim.Adam(hf_model.parameters(), lr=config.classifier_training.lr, weight_decay=1e-5)
 
     lf_state_dict: Dict | None  = None
     hf_state_dict: Dict | None  = None
@@ -473,9 +474,34 @@ def main(config_file):
         hf_input_mode=hf_input_mode
     )
 
+    # Also reported against val here (not just test) so a val/test gap is visible
+    # up front - for datasets like LLVIP, where val is carved out of the train
+    # pool rather than being a truly independent split, val can look far rosier
+    # than test and that's worth catching immediately, not discovering later via
+    # the gate search quietly optimizing against an inflated signal.
+    lf_val_loss, lf_val_acc = classifier_one_run(
+        model=lf_model,
+        dataloader=val_dl,
+        criterion=nn.CrossEntropyLoss(),
+        fidelity="lf",
+        train_body=train_body,
+    )
+
+    hf_val_loss, hf_val_acc = classifier_one_run(
+        model=hf_model,
+        dataloader=val_dl,
+        criterion=nn.CrossEntropyLoss(),
+        fidelity="hf",
+        train_body=train_body,
+        hf_input_mode=hf_input_mode
+    )
+
     logger.info("Final Test Summary")
     logger.info(f"\tLF Test   Loss: {lf_test_loss:.4f}  | Accuracy: {100 * lf_test_acc:.2f}%")
     logger.info(f"\tHF Test   Loss: {hf_test_loss:.4f}  | Accuracy: {100 * hf_test_acc:.2f}%")
+    logger.info("Final Val Summary")
+    logger.info(f"\tLF Val    Loss: {lf_val_loss:.4f}  | Accuracy: {100 * lf_val_acc:.2f}%")
+    logger.info(f"\tHF Val    Loss: {hf_val_loss:.4f}  | Accuracy: {100 * hf_val_acc:.2f}%")
 
     # snapshot the cascade (raw/body) datasets & dataloaders before train_dl/test_dl/val_dl
     # get overwritten below with FE_Dataset loaders (precomputed latents) for FE/SR — the
@@ -504,12 +530,25 @@ def main(config_file):
     run_summary["cost_realism"]["hf"]["inference_latency_ms_per_sample"] = hf_inference_latency_ms
     run_summary["final_accuracy"]["lf_test_acc"] = lf_test_acc
     run_summary["final_accuracy"]["hf_test_acc"] = hf_test_acc
+    run_summary["final_accuracy"]["lf_val_acc"] = lf_val_acc
+    run_summary["final_accuracy"]["hf_val_acc"] = hf_val_acc
 
     # ================================================================
     # FE MODEL TRAINING
     # save LF/HF latents, then AdaptiveGridSearch over usage_values
     # ================================================================
     logger.info("SAVING LATENT REPRESENTATIONS")
+
+    # UNet exposes both its encoder bottleneck ("body", e.g. 1024x14x14) and
+    # its decoder's near-final feature map at full input resolution
+    # ("latent", 64x224x224 - kept spatial for a future per-pixel/region-
+    # level gate, see UNet.forward's comment in models.py). Saving "latent"
+    # per sample across crop's ~90k-sample splits needs ~1.6TB of disk, so
+    # this currently uses the much smaller bottleneck instead. Switch back to
+    # "latent" here (and see save_latent's docstring) to bring that future
+    # work back.
+    gate_latent_key = "body" if dataset_name == "crop" else "latent"
+
     train_latent_folder: str = os.path.join(latent_folder, "train")
     save_latent(
         lf_model=lf_model,
@@ -518,7 +557,8 @@ def main(config_file):
         save_folder=train_latent_folder,
         train_body=train_body,
         device=DEVICE,
-        hf_input_mode=hf_input_mode
+        hf_input_mode=hf_input_mode,
+        latent_key=gate_latent_key
     )
 
     test_latent_folder: str = os.path.join(latent_folder, "test")
@@ -529,7 +569,8 @@ def main(config_file):
         save_folder=test_latent_folder,
         train_body=train_body,
         device=DEVICE,
-        hf_input_mode=hf_input_mode
+        hf_input_mode=hf_input_mode,
+        latent_key=gate_latent_key
     )
 
     val_latent_folder: str = os.path.join(latent_folder, "val")
@@ -540,7 +581,8 @@ def main(config_file):
         save_folder=val_latent_folder,
         train_body=train_body,
         device=DEVICE,
-        hf_input_mode=hf_input_mode
+        hf_input_mode=hf_input_mode,
+        latent_key=gate_latent_key
     )
     folder_size: float = get_folder_size(latent_folder)/1e6
     logger.info(f"Total size of {latent_folder}: {folder_size:,} MB")
@@ -573,10 +615,12 @@ def main(config_file):
         batch_size=config.fe_training.batch_size,
     )
 
-    # cnn_head is for a spatial (C, H, W) lf_latent - crop's UNet decoder output,
-    # and now YOLO's raw (unpooled) backbone feature map, so the gate model can
-    # learn region-level routing signal instead of only ever seeing an already-
-    # pooled global summary. mlp is for a flat (D,) latent (resnet/vit/mlp).
+    # cnn_head is for a spatial (C, H, W) lf_latent - crop's UNet bottleneck
+    # (see gate_latent_key above) and YOLO's raw (unpooled) backbone feature
+    # map - vs. mlp for a flat (D,) latent (resnet/vit/mlp). Note LatentCNNHead
+    # itself still global-average-pools before its routing decision either
+    # way, so this is about which features feed that decision, not (yet)
+    # about making the decision itself per-pixel/region.
     is_spatial_latent = (dataset_name == "crop" or lf_model_name == "yolo")
 
     # Either way, size the gate model off the *actual* saved latent, not
@@ -606,7 +650,33 @@ def main(config_file):
     run_summary["cost_realism"]["gate"] = {"num_parameters": fe_param_count}
 
     logger.info("RUNNING DEFAULT FE")
-    is_yolo_gate = (lf_model_name == "yolo" or hf_model_name == "yolo")
+
+    # Measure how much routing signal actually exists before deciding whether
+    # to apply the imbalance mitigations below - originally these were gated on
+    # is_yolo_gate (LLVIP/YOLO's LF/HF disagree on only ~5% of samples), but
+    # the same collapse - an unweighted, un-clipped gate hits softmax
+    # saturation within a handful of epochs and gets stuck always picking one
+    # fidelity, at every cost value - shows up on any dataset whose LF/HF
+    # models are this correlated, toy_2d included (~7% here, just from how
+    # close its two fidelity's accuracies happen to land). Measuring it
+    # directly generalizes the mitigation instead of hardcoding it to one
+    # dataset name.
+    hf_needed_count = 0
+    total_count = 0
+    for _, lf_output, hf_output, label in train_dl:
+        lf_pred = lf_output.argmax(dim=1)
+        hf_pred = hf_output.argmax(dim=1)
+        label = label.long()
+        hf_needed_count += ((hf_pred == label) & (lf_pred != label)).sum().item()
+        total_count += label.numel()
+    hf_needed_rate = hf_needed_count / total_count
+    logger.info(f"HF-needed rate on train set: {hf_needed_rate:.2%} ({hf_needed_count:,}/{total_count:,})")
+
+    # Below this, an unweighted/un-clipped gate reliably collapses within a
+    # handful of epochs regardless of cost (observed on both LLVIP/YOLO's ~5%
+    # rate and toy_2d's ~7%).
+    imbalanced_gate = hf_needed_rate < 0.15
+
     adaptive_search: AdaptiveGridSearch = AdaptiveGridSearch(
         fe_model=fe_model,
         device=DEVICE,
@@ -614,18 +684,17 @@ def main(config_file):
         val_dl=val_dl,
         test_dl=test_dl,
         model_folder=model_folder,
-        # YOLO's LF/HF only disagree on ~5% of samples - without balancing, a
-        # degenerate "always pick one fidelity" gate can minimize expected cost
-        # almost for free, drowning out the minority routing signal.
-        class_weighted_loss=is_yolo_gate,
+        # Without balancing, a degenerate "always pick one fidelity" gate can
+        # minimize expected cost almost for free, drowning out the minority
+        # routing signal.
+        class_weighted_loss=imbalanced_gate,
         # A lower LR + gradient clipping guards against the gate's routing
         # logits blowing up into softmax saturation within the first epoch or
-        # two (observed on this task's thin, imbalanced routing signal); more
-        # epochs gives it room to actually use that stability, which is cheap
-        # here since neither LF nor HF is being trained.
-        gate_epochs=100 if is_yolo_gate else 30,
-        gate_lr=5e-5 if is_yolo_gate else 3e-4,
-        gate_grad_clip_norm=1.0 if is_yolo_gate else None
+        # two (observed on this task's thin, imbalanced routing signal).
+        gate_epochs=config.fe_training.epochs,
+        gate_lr=5e-5 if imbalanced_gate else 3e-4,
+        gate_grad_clip_norm=1.0 if imbalanced_gate else None,
+        seed=seed
     )
 
     reset_peak_memory(DEVICE)
@@ -697,6 +766,13 @@ def main(config_file):
         os.path.join(image_folder, "gate_sensitivity_zoom.png")
     )
 
+    # Raw (undeduped) points, deliberately - the scatter is meant to show the
+    # actual per-run training noise, not the averaged-per-c_h view above.
+    plot_isotonic_smoothing(
+        gate_r, gate_usage,
+        os.path.join(image_folder, "gate_sensitivity_isotonic.png")
+    )
+
     logger.info("PLOTTING GATE ROUTING (projection + confusion tables)")
     routing_snapshots = load_routing_snapshots(file_folder)
     for rerun_idx in range(fe_reruns):
@@ -715,8 +791,67 @@ def main(config_file):
         f"at c_h={gate_r_at_max:.4f}"
     )
 
+    # ================================================================
+    # FE + SOFTMAX RESPONSE
+    # "just the FE model" (above) uses each r's gate with its own hard argmax
+    # routing decision. This reuses the SAME already-trained fe_model-{r}.pt
+    # checkpoints, but sweeps the gate's own continuous confidence over a
+    # threshold grid instead - see AdaptiveGridSearch.run_fe_sr_grid. Runs
+    # regardless of run_comparisons - it's a natural extension of the FE
+    # results above, not one of the classification-shaped SelectiveNet/SAT/SR
+    # baselines below (which YOLO can't run at all).
+    # ================================================================
+    logger.info("RUNNING FE + SOFTMAX RESPONSE")
+
+    fe_sr_threshold_grid: List[float] = list(np.linspace(0.0, 1.0, 21))
+    fe_sr = adaptive_search.run_fe_sr_grid(
+        usage_values=usage_values,
+        threshold_grid=fe_sr_threshold_grid
+    )
+
+    fe_sr_data_path: str = os.path.join(file_folder, "fe_sr_results.npz")
+    np.savez(
+        fe_sr_data_path,
+        usage=fe_sr["usage"],
+        acc=fe_sr["acc"],
+        target_usage=fe_sr["target_usage"],
+        chosen_r=fe_sr["chosen_r"],
+        chosen_threshold=fe_sr["chosen_threshold"]
+    )
+    run_summary["result_files"].append("fe_sr_results.npz")
+
+    fe_sr_grid_path: str = os.path.join(file_folder, "fe_sr_grid.npz")
+    np.savez(
+        fe_sr_grid_path,
+        r_grid=fe_sr["r_grid"],
+        threshold_grid=fe_sr["threshold_grid"],
+        val_usage_grid=fe_sr["val_usage_grid"],
+        val_acc_grid=fe_sr["val_acc_grid"],
+        test_usage_grid=fe_sr["test_usage_grid"],
+        test_acc_grid=fe_sr["test_acc_grid"]
+    )
+    run_summary["result_files"].append("fe_sr_grid.npz")
+
     # ends the script if you don't want comparisons
     if not run_comparisons:
+        logger.info("PLOTTING PARETO CURVES")
+
+        # lf_correct/hf_correct only depend on the LF/HF models' own
+        # predictions on the fixed test set, not on which gate model produced
+        # a given snapshot — so any single snapshot's arrays (here, the
+        # first) give the ground truth.
+        oracle_acc = compute_oracle_curve(
+            routing_snapshots["lf_correct"][0], routing_snapshots["hf_correct"][0], usage_values
+        )
+        oracle = (np.array(usage_values) * 100, oracle_acc)
+
+        pareto_curves = load_pareto_curves(file_folder)
+        render_pareto_plot(
+            pareto_curves, dataset_label=dataset_name,
+            save_path=os.path.join(image_folder, "pareto.png"),
+            oracle=oracle
+        )
+
         run_summary["timing"]["total_experiment_sec"] = time.perf_counter() - experiment_start_time
         with open(os.path.join(folder_name, "summary.json"), "w") as f:
             json.dump(run_summary, f, indent=2)
@@ -788,7 +923,7 @@ def main(config_file):
             logger.info(f"SelectiveNet model parameters: {selnet_param_count:,}")
             run_summary["cost_realism"]["selectivenet"] = {"num_parameters": selnet_param_count}
 
-        selnet_optimizer = torch.optim.Adam(selnet_model.parameters(), lr=1e-5, weight_decay=1e-5)
+        selnet_optimizer = torch.optim.Adam(selnet_model.parameters(), lr=config.classifier_training.lr, weight_decay=1e-5)
         selnet_method: SelectiveNetMethod = SelectiveNetMethod(model_folder=model_folder, c=c_val)
         selnet_model_file = os.path.join(model_folder, f"selnet_model_c{c_val:.2f}.pt")
         selnet_best_acc: float = 0.0
@@ -942,7 +1077,7 @@ def main(config_file):
     logger.info(f"SAT model parameters: {sat_param_count:,}")
     run_summary["cost_realism"]["sat"] = {"num_parameters": sat_param_count}
 
-    sat_optimizer = torch.optim.Adam(sat_model.parameters(), lr=1e-5, weight_decay=1e-5)
+    sat_optimizer = torch.optim.Adam(sat_model.parameters(), lr=config.classifier_training.lr, weight_decay=1e-5)
     sat_method: SelfAdaptiveTrainingMethod = SelfAdaptiveTrainingMethod(
         num_train_samples=len(cascade_train_ds),
         num_classes=output_size,

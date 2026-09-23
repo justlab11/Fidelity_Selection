@@ -58,7 +58,13 @@ class MetaLossFunction(nn.Module):
         # Cost ratio vector; shape (n_f,)
         ch_vec = torch.tensor(self.ch, device=self.device).float()
 
-        # For each sample, total cost: cost ratio + loss
+        # For each sample, total cost: cost ratio + loss (Eq. 3/4 in the paper -
+        # additive, not multiplicative; cw only appears in the illustrative 0-1-loss
+        # special case, not the general loss). A multiplicative loss*(cw+ch) was
+        # tried here but is degenerate: whenever a fidelity's own loss is already
+        # near 0 (e.g. HF confidently correct), multiplying by any finite (cw+ch)
+        # keeps its cost near 0 regardless of ch, so no ch value can ever price it
+        # out - usage asymptotes well above 0% instead of sweeping down to it.
         total_costs = model_losses_tensor + ch_vec  # broadcasting: (batch_size, n_f)
 
         # For each sample, expected cost under FE probabilities:

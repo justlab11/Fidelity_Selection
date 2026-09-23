@@ -8,7 +8,7 @@ class SplitData(BaseModel):
     val: List[float]
 
 class DatasetSettings(BaseModel):
-    name: Literal["toy_2d", "toy_5d", "mnist_noise", "mnist_rotation", "bird_grayscale", "bird_color", "crop", "llvip"]
+    name: Literal["toy_2d", "toy_5d", "mnist_noise", "mnist_rotation", "bird_grayscale", "bird_color", "crop", "llvip", "bigearthnet"]
     folder: str
 
 class ClassifierSettings(BaseModel):
@@ -20,6 +20,12 @@ class ClassifierSettings(BaseModel):
     trained_lf_model: str | None
     trained_hf_model: str | None
     hf_input_mode: Literal["concat", "hf_only"] = "concat"
+    # Default matches the value every config before this field existed was
+    # implicitly using (main.py hardcoded lr=1e-5 for lf/hf/selnet/sat
+    # training) - appropriate for fine-tuning a pretrained CNN (resnet/vit),
+    # but far too slow for a small model trained from scratch (e.g. "mlp" on
+    # a toy dataset) to visibly converge within a reasonable epoch budget.
+    lr: float = 1e-5
 
     @model_validator(mode="after")
     def check_yolo_requires_trained_model(self):

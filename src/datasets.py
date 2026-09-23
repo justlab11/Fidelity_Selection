@@ -1,7 +1,9 @@
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 import numpy as np
+import pandas as pd
 from torch.utils.data import Dataset, random_split
 from PIL import Image
 import os.path as path
@@ -182,81 +184,53 @@ class MNISTDataset(Dataset):
     
 
 class CropDataset(Dataset):
+    """Reads the pre-chipped, ready-to-use layout: root/{train,val,test}/ each
+    containing paired "<basename>_img.tif" (56, 56, 6) / "<basename>_mask.tif"
+    (56, 56) files. Each file pair is already the single timestep/quadrant
+    crop that the old raw multi-temporal-crop-classification layout (see
+    CropDatasetOld) used to carve out on the fly, so there's no
+    timestep/quadrant windowing or random-cropping left to do here at
+    __getitem__ time - that work already happened once when this simplified
+    dataset was generated. The crop still gets resized back up to 224x224
+    (matching the old pipeline and build_unet's expected input resolution),
+    since it's a region-of-interest crop, not the model's native input size.
+    """
+
     def __init__(
         self,
         root: str,
         split: str,
         seed: int = 42,
-        test_ratio: float = 0.2,
     ):
         assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
 
-        self.fileset = []
-        self.generator = torch.Generator().manual_seed(seed)
         self.split = split
+        self.generator = torch.Generator().manual_seed(seed)
 
         self.img_transform = transforms.Compose([
             transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
             transforms.Resize((224, 224)),  # Resize to model input size
         ])
-        
+
         self.mask_transform = transforms.Compose([
             transforms.Lambda(lambda x: torch.from_numpy(x).long().unsqueeze(0)),  # uint8→long DIRECTLY
             transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.NEAREST),
             transforms.Lambda(lambda x: x.squeeze(0))
         ])
 
-        self.mean = 0
-        self.std = 0
+        split_folder = path.join(root, split)
+        img_suffix = "_img.tif"
+        self.fileset = [
+            path.join(split_folder, fname[:-len(img_suffix)])
+            for fname in sorted(os.listdir(split_folder))
+            if fname.endswith(img_suffix)
+        ]
 
-        if split == "val":
-            val_folder = path.join(root, "multi-temporal-crop-classification", "validation_data.txt")
-            with open(val_folder, "r") as f:
-                val_chips = f.readlines()
+        self.mean = None
+        self.std = None
 
-            val_filenames = [
-                path.join(
-                    root, 
-                    "multi-temporal-crop-classification", 
-                    "validation_chips", "validation_chips", line.strip()
-                ) for line in val_chips
-            ]
-
-            for i in range(len(val_filenames)):
-                for t in range(3): # timestep 
-                    for q in range(4): # quandrant of the image
-                        self.fileset.append((val_filenames[i], t, q))
-        
-        else:
-            train_folder = path.join(root, "multi-temporal-crop-classification", "training_data.txt")
-            with open(train_folder, "r") as f:
-                train_chips = f.readlines()
-
-            train_test_filenames = [
-                path.join(
-                    root, 
-                    "multi-temporal-crop-classification", 
-                    "training_chips", "training_chips", line.strip()
-                ) for line in train_chips
-            ]
-
-            n = len(train_test_filenames)
-            test_size = int(n * test_ratio)
-            train_size = n - test_size
-
-            train_set, test_set = random_split(train_test_filenames, [train_size, test_size], generator=self.generator)
-            if split == "train":
-                indices = train_set.indices
-            else:
-                indices = test_set.indices
-
-            for i in indices:
-                for t in range(3): # timestep 
-                    for q in range(4): # quandrant of the image
-                        self.fileset.append((train_test_filenames[i], t, q))
-            
-            if split == "train":
-                self._compute_dataset_stats()
+        if split == "train":
+            self._compute_dataset_stats()
 
     def get_num_classes(self):
         return 14
@@ -269,52 +243,36 @@ class CropDataset(Dataset):
 
     def __len__(self):
         return len(self.fileset)
-    
-    def _compute_dataset_stats(self):
-        """Compute global mean/std from unique chips in this split only"""
-        unique_chips = set(f[0] for f in self.fileset)  # Remove timestep/quadrant duplicates
-        
-        all_data = []
-        for chip_path in unique_chips:  # Just one sample per unique chip
-            image_fname = chip_path + "_merged.tif"
-            image_set = tif.imread(image_fname)
-            all_data.append(image_set)
-        
-        all_data = np.stack(all_data, axis=0)  # [N_chips, H, W, 18]
-        self.mean = all_data.mean(axis=(0,1,2))    # [18]
-        self.std = all_data.std(axis=(0,1,2)) + 1e-8  # [18]
-        
-    def __getitem__(self, idx:int):
-        base_fname, timestep, _ = self.fileset[idx]
-        mask_fname = base_fname + ".mask.tif"
-        image_fname = base_fname + "_merged.tif"
 
-        mask = tif.imread(mask_fname)
-        image_set = tif.imread(image_fname)
+    def _compute_dataset_stats(self, max_samples: int = 1000):
+        """Estimate global mean/std from a random subsample of the train split -
+        reading all ~148k precropped train chips just for this would be far
+        slower than the extra precision is worth."""
+        n = len(self.fileset)
+        sample_idx = torch.randperm(n, generator=self.generator)[:min(max_samples, n)].tolist()
+
+        all_data = np.stack(
+            [tif.imread(self.fileset[i] + "_img.tif") for i in sample_idx], axis=0
+        )
+        self.mean = all_data.mean(axis=(0, 1, 2))
+        self.std = all_data.std(axis=(0, 1, 2)) + 1e-8
+
+    def __getitem__(self, idx: int):
+        base_fname = self.fileset[idx]
+        image = tif.imread(base_fname + "_img.tif").astype(np.float32)
+        mask = tif.imread(base_fname + "_mask.tif")
 
         if self.mean is not None:
-            image_set = (image_set - self.mean[None, None, :]) / self.std[None, None, :]
+            image = (image - self.mean[None, None, :]) / self.std[None, None, :]
         else:
             warnings.warn("Please set self.mean and self.std to the values from the train set")
 
-        if self.split == "test":
-            hf_image = image_set[:56, :56, 6*timestep:6*(timestep+1)]
-        else:
-            x_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
-            x_end = x_start + 56
+        image[:, :, :3] = image[:, :, [2, 1, 0]]
+        image = self.img_transform(image)
 
-            y_start = torch.randint(0, 224 - 56 + 1, (1,), generator=self.generator).item()
-            y_end = y_start + 56
+        lf_image = image[:3]
+        hf_image = image[3:] # we concatenate later in the code so we split here
 
-            hf_image = image_set[x_start:x_end, y_start:y_end, 6*timestep:6*(timestep+1)]
-
-        hf_image[:,:,:3] = hf_image[:, :, [2, 1, 0]]
-        hf_image = self.img_transform(hf_image)
-
-        lf_image = hf_image[:3]
-        hf_image = hf_image[3:] # we concatenate later in the code so we split here
-
-        mask = mask[x_start:x_end, y_start:y_end]
         mask = self.mask_transform(mask)
 
         return lf_image, hf_image, mask
@@ -563,7 +521,25 @@ class LLVIPDataset(Dataset):
     other, not to this ground truth directly.
 
     No official validation split is provided (only train/test, per LLVIP's
-    own layout) — val is carved out of train the same way CUBDataset does.
+    own layout). val can't be carved out of train the way CUBDataset does,
+    though, the way it might look like it should be: the YOLO checkpoints this
+    project wraps are pretrained on the *entirety* of LLVIP's train folder, so
+    any val subset sampled from train would still be fully "seen" by those
+    checkpoints no matter how it's drawn - it would measure something close to
+    memorization, not generalization. val has to come from test instead.
+
+    LLVIP's filenames encode scene id as their leading two digits (e.g.
+    "260532.jpg" is scene "26"), and train/test are already split along whole
+    scene boundaries - no scene appears in both. test's frames are sequential
+    video within each scene, so a random per-frame val/test split would leak
+    near-duplicate adjacent frames across the split (verified: with a plain
+    random split, ~99% of a would-be val set had an immediate-neighbor frame
+    land in test). Splitting along scene boundaries instead - holding out the
+    scene(s) named in val_scene_prefixes as val, keeping every other test
+    scene as the final test set - avoids that: every val/test boundary is a
+    genuine scene boundary, not a mid-video cut. The unavoidable cost is a
+    smaller final test set (the default holds out scene "26", ~533 of test's
+    3,463 images).
 
     lf_img/hf_img are returned as (3, img_size, img_size) float tensors
     scaled to [0, 1] — YOLOv5's own preprocessing convention (no ImageNet
@@ -576,10 +552,10 @@ class LLVIPDataset(Dataset):
         root: str,
         split: str,
         seed: int = 42,
-        val_ratio: float = 0.1,
         img_size: int = 640,
         max_boxes: int = 20,
         lf_modality: str = "visible",
+        val_scene_prefixes: tuple = ("26",),
     ):
         assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
         assert lf_modality in ["visible", "infrared"], "lf_modality must be 'visible' or 'infrared'"
@@ -598,21 +574,20 @@ class LLVIPDataset(Dataset):
         self.max_boxes = max_boxes
         self.lf_modality = lf_modality
         self.hf_modality = "infrared" if lf_modality == "visible" else "visible"
-        self.generator = torch.Generator().manual_seed(seed)
+        # seed is accepted (unused) for interface parity with build_dataset's
+        # uniform per-dataset call signature - this split is scene-based and
+        # deterministic, not random, so there's nothing left for it to seed.
 
-        self.file_split = "test" if split == "test" else "train"
+        self.file_split = "test" if split in ("test", "val") else "train"
         image_dir = path.join(root, "visible", self.file_split)
         basenames = sorted(
             f for f in os.listdir(image_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))
         )
 
-        if split != "test":
-            n = len(basenames)
-            val_size = int(n * val_ratio)
-            train_size = n - val_size
-            train_set, val_set = random_split(basenames, [train_size, val_size], generator=self.generator)
-            indices = train_set.indices if split == "train" else val_set.indices
-            self.basenames = [basenames[i] for i in indices]
+        if split == "val":
+            self.basenames = [f for f in basenames if f[:2] in val_scene_prefixes]
+        elif split == "test":
+            self.basenames = [f for f in basenames if f[:2] not in val_scene_prefixes]
         else:
             self.basenames = basenames
 
@@ -679,6 +654,171 @@ class LLVIPDataset(Dataset):
         hf_tensor = torch.from_numpy(hf_img).permute(2, 0, 1).float() / 255.0
 
         return lf_tensor, hf_tensor, torch.from_numpy(label)
+
+class BigEarthNetDataset(Dataset):
+    """Paired Sentinel-1 (SAR) / Sentinel-2 (multispectral optical) dataset
+    (BigEarthNet v2 / "reben" layout). LF is S1 by default (2-band VV/VH SAR,
+    cheap to acquire and weather/cloud-independent but coarse) and HF is S2
+    (12-band optical, richer spectral signal but cloud-occluded and pricier to
+    task) — pass lf_modality="s2" to flip which checkpoint plays which role.
+
+    root is expected to contain "BigEarthNet-S1/", "BigEarthNet-S2/", and
+    "metadata.parquet" (the standard BigEarthNet v2 layout). Patch/scene
+    directory names are derived from metadata.parquet's patch_id and s1_name
+    columns:
+      - S2 dir: root/BigEarthNet-S2/<patch_id minus last 2 "_"-tokens>/<patch_id>/
+      - S1 dir: root/BigEarthNet-S1/<s1_name minus last 3 "_"-tokens>/<s1_name>/
+    with per-band files named "<dir_name>_<BAND>.tif" inside.
+
+    labels is BigEarthNet's 19-class multi-label nomenclature (a patch can
+    show several land-cover types at once), so `label` here is a (19,)
+    multi-hot float tensor rather than a single class index.
+
+    S2's bands live at 3 different native resolutions (10m/20m/60m per
+    Sentinel-2's own sensor design), so every band is bilinearly resized to
+    img_size (default 120, S1/10m-S2's native patch size) to stack into a
+    single tensor.
+
+    Not every metadata row necessarily has both S1 and S2 data present on
+    disk (e.g. a partial download) — rows missing either directory are
+    dropped at init (see verify_paths).
+    """
+
+    S1_BANDS = ["VV", "VH"]
+    S2_BANDS = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"]
+    LABELS = [
+        "Agro-forestry areas", "Arable land", "Beaches, dunes, sands", "Broad-leaved forest",
+        "Coastal wetlands", "Complex cultivation patterns", "Coniferous forest",
+        "Industrial or commercial units", "Inland waters", "Inland wetlands",
+        "Land principally occupied by agriculture, with significant areas of natural vegetation",
+        "Marine waters", "Mixed forest", "Moors, heathland and sclerophyllous vegetation",
+        "Natural grassland and sparsely vegetated areas", "Pastures", "Permanent crops",
+        "Transitional woodland, shrub", "Urban fabric",
+    ]
+
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        seed: int = 42,
+        img_size: int = 120,
+        lf_modality: str = "s1",
+        verify_paths: bool = True,
+    ):
+        assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
+        assert lf_modality in ["s1", "s2"], "lf_modality must be 's1' or 's2'"
+        # seed is accepted (unused) for interface parity with build_dataset's
+        # uniform per-dataset call signature - BigEarthNet ships fixed
+        # train/validation/test splits in metadata.parquet, so there's
+        # nothing left for it to seed.
+
+        self.root = root
+        self.img_size = img_size
+        self.lf_modality = lf_modality
+        self.hf_modality = "s2" if lf_modality == "s1" else "s1"
+        self.s1_root = path.join(root, "BigEarthNet-S1")
+        self.s2_root = path.join(root, "BigEarthNet-S2")
+        self.label_to_idx = {label: i for i, label in enumerate(self.LABELS)}
+
+        split_map = {"train": "train", "val": "validation", "test": "test"}
+        df = pd.read_parquet(path.join(root, "metadata.parquet"))
+        df = df[df["split"] == split_map[split]]
+
+        self.samples = []
+        for row in df.itertuples(index=False):
+            patch_id = row.patch_id
+            s1_name = row.s1_name
+
+            # S2 tile dir: strip last 2 tokens (H-Order, V-Order)
+            s2_tile = "_".join(patch_id.split("_")[:-2])
+            s2_dir = path.join(self.s2_root, s2_tile, patch_id)
+
+            # S1 tile dir: strip last 3 tokens (Tile, H-Order, V-Order) - scene-only dir name
+            s1_tile = "_".join(s1_name.split("_")[:-3])
+            s1_dir = path.join(self.s1_root, s1_tile, s1_name)
+
+            if verify_paths and not (path.isdir(s2_dir) and path.isdir(s1_dir)):
+                continue
+
+            self.samples.append((patch_id, s2_dir, s1_name, s1_dir, list(row.labels)))
+
+        if not self.samples:
+            raise RuntimeError(f"No BigEarthNet samples found on disk for split={split!r} under root={root!r}")
+
+    def get_num_classes(self):
+        return len(self.LABELS)
+
+    def get_lf_input_size(self):
+        return len(self.S1_BANDS) if self.lf_modality == "s1" else len(self.S2_BANDS)
+
+    def get_hf_input_size(self):
+        return len(self.S2_BANDS) if self.hf_modality == "s2" else len(self.S1_BANDS)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _read_band_raw(self, fpath):
+        arr = tif.imread(fpath).astype(np.float32)
+        return torch.from_numpy(arr)
+
+    def _load_band(self, fpath):
+        band = self._read_band_raw(fpath)
+        if band.shape != (self.img_size, self.img_size):
+            band = F.interpolate(
+                band[None, None], size=(self.img_size, self.img_size),
+                mode="bilinear", align_corners=False,
+            )[0, 0]
+        return band
+
+    def _load_s1(self, s1_dir, s1_name):
+        bands = [self._load_band(path.join(s1_dir, f"{s1_name}_{b}.tif")) for b in self.S1_BANDS]
+        return torch.stack(bands, dim=0)  # (2, H, W)
+
+    def _load_s2(self, s2_dir, patch_id):
+        bands = [self._load_band(path.join(s2_dir, f"{patch_id}_{b}.tif")) for b in self.S2_BANDS]
+        return torch.stack(bands, dim=0)  # (12, H, W)
+
+    def _load_label(self, labels):
+        label = torch.zeros(len(self.LABELS), dtype=torch.float32)
+        for l in labels:
+            label[self.label_to_idx[l]] = 1.0
+        return label
+
+    def load_raw_bands(self, idx):
+        """Returns every native-resolution S1+S2 band for sample idx as a
+        {band_name: (H, W) float32 tensor} dict - unresized (each Sentinel
+        band keeps its own native 10m/20m/60m resolution) and unnormalized.
+
+        This is a separate entry point from __getitem__ (which stacks/resizes
+        into the fixed lf/hf tensors the rest of this codebase's models
+        expect): it's meant for models.BigEarthNetFidelityModel.preprocess,
+        which - given any single-modality reben_publication checkpoint -
+        knows on its own which bands/order/resize/normalization to apply, so
+        the dataset doesn't need to know which checkpoint will consume it.
+        A DataLoader batching a Dataset built around this method auto-collates
+        it into {band_name: (B, H, W)} since each band has a fixed native
+        resolution across all patches.
+        """
+        patch_id, s2_dir, s1_name, s1_dir, _ = self.samples[idx]
+        bands = {}
+        for b in self.S1_BANDS:
+            bands[b] = self._read_band_raw(path.join(s1_dir, f"{s1_name}_{b}.tif"))
+        for b in self.S2_BANDS:
+            bands[b] = self._read_band_raw(path.join(s2_dir, f"{patch_id}_{b}.tif"))
+        return bands
+
+    def __getitem__(self, idx):
+        patch_id, s2_dir, s1_name, s1_dir, labels = self.samples[idx]
+
+        modality_images = {
+            "s1": lambda: self._load_s1(s1_dir, s1_name),
+            "s2": lambda: self._load_s2(s2_dir, patch_id),
+        }
+        lf_img = modality_images[self.lf_modality]()
+        hf_img = modality_images[self.hf_modality]()
+        label = self._load_label(labels)
+
+        return lf_img, hf_img, label
 
 class BodyDataset(Dataset):
     def __init__(self, folder_path):

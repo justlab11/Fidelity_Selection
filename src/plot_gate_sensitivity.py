@@ -4,10 +4,12 @@ import logging
 import numpy as np
 import matplotlib.pyplot as plt
 import click
+from sklearn.isotonic import IsotonicRegression
 
 logger = logging.getLogger(__name__)
 
 SERIES_COLOR = "#2a78d6"
+RAW_POINT_COLOR = "#898781"
 INK_PRIMARY = "#0b0b0b"
 INK_SECONDARY = "#52514e"
 INK_MUTED = "#898781"
@@ -92,6 +94,64 @@ def find_zoom_range(r_sorted: np.ndarray, usage_sorted: np.ndarray, low: float, 
 def report_max_usage(r_sorted: np.ndarray, usage_sorted: np.ndarray):
     idx = int(np.argmax(usage_sorted))
     return float(usage_sorted[idx]), float(r_sorted[idx])
+
+
+def fit_isotonic_usage(r: np.ndarray, usage: np.ndarray):
+    """Fits a non-increasing (isotonic) regression of usage on c_h.
+
+    The *Bayes-optimal* usage(c_h) is provably non-increasing: for any fixed
+    sample, the per-sample-optimal rule is "choose HF if hf_loss + c_h <
+    lf_loss" — raising c_h only ever makes the HF side larger, so once a
+    sample's optimal choice flips from HF to LF as c_h grows, it can never
+    flip back. Usage is just the fraction of samples on the HF side, so the
+    true optimal curve can only decrease (or hold), never rise, as c_h grows.
+
+    The raw points here (one per independently-retrained gate, reset_all_weights
+    + trained from scratch — see AdaptiveGridSearch.train_fe_model) are noisy
+    estimates scattered around that true curve, not the curve itself — the
+    non-monotonicity we've actually observed is estimation noise from that
+    per-run retraining, not evidence the underlying relationship isn't
+    monotonic. Isotonic regression recovers the denoised trend those noisy
+    per-c_h estimates are scattered around, without assuming any particular
+    smooth functional form (unlike e.g. a polynomial fit).
+    """
+    order = np.argsort(r)
+    iso = IsotonicRegression(increasing=False, out_of_bounds="clip")
+    iso.fit(r[order], usage[order])
+    return iso
+
+
+def plot_isotonic_smoothing(r: np.ndarray, usage: np.ndarray, save_path: str) -> None:
+    """Raw (c_h, usage) points from every gate retrained during the sweep —
+    scattered to show just how noisy per-c_h estimates really are — overlaid
+    with the isotonic (non-increasing) fit: the denoised estimate of the true
+    Bayes-optimal usage(c_h) curve (see fit_isotonic_usage)."""
+    iso = fit_isotonic_usage(r, usage)
+    r_line = np.linspace(r.min(), r.max(), 200)
+    usage_line = iso.predict(r_line)
+
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
+    fig.patch.set_facecolor("#fcfcfb")
+    ax.set_facecolor("#fcfcfb")
+    _style_axes(ax)
+
+    ax.scatter(r, usage * 100, s=20, color=RAW_POINT_COLOR, alpha=0.55, zorder=2,
+               label="Raw per-run samples (training noise)")
+    ax.plot(r_line, usage_line * 100, color=SERIES_COLOR, linewidth=2.5, zorder=3,
+            label="Isotonic fit (non-increasing)")
+
+    ax.set_xlabel("c_h", color=INK_SECONDARY)
+    ax.set_ylabel("Usage (%)", color=INK_PRIMARY)
+    ax.set_title("Usage vs c_h: raw training noise vs. isotonic-smoothed trend", color=INK_PRIMARY, fontweight="bold")
+    legend = ax.legend(frameon=False, loc="best")
+    for text in legend.get_texts():
+        text.set_color(INK_SECONDARY)
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    logger.info(f"Saved isotonic smoothing plot to {save_path}")
 
 
 def _style_axes(ax):
@@ -201,6 +261,8 @@ def main(results_folder, low, high, round_decimals, smooth_window):
 
     zoom_range = find_zoom_range(r_sorted, usage_sorted, low, high)
     plot_zoom(r_sorted, usage_sorted, zoom_range, os.path.join(image_folder, "gate_sensitivity_zoom.png"))
+
+    plot_isotonic_smoothing(r, usage, os.path.join(image_folder, "gate_sensitivity_isotonic.png"))
 
     max_usage, r_at_max = report_max_usage(r_sorted, usage_sorted)
     logger.info(
