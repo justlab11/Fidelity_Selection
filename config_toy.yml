@@ -1,0 +1,38 @@
+dataset:
+  name: toy_2d
+  folder: ../data
+
+latent_size: 32
+random_seed: 42
+run_comparisons: False
+train_body: True
+
+
+classifier_training:
+  # classifier_training.lr defaults to 1e-5 (tuned for fine-tuning pretrained
+  # CNNs, e.g. resnet/vit on the image datasets) - far too slow for this
+  # dataset/model combo, a 4-layer MLP trained from scratch on 160 samples, to
+  # visibly converge within a reasonable epoch budget. 1e-3 + 200 epochs gets
+  # this MLP to ~90% train / ~85% test (vs. an ~88% SVC ceiling on this
+  # synthetic clustering task) in well under a minute.
+  epochs: 200
+  batch_size: 32
+  loss_fun: CE
+  hf_input_mode: concat
+  lf_model: mlp
+  hf_model: mlp
+  trained_lf_model:
+  trained_hf_model:
+  lr: 1e-3
+
+fe_training:
+  epochs: 40
+  batch_size: 32
+  reruns: 1
+
+  r_range:
+    start: 0.0
+    stop: 1.0
+    num_steps: 25
+    scale: linear
+    direction: reversed # normal: 0 -> 1, reversed 1 -> 0

@@ -21,7 +21,7 @@ from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset, LL
 from custom_types import ConfigOptions, FEResult
 from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead, build_yolov5, YOLOv5FidelityModel
 from losses import MetaLossFunction
-from comparisons import SelectiveNetMethod
+from comparisons import SelectiveNetMethod, IndexedDataset
 
 logger = logging.getLogger(__name__)
 
@@ -531,11 +531,13 @@ def compute_yolo_detection_correctness(
     return correct
 
 def compute_gate_routing_details(model, dataloader, device):
-    """One no-grad pass over a "gate"-fidelity dataloader (lf_embeddings, lf_preds,
-    hf_preds, target), returning per-sample arrays: the gate's routing decision and
-    both models' own correctness — everything needed to build the ground-truth
-    "HF needed" / "LF fine" labels and the routing confusion counts, without
-    duplicating classifier_one_run's loss/aggregate-accuracy bookkeeping.
+    """One no-grad pass over a "gate"-fidelity dataloader (lf_embeddings, lf_loss,
+    hf_loss, lf_correct, hf_correct, idx), returning per-sample arrays: the gate's
+    routing decision and both models' own (already-precomputed - see
+    compute_fidelity_loss_correct/save_latent) correctness — everything needed to
+    build the ground-truth "HF needed" / "LF fine" labels and the routing confusion
+    counts, without duplicating classifier_one_run's loss/aggregate-accuracy
+    bookkeeping.
 
     lf_embeddings may be flat (B, latent_dim) for an "mlp" gate or spatial
     (B, C, H, W) for a "cnn_head" gate (segmentation, or YOLO's unpooled
@@ -552,15 +554,12 @@ def compute_gate_routing_details(model, dataloader, device):
     """
     model.eval()
 
-    lf_latents, lf_corrects, hf_corrects, choices, labels = [], [], [], [], []
+    lf_latents, lf_corrects, hf_corrects, choices, idxs = [], [], [], [], []
     latent_sample_shape = None
 
     with torch.no_grad():
-        for lf_embeddings, lf_preds, hf_preds, target in dataloader:
+        for lf_embeddings, lf_loss, hf_loss, lf_correct, hf_correct, idx in dataloader:
             lf_embeddings = lf_embeddings.to(device, torch.float)
-            lf_preds = lf_preds.to(device, torch.float)
-            hf_preds = hf_preds.to(device, torch.float)
-            target = target.long().to(device)
 
             choice = torch.argmax(model(lf_embeddings)["output"], dim=1)  # 0=LF, 1=HF
 
@@ -573,17 +572,17 @@ def compute_gate_routing_details(model, dataloader, device):
             )
 
             lf_latents.append(lf_pooled.cpu().numpy())
-            lf_corrects.append((torch.argmax(lf_preds, dim=1) == target).cpu().numpy())
-            hf_corrects.append((torch.argmax(hf_preds, dim=1) == target).cpu().numpy())
+            lf_corrects.append(lf_correct.cpu().numpy())
+            hf_corrects.append(hf_correct.cpu().numpy())
             choices.append(choice.cpu().numpy())
-            labels.append(target.cpu().numpy())
+            idxs.append(idx.cpu().numpy())
 
     return {
         "lf_latent": np.concatenate(lf_latents, axis=0),
         "lf_correct": np.concatenate(lf_corrects, axis=0),
         "hf_correct": np.concatenate(hf_corrects, axis=0),
         "choice": np.concatenate(choices, axis=0),
-        "label": np.concatenate(labels, axis=0),
+        "idx": np.concatenate(idxs, axis=0),
         "latent_sample_shape": latent_sample_shape,
     }
 
@@ -607,19 +606,27 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
     model.train(mode=bool(optimizer))
     device = next(model.parameters()).device
 
-    total_loss = 0.0
-    total_correct = 0.0
+    # Accumulated as GPU tensors and only pulled to a Python float once, at
+    # the very end (see the .item() calls right before average_loss/accuracy
+    # are computed) - a per-batch .item() forces the CPU to block until the
+    # GPU finishes everything queued so far, which serializes what would
+    # otherwise be async, pipelined GPU work. With hundreds/thousands of
+    # batches per run that per-batch sync (not the actual compute) ends up
+    # dominating wall-clock time, especially for small models/batches where
+    # there's very little real work to overlap the sync latency with.
+    total_loss = torch.zeros((), device=device)
+    total_correct = torch.zeros((), device=device)
     total_samples = 0.0
     # Segmentation losses (crop/unet) are already averaged per-pixel by
     # criterion, so they need to be weighted/divided by batch count, not by
     # total_samples - that's pixel count (B*H*W) for segmentation, since it
     # also doubles as the accuracy denominator. Reusing total_samples for both
-    # would divide a loss already keyed to `loss.item() * batch_size` by a
+    # would divide a loss already keyed to `loss.detach() * batch_size` by a
     # pixel count thousands of times larger, silently flooring the printed
     # loss to 0.0000 while accuracy (whose numerator/denominator scale
     # together) stays correct.
     total_loss_samples = 0.0
-    total_high = 0
+    total_high = torch.zeros((), device=device)
 
     if fidelity == "lf":
         for data, _, target in dataloader:
@@ -630,8 +637,8 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
                 output = model(data)["output"]
                 correct = compute_yolo_detection_correctness(output, target, img_size=data.shape[-2:])
 
-                total_loss += (1 - correct).sum().item()
-                total_correct += correct.sum().item()
+                total_loss += (1 - correct).sum()
+                total_correct += correct.sum()
                 total_samples += data.size(0)
                 total_loss_samples += data.size(0)
                 continue
@@ -652,16 +659,16 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
-            total_loss += loss.item() * data.size(0)
+            total_loss += loss.detach() * data.size(0)
             total_loss_samples += data.size(0)
             predicted = torch.argmax(output, dim=1)
 
             is_segmentation = (output.ndim == 4 and target.ndim >= 3)
             if is_segmentation:
-                total_correct += (predicted == target).float().sum().item()
+                total_correct += (predicted == target).float().sum()
                 total_samples += predicted.numel()  # B*C*H*W but C=1 after argmax
             else:
-                total_correct += (predicted == target).sum().item()
+                total_correct += (predicted == target).sum()
                 total_samples += data.size(0)
 
         if scheduler:
@@ -677,8 +684,8 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
                 output = model(data)["output"]
                 correct = compute_yolo_detection_correctness(output, target, img_size=data.shape[-2:])
 
-                total_loss += (1 - correct).sum().item()
-                total_correct += correct.sum().item()
+                total_loss += (1 - correct).sum()
+                total_correct += correct.sum()
                 total_samples += data.size(0)
                 total_loss_samples += data.size(0)
                 continue
@@ -699,37 +706,32 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 optimizer.step()
 
-            total_loss += loss.item() * data.size(0)
+            total_loss += loss.detach() * data.size(0)
             total_loss_samples += data.size(0)
             predicted = torch.argmax(output, dim=1)
 
             is_segmentation = (output.ndim == 4 and target.ndim >= 3)
             if is_segmentation:
-                total_correct += (predicted == target).float().sum().item()
+                total_correct += (predicted == target).float().sum()
                 total_samples += predicted.numel()  # B*C*H*W but C=1 after argmax
             else:
-                total_correct += (predicted == target).sum().item()
+                total_correct += (predicted == target).sum()
                 total_samples += data.size(0)
 
         if scheduler:
             scheduler.step()
 
     elif fidelity == "gate":
-        for lf_embeddings, lf_preds, hf_preds, target in dataloader:
+        for lf_embeddings, lf_loss, hf_loss, lf_correct, hf_correct, idx in dataloader:
             lf_embeddings = lf_embeddings.to(device, torch.float)
-            lf_preds = lf_preds.to(device, torch.float)
-            hf_preds = hf_preds.to(device, torch.float)
-
-            target = target.type(torch.LongTensor)
-            target = target.to(device)
+            lf_loss = lf_loss.to(device, torch.float)
+            hf_loss = hf_loss.to(device, torch.float)
+            lf_correct = lf_correct.to(device)
+            hf_correct = hf_correct.to(device)
 
             outputs = model(lf_embeddings)["output"]
-            preds = torch.stack([
-                lf_preds,
-                hf_preds
-            ])
 
-            loss = criterion(target, preds, outputs)
+            loss = criterion([lf_loss, hf_loss], outputs)
             if optimizer:
                 optimizer.zero_grad()
                 loss.backward()
@@ -738,23 +740,28 @@ def classifier_one_run(model, dataloader, criterion, fidelity, train_body=True, 
                 optimizer.step()
 
             choices = torch.argmax(outputs, dim=1)
-            lf_acc = torch.argmax(lf_preds, dim=1) == target
-            hf_acc = torch.argmax(hf_preds, dim=1) == target
+            routed_correct = torch.where(choices == 1, hf_correct, lf_correct)
 
-            total_loss += loss.item() * lf_preds.size(0)
-            total_correct += torch.sum(hf_acc[choices==1]) + torch.sum(lf_acc[choices==0]).item()
-            total_samples += lf_preds.size(0)
-            total_loss_samples += lf_preds.size(0)
-            total_high += torch.sum(choices).item()
+            total_loss += loss.detach() * lf_embeddings.size(0)
+            total_correct += torch.sum(routed_correct)
+            total_samples += lf_embeddings.size(0)
+            total_loss_samples += lf_embeddings.size(0)
+            total_high += torch.sum(choices)
         if scheduler:
             scheduler.step()
+
+    # Single sync per call (not per batch) to pull the accumulated GPU
+    # tensors back to Python floats.
+    total_loss = total_loss.item()
+    total_correct = total_correct.item()
+    total_high = total_high.item()
 
     average_loss = total_loss / total_loss_samples
     accuracy = total_correct / total_samples
 
     if fidelity=="gate":
         high_count = total_high / total_samples
-        return average_loss, accuracy.item(), high_count
+        return average_loss, accuracy, high_count
 
     return average_loss, accuracy
 
@@ -804,6 +811,45 @@ def save_body(
 
     logger.info(f"Finished saving split to {save_folder}")
 
+def compute_fidelity_loss_correct(output: torch.Tensor, target: torch.Tensor):
+    """Per-sample (loss, correct) for a model's raw output vs. the true target -
+    the two things the gate stage (classifier_one_run's "gate" fidelity,
+    save_latent, compute_gate_routing_details) ever derive from a fidelity's
+    prediction. Computed once here instead of carrying the full output/label
+    through the whole gate pipeline.
+
+    Handles both this repo's classification shape ((B, num_classes) output vs.
+    (B,) target - loss/correct come out (B,), one real number/bool per sample)
+    and its segmentation shape ((B, C, H, W) output vs. (B, H, W) target - the
+    per-pixel CE/hit map is averaged over pixels down to one number per image;
+    "correct" for segmentation means "more than half this image's pixels were
+    classified correctly", not "every pixel matched exactly").
+
+    loss stays continuous (mean CE) so it keeps the confidence signal a hard
+    right/wrong wouldn't - "correct" is a separate, genuinely boolean value
+    because downstream ground-truth logic (compute_ground_truth's hf_needed =
+    hf_correct & ~lf_correct) uses bitwise &/~ on it directly.
+
+    Not used for YOLO - its raw output isn't comparable to a target via CE at
+    all, so it keeps its own compute_yolo_detection_correctness path (see
+    save_latent), with loss defined as 1 - correct there instead.
+    """
+    target = target.long()
+    is_segmentation = (output.ndim == 4 and target.ndim >= 3)
+
+    per_element_loss = F.cross_entropy(output, target, reduction="none")
+    per_element_hit = (output.argmax(dim=1) == target)
+
+    if is_segmentation:
+        spatial_dims = tuple(range(1, per_element_loss.ndim))
+        loss = per_element_loss.mean(dim=spatial_dims)
+        correct = per_element_hit.float().mean(dim=spatial_dims) > 0.5
+    else:
+        loss = per_element_loss
+        correct = per_element_hit
+
+    return loss, correct
+
 def save_latent(
         lf_model: nn.Module,
         hf_model: nn.Module,
@@ -824,6 +870,23 @@ def save_latent(
     ~90k-sample dataset needs ~1.6TB of disk; pass "latent" there to bring
     the full-resolution map back (see UNet.forward's comment for the rest of
     what that would take).
+
+    Per sample, this saves lf_latent plus each fidelity's precomputed
+    (lf_loss, hf_loss, lf_correct, hf_correct) against the true label - see
+    compute_fidelity_loss_correct - instead of the raw output/label
+    themselves. That's all classifier_one_run's "gate" fidelity
+    (MetaLossFunction's expected cost, class-weighted reweighting,
+    usage/accuracy bookkeeping) or compute_gate_routing_details ever derived
+    from them anyway, and computing it once here instead of carrying full
+    (B, num_classes) or (B, C, H, W) tensors through the whole gate search is
+    what keeps this affordable for a segmentation dataset like crop.
+
+    dataloader is expected to yield (idx, lf, hf, labels) - wrap its dataset in
+    comparisons.IndexedDataset first. idx is saved per sample too (not used by
+    training - see gate stage) purely so a routed sample can be traced back to
+    the original dataset item later; it also replaces batch_idx/i in the
+    output filename, so filenames stay stable across reruns even though the
+    dataloader shuffles.
     """
 
     lf_model = lf_model.to(device)
@@ -839,7 +902,7 @@ def save_latent(
         raise ValueError("Mixing a YOLO model with a non-YOLO model across lf/hf is not supported")
 
     with torch.no_grad():
-        for batch_idx, (lf, hf, labels) in enumerate(dataloader):
+        for idx, lf, hf, labels in dataloader:
             hf = assemble_hf_input(lf, hf, hf_input_mode, hf_model=hf_model)
 
             lf = lf.to(device)
@@ -853,33 +916,28 @@ def save_latent(
                 lf_head = lf_model.head(lf)
                 hf_head = hf_model.head(hf)
 
-
             lf_latent = lf_head[latent_key]
 
             if lf_is_yolo:
-                # Redefine what "lf_output"/"hf_output"/"label" mean for a YOLO
-                # cascade: instead of raw class logits, store a per-image
-                # [incorrect, correct] pair (see compute_yolo_detection_correctness)
-                # and a constant target of 1 ("correct" is always the true class).
-                # argmax([1-correct, correct]) == 1 then reproduces `correct`
-                # exactly, so every downstream consumer (compute_gate_routing_details,
-                # the gate's CE loss, the routing plots) keeps working unmodified.
-                lf_correct = compute_yolo_detection_correctness(lf_head["output"], labels, img_size=lf.shape[-2:])
-                hf_correct = compute_yolo_detection_correctness(hf_head["output"], labels, img_size=hf.shape[-2:])
-
-                lf_output = torch.stack([1 - lf_correct, lf_correct], dim=1)
-                hf_output = torch.stack([1 - hf_correct, hf_correct], dim=1)
-                labels = torch.ones(lf.size(0), dtype=torch.long)
+                # YOLO's raw output (boxes) isn't comparable to a target via CE
+                # at all, so correctness is the only signal available -
+                # compute_yolo_detection_correctness already reduces it to a
+                # per-image (B,) float in {0.0, 1.0}; loss is defined as
+                # 1 - correct to keep the same "0 = perfect, positive = worse"
+                # convention compute_fidelity_loss_correct's CE-based loss has.
+                lf_correct = compute_yolo_detection_correctness(lf_head["output"], labels, img_size=lf.shape[-2:]).bool()
+                hf_correct = compute_yolo_detection_correctness(hf_head["output"], labels, img_size=hf.shape[-2:]).bool()
+                lf_loss = 1.0 - lf_correct.float()
+                hf_loss = 1.0 - hf_correct.float()
             else:
-                lf_output = lf_head["output"]
-
-                # Pass hf through hf_model head (latent + output)
-                hf_output = hf_head["output"]
-                labels = labels.cpu()
+                lf_loss, lf_correct = compute_fidelity_loss_correct(lf_head["output"], labels)
+                hf_loss, hf_correct = compute_fidelity_loss_correct(hf_head["output"], labels)
 
             lf_latent = lf_latent.cpu()
-            lf_output = lf_output.cpu()
-            hf_output = hf_output.cpu()
+            lf_loss = lf_loss.cpu()
+            hf_loss = hf_loss.cpu()
+            lf_correct = lf_correct.cpu()
+            hf_correct = hf_correct.cpu()
 
             batch_size = lf_latent.size(0)
             for i in range(batch_size):
@@ -889,12 +947,15 @@ def save_latent(
                 # every sibling sample into each per-sample file too (an easy-to-
                 # miss ~batch_size x disk/IO blowup - severe once lf_latent is a
                 # large spatial (C, H, W) map rather than a small flat vector).
+                sample_idx = int(idx[i])
                 torch.save({
                     "lf_latent": lf_latent[i].clone(),
-                    "lf_output": lf_output[i].clone(),
-                    "hf_output": hf_output[i].clone(),
-                    "label": labels[i].clone()
-                }, os.path.join(save_folder, f"sample_{batch_idx}_{i}.pt"))
+                    "lf_loss": lf_loss[i].clone(),
+                    "hf_loss": hf_loss[i].clone(),
+                    "lf_correct": lf_correct[i].clone(),
+                    "hf_correct": hf_correct[i].clone(),
+                    "idx": sample_idx
+                }, os.path.join(save_folder, f"sample_{sample_idx}.pt"))
 
     logger.info(f"Finished saving split to {save_folder}")
 
@@ -928,7 +989,7 @@ def gate_logit_stats(model, dataloader, device):
     logit_min, logit_max, abs_sum, count = float("inf"), float("-inf"), 0.0, 0
 
     with torch.no_grad():
-        for lf_embeddings, _, _, _ in dataloader:
+        for lf_embeddings, *_ in dataloader:
             lf_embeddings = lf_embeddings.to(device, torch.float)
             outputs = model(lf_embeddings)["output"]
 
@@ -1096,7 +1157,7 @@ class GaussianProcessSearch:
 class AdaptiveGridSearch:
     def __init__(
             self, fe_model, device, train_dl, val_dl, test_dl, model_folder,
-            class_weighted_loss=False, gate_epochs=30, gate_lr=3e-4, gate_grad_clip_norm=None, seed=42):
+            gate_epochs=30, gate_lr=3e-4, gate_grad_clip_norm=None, seed=42):
         # evaluated_points is reset at the start of every rerun (see run_reruns) so
         # each rerun's bracket search is a genuinely independent sweep, not warm-
         # started off a previous rerun's history. all_evaluated_points pools every
@@ -1117,7 +1178,6 @@ class AdaptiveGridSearch:
         self.val_dl = val_dl
         self.test_dl = test_dl
         self.model_folder = model_folder
-        self.class_weighted_loss = class_weighted_loss
         self.gate_epochs = gate_epochs
         self.gate_lr = gate_lr
         self.gate_grad_clip_norm = gate_grad_clip_norm
@@ -1336,8 +1396,7 @@ class AdaptiveGridSearch:
         criterion = MetaLossFunction(
             ch=[r_val],
             cw=1,
-            device=self.device,
-            class_weighted=self.class_weighted_loss
+            device=self.device
         )
 
         set_all_seeds(self.rerun_seed)
@@ -1465,7 +1524,7 @@ class AdaptiveGridSearch:
             lf_correct=np.stack([s["lf_correct"] for s in self.routing_snapshots], axis=0),
             hf_correct=np.stack([s["hf_correct"] for s in self.routing_snapshots], axis=0),
             choice=np.stack([s["choice"] for s in self.routing_snapshots], axis=0),
-            label=np.stack([s["label"] for s in self.routing_snapshots], axis=0),
+            idx=np.stack([s["idx"] for s in self.routing_snapshots], axis=0),
             latent_2d=latent_2d,
             boundary_xx=self.boundary_xx,
             boundary_yy=self.boundary_yy,
@@ -1602,18 +1661,15 @@ class AdaptiveGridSearch:
         p_hf_list, lf_correct_list, hf_correct_list = [], [], []
 
         with torch.no_grad():
-            for lf_embeddings, lf_preds, hf_preds, target in dataloader:
+            for lf_embeddings, lf_loss, hf_loss, lf_correct, hf_correct, idx in dataloader:
                 lf_embeddings = lf_embeddings.to(self.device, torch.float)
-                lf_preds = lf_preds.to(self.device, torch.float)
-                hf_preds = hf_preds.to(self.device, torch.float)
-                target = target.long().to(self.device)
 
                 outputs = self.fe_model(lf_embeddings)["output"]
                 p_hf = torch.softmax(outputs, dim=1)[:, 1]
 
                 p_hf_list.append(p_hf.cpu().numpy())
-                lf_correct_list.append((torch.argmax(lf_preds, dim=1) == target).cpu().numpy())
-                hf_correct_list.append((torch.argmax(hf_preds, dim=1) == target).cpu().numpy())
+                lf_correct_list.append(lf_correct.cpu().numpy())
+                hf_correct_list.append(hf_correct.cpu().numpy())
 
         return (
             np.concatenate(p_hf_list, axis=0),

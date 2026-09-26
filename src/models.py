@@ -31,15 +31,26 @@ class CustomMLP(nn.Module):
     def forward(self, x):
         layers = {}
 
-        latent = self.model(x)
+        # First hidden Linear+ReLU pair only, i.e. self.model[:2] - exposed
+        # separately from the final "latent" so callers can compare how much
+        # separable signal exists at an earlier layer vs. the final one
+        # (see toy_test.py's run_disagreement_probe). Functionally identical
+        # to the single self.model(x) call below when num_layers>=2 (slicing
+        # a Sequential and chaining the pieces is equivalent to calling it
+        # whole); degrades to early_latent == latent for num_layers=1 (the
+        # second slice is then empty, i.e. identity) rather than erroring.
+        early_latent = self.model[:2](x)
+        layers["early_latent"] = early_latent
+
+        latent = self.model[2:](early_latent)
         layers["latent"] = latent
 
         output = self.output_layer(latent)
         layers["output"] = output
 
-        return layers  
+        return layers
 
-    def selective_forward(self, x):    
+    def selective_forward(self, x):
         layers = {}
 
         latent = self.model(x)
@@ -558,8 +569,13 @@ def build_unet(num_channels, num_classes):
 class LatentCNNHead(nn.Module):
     def __init__(self, in_channels, num_classes):
         super().__init__()
+        # self.conv = nn.Sequential(
+        #     nn.Conv2d(in_channels, 256, 3, padding=1),
+        #     nn.ReLU(),
+        #     nn.AdaptiveAvgPool2d(1)  # Output: [batch, 256, 1, 1]
+        # )
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 3, padding=1),
+            nn.Conv2d(in_channels, 256, 1),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1)  # Output: [batch, 256, 1, 1]
         )

@@ -888,9 +888,11 @@ class FE_Dataset(Dataset):
             data = torch.load(file_path)
 
         lf_latent = data['lf_latent']
-        lf_output = data['lf_output']
-        hf_output = data['hf_output']
-        label = data['label']
+        lf_loss = data['lf_loss']
+        hf_loss = data['hf_loss']
+        lf_correct = data['lf_correct']
+        hf_correct = data['hf_correct']
+        idx = data['idx']
 
-        return lf_latent, lf_output, hf_output, label
+        return lf_latent, lf_loss, hf_loss, lf_correct, hf_correct, idx
     

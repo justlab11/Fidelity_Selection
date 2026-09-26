@@ -17,6 +17,7 @@ classifier_training:
   hf_model: yolo
   trained_lf_model: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/models/yolov5_visible.pt
   trained_hf_model: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/models/yolov5_infrared.pt
+  lr: 1e-5 # ignored - same reason as epochs above (also unused by selnet/sat, which never run since run_comparisons is False)
 
 fe_training:
   epochs: 40

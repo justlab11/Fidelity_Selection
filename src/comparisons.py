@@ -7,30 +7,61 @@ from torch.utils.data import Dataset
 logger = logging.getLogger(__name__)
 
 class SoftmaxResponseMethod:
-    def __init__(self, val_dl, test_dl):
+    """LF-only "softmax response" selective-classification baseline: escalates
+    to HF whenever the LF model's own softmax confidence falls below a
+    threshold, chosen to hit a target coverage.
+
+    Runs its own inference pass over lf_model (val_dl/test_dl are the raw
+    (lf_data, hf_data, label) cascade dataloaders) rather than reading a
+    precomputed cache like the gate stage does - it needs the LF model's full
+    per-class softmax distribution plus the true label to build its
+    confidence-threshold curve, and the shared FE-stage cache
+    (save_latent/FE_Dataset) no longer keeps either around (see
+    helpers.save_latent's docstring: it only saves each fidelity's precomputed
+    loss/correctness, not raw output/label, to stay affordable for
+    spatial/segmentation outputs). This baseline is optional
+    (run_comparisons=True only) and small (one pass per split), so paying its
+    own inference cost here is cheap relative to that.
+    """
+    def __init__(self, lf_model, val_dl, test_dl, device, train_body=True):
+        self.lf_model = lf_model.to(device)
         self.val_dl = val_dl
         self.test_dl = test_dl
+        self.device = device
+        self.train_body = train_body
+        self._test_cache = None  # (model_output, label), filled by get_softmax_thresholds
+
+    def _lf_outputs_and_labels(self, dataloader):
+        self.lf_model.eval()
+        outputs, labels = [], []
+        with torch.no_grad():
+            for lf_data, _, label in dataloader:
+                lf_data = lf_data.to(self.device, torch.float)
+                head = self.lf_model(lf_data) if self.train_body else self.lf_model.head(lf_data)
+                outputs.append(head["output"].cpu())
+                labels.append(label)
+        return torch.cat(outputs, dim=0), torch.cat(labels, dim=0)
 
     def get_softmax_thresholds(self, usage_list):
         logger.info("\nRunning Softmax Response on LF Model")
-        
+
         # covert to what other works use
         coverage_list = [1-i for i in usage_list]
 
-        # collect max probabilities
-        all_max_probs = []
-        for _, model_output, _, _ in self.val_dl:
-            probs = F.softmax(model_output, dim=1)
-            max_probs, _ = torch.max(probs, dim=1)
-            all_max_probs.extend(max_probs.cpu().numpy())
+        # Cached so the per-usage-value threshold trials below don't each
+        # re-run the LF model's forward pass over the whole test split.
+        self._test_cache = self._lf_outputs_and_labels(self.test_dl)
 
-        all_max_probs = np.array(all_max_probs)
+        val_output, _ = self._lf_outputs_and_labels(self.val_dl)
+        probs = F.softmax(val_output, dim=1)
+        max_probs, _ = torch.max(probs, dim=1)
+        all_max_probs = max_probs.numpy()
 
         # sort descending for coverage mapping
         sorted_probs = np.sort(all_max_probs)[::-1]
         acc_vals = {}
         usage_vals = {}
-        
+
         for coverage in coverage_list:
             idx = max(0, int(np.floor(len(sorted_probs) * coverage)) - 1)
             threshold = sorted_probs[idx]
@@ -48,20 +79,14 @@ class SoftmaxResponseMethod:
         return acc_vals, usage_vals
 
     def apply_softmax_threshold(self, threshold):
-        correct = 0
-        total = 0
-        admitted = 0
+        model_output, label = self._test_cache
+        probs = F.softmax(model_output, dim=1)
+        max_probs, preds = torch.max(probs, dim=1)
 
-        for _, model_output, _, label in self.test_dl:
-            probs = F.softmax(model_output, dim=1)
-            max_probs, preds = torch.max(probs, dim=1)
-
-            for i in range(len(label)):
-                total += 1
-                if max_probs[i] >= threshold:
-                    admitted += 1
-                    if preds[i] == label[i]:
-                        correct += 1
+        admitted_mask = max_probs >= threshold
+        admitted = int(admitted_mask.sum().item())
+        total = label.size(0)
+        correct = int((preds[admitted_mask] == label[admitted_mask]).sum().item()) if admitted > 0 else 0
 
         accuracy = correct / admitted if admitted > 0 else float('nan')
         coverage = admitted / total if total > 0 else float('nan')

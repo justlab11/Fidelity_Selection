@@ -21,7 +21,7 @@ from experiment_logging import (
     measure_inference_latency, format_duration, EpochMetricsLogger
 )
 from plot_gate_sensitivity import (
-    load_gate_log, dedupe_and_sort, compute_usage_derivative,
+    load_gate_log, load_test_benefit, dedupe_and_sort, compute_usage_derivative,
     plot_derivative, find_zoom_range, plot_zoom, plot_full_curve, report_max_usage,
     plot_isotonic_smoothing
 )
@@ -549,11 +549,22 @@ def main(config_file):
     # work back.
     gate_latent_key = "body" if dataset_name == "crop" else "latent"
 
+    # save_latent saves each sample's "idx" alongside its latent/loss/correctness
+    # (see save_latent's docstring) so a routed sample can be traced back to the
+    # original dataset item later - IndexedDataset is what actually supplies that
+    # idx, wrapping the raw cascade datasets rather than mutating cascade_train_dl
+    # etc. themselves (those are reused unwrapped elsewhere, e.g. SelectiveNet's
+    # cascade below). shuffling doesn't matter here - every sample lands in its
+    # own idx-named file regardless of batch order.
+    latent_train_dl = DataLoader(IndexedDataset(cascade_train_ds), batch_size=config.classifier_training.batch_size)
+    latent_test_dl = DataLoader(IndexedDataset(cascade_test_ds), batch_size=config.classifier_training.batch_size)
+    latent_val_dl = DataLoader(IndexedDataset(cascade_val_ds), batch_size=config.classifier_training.batch_size)
+
     train_latent_folder: str = os.path.join(latent_folder, "train")
     save_latent(
         lf_model=lf_model,
         hf_model=hf_model,
-        dataloader=train_dl,
+        dataloader=latent_train_dl,
         save_folder=train_latent_folder,
         train_body=train_body,
         device=DEVICE,
@@ -565,7 +576,7 @@ def main(config_file):
     save_latent(
         lf_model=lf_model,
         hf_model=hf_model,
-        dataloader=test_dl,
+        dataloader=latent_test_dl,
         save_folder=test_latent_folder,
         train_body=train_body,
         device=DEVICE,
@@ -577,7 +588,7 @@ def main(config_file):
     save_latent(
         lf_model=lf_model,
         hf_model=hf_model,
-        dataloader=val_dl,
+        dataloader=latent_val_dl,
         save_folder=val_latent_folder,
         train_body=train_body,
         device=DEVICE,
@@ -599,20 +610,42 @@ def main(config_file):
         folder_path=val_latent_folder
     )
 
+    # FE_Dataset falls back to per-sample torch.load() from disk whenever a split
+    # doesn't fit in RAM (see FE_Dataset.__init__) - for a dataset the size of
+    # crop's train split, that's ~98% of an epoch's wall time (measured: ~190s of
+    # disk I/O vs. ~2.6s of actual gate-model compute per epoch), all serialized
+    # in the main process under the default num_workers=0. Parallelizing those
+    # reads across worker processes is the fix - this dataloader gets re-iterated
+    # every gate epoch, across every bisection trial, across every rerun, so it's
+    # worth paying for. persistent_workers avoids respawning that whole worker
+    # pool at the start of each of those re-iterations; pin_memory speeds up the
+    # host->GPU transfer. Harmless (if less impactful) for test/val too, which
+    # usually fit in RAM already.
+    fe_dataloader_workers = 8
+
     train_dl: DataLoader = DataLoader(
         train_ds,
         batch_size=config.fe_training.batch_size,
-        shuffle=True
+        shuffle=True,
+        num_workers=fe_dataloader_workers,
+        persistent_workers=True,
+        pin_memory=True,
     )
 
     test_dl: DataLoader = DataLoader(
         test_ds,
         batch_size=config.fe_training.batch_size,
+        num_workers=fe_dataloader_workers,
+        persistent_workers=True,
+        pin_memory=True,
     )
 
     val_dl: DataLoader = DataLoader(
         val_ds,
         batch_size=config.fe_training.batch_size,
+        num_workers=fe_dataloader_workers,
+        persistent_workers=True,
+        pin_memory=True,
     )
 
     # cnn_head is for a spatial (C, H, W) lf_latent - crop's UNet bottleneck
@@ -663,18 +696,20 @@ def main(config_file):
     # dataset name.
     hf_needed_count = 0
     total_count = 0
-    for _, lf_output, hf_output, label in train_dl:
-        lf_pred = lf_output.argmax(dim=1)
-        hf_pred = hf_output.argmax(dim=1)
-        label = label.long()
-        hf_needed_count += ((hf_pred == label) & (lf_pred != label)).sum().item()
-        total_count += label.numel()
+    for _, _, _, lf_correct, hf_correct, _ in train_dl:
+        hf_needed_count += (hf_correct & ~lf_correct).sum().item()
+        total_count += lf_correct.numel()
     hf_needed_rate = hf_needed_count / total_count
     logger.info(f"HF-needed rate on train set: {hf_needed_rate:.2%} ({hf_needed_count:,}/{total_count:,})")
 
     # Below this, an unweighted/un-clipped gate reliably collapses within a
     # handful of epochs regardless of cost (observed on both LLVIP/YOLO's ~5%
-    # rate and toy_2d's ~7%).
+    # rate and toy_2d's ~7%). class_weighted per-batch loss reweighting used to
+    # be the other half of this mitigation, but was removed - at low
+    # hf_needed_rate a 128-sample batch sees on the order of one disagreement
+    # sample, so its reweight factor swings wildly batch to batch (0x some
+    # batches, 100x+ on others), which turned out to destabilize gate training
+    # more than the imbalance itself did.
     imbalanced_gate = hf_needed_rate < 0.15
 
     adaptive_search: AdaptiveGridSearch = AdaptiveGridSearch(
@@ -684,10 +719,6 @@ def main(config_file):
         val_dl=val_dl,
         test_dl=test_dl,
         model_folder=model_folder,
-        # Without balancing, a degenerate "always pick one fidelity" gate can
-        # minimize expected cost almost for free, drowning out the minority
-        # routing signal.
-        class_weighted_loss=imbalanced_gate,
         # A lower LR + gradient clipping guards against the gate's routing
         # logits blowing up into softmax saturation within the first epoch or
         # two (observed on this task's thin, imbalanced routing signal).
@@ -749,28 +780,43 @@ def main(config_file):
     gate_r, gate_usage, gate_acc = load_gate_log(file_folder)
     gate_r_sorted, gate_usage_sorted, gate_acc_sorted = dedupe_and_sort(gate_r, gate_usage, gate_acc)
 
+    # Exact Bayes-optimal usage(c_h) curve, computed straight from the frozen
+    # LF/HF models' own test-set losses (test_latent_folder, already on disk
+    # from save_latent above) - no training/noise involved, unlike every other
+    # series on these plots. Lets the gate's own noisy estimates be judged
+    # against ground truth instead of only against each other.
+    try:
+        gate_benefit = load_test_benefit(test_latent_folder)
+    except FileNotFoundError as e:
+        logger.warning(f"No oracle overlay available for gate sensitivity plots: {e}")
+        gate_benefit = None
+
     gate_derivative = compute_usage_derivative(gate_r_sorted, gate_usage_sorted)
     plot_derivative(
         gate_r_sorted, gate_derivative,
-        os.path.join(image_folder, "gate_sensitivity_derivative.png")
+        os.path.join(image_folder, "gate_sensitivity_derivative.png"),
+        benefit=gate_benefit
     )
 
     plot_full_curve(
         gate_r_sorted, gate_usage_sorted,
-        os.path.join(image_folder, "gate_sensitivity_full.png")
+        os.path.join(image_folder, "gate_sensitivity_full.png"),
+        benefit=gate_benefit
     )
 
     gate_zoom_range = find_zoom_range(gate_r_sorted, gate_usage_sorted, low=0.7, high=0.9)
     plot_zoom(
         gate_r_sorted, gate_usage_sorted, gate_zoom_range,
-        os.path.join(image_folder, "gate_sensitivity_zoom.png")
+        os.path.join(image_folder, "gate_sensitivity_zoom.png"),
+        benefit=gate_benefit
     )
 
     # Raw (undeduped) points, deliberately - the scatter is meant to show the
     # actual per-run training noise, not the averaged-per-c_h view above.
     plot_isotonic_smoothing(
         gate_r, gate_usage,
-        os.path.join(image_folder, "gate_sensitivity_isotonic.png")
+        os.path.join(image_folder, "gate_sensitivity_isotonic.png"),
+        benefit=gate_benefit
     )
 
     logger.info("PLOTTING GATE ROUTING (projection + confusion tables)")
@@ -864,8 +910,11 @@ def main(config_file):
     logger.info("RUNNING DEFAULT SOFTMAX RESPONSE")
 
     softmax_response: SoftmaxResponseMethod = SoftmaxResponseMethod(
-        val_dl=val_dl,
-        test_dl=test_dl,
+        lf_model=lf_model,
+        val_dl=cascade_val_dl,
+        test_dl=cascade_test_dl,
+        device=DEVICE,
+        train_body=train_body,
     )
 
     sr_acc_vals, sr_usage_vals = softmax_response.get_softmax_thresholds(

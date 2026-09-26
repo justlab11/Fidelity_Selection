@@ -1,0 +1,32 @@
+dataset:
+  name: crop
+  folder: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/data/crop
+
+latent_size: 256
+random_seed: 42
+run_comparisons: False
+train_body: True # ignored for crop - main.py forces this True since there's no separate head to precompute body outputs for
+
+
+classifier_training:
+  epochs: 20 # train split alone is ~148k precropped chips, so this is plenty of gradient steps
+  batch_size: 32
+  loss_fun: CE
+  hf_input_mode: concat
+  lf_model: unet
+  hf_model: unet
+  trained_lf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\models\crop_lf_model.pt
+  trained_hf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\models\crop_hf_model.pt
+  lr: 1e-4 # UNet trained from scratch (not fine-tuned), so 1e-5 default would barely move it
+
+fe_training:
+  epochs: 40
+  batch_size: 128
+  reruns: 1
+
+  r_range:
+    start: 0.0
+    stop: 1.0
+    num_steps: 100
+    scale: linear
+    direction: reversed # normal: 0 -> 1, reversed 1 -> 0

@@ -6,23 +6,24 @@ import logging
 logger = logging.getLogger(__name__)
 
 class MetaLossFunction(nn.Module):
-    def __init__(self, ch: List[float], cw: float, device: str, loss_fun: str="CE", class_weighted: bool=False):
+    def __init__(self, ch: List[float], cw: float, device: str, loss_fun: str="CE"):
         '''
-        Loss function for the FE model
+        Loss function for the FE model.
+
+        Each fidelity's per-sample loss against the true label is computed
+        once, upstream (see helpers.compute_fidelity_loss_correct,
+        save_latent) - this function only ever combines those already-computed
+        numbers with the gate's own routing probabilities, so it no longer
+        needs to know anything about a fidelity's output shape (classification
+        logits vs. segmentation's per-pixel map vs. YOLO's detections all look
+        the same by the time they get here).
+
         Parameters:
             ch - cost of using high fidelity
             cw - cost of being wrong
-            loss_fun - the choice of loss function used to determine wrong predictions
-            class_weighted - upweight samples where fidelities disagree (one correct,
-                one wrong) to match the total weight of samples where they agree,
-                per batch. Without this, a task where only a small minority of
-                samples actually carry routing signal (e.g. LLVIP/YOLO, where LF and
-                HF agree on ~94% of samples) lets a degenerate "always pick one
-                fidelity" policy minimize expected cost almost for free, since the
-                loss is dominated by the indifferent majority. Only meaningful when
-                each y_preds tensor is per-sample classification-shaped
-                ((batch_size, num_classes) with argmax comparable to y_true) - leave
-                off for segmentation-shaped predictions.
+            loss_fun - retained for interface/config parity; no longer used
+                directly here, since fidelity losses arrive precomputed - see
+                compute_fidelity_loss_correct for what actually produces them.
         '''
         super().__init__()
         self.ch = ch
@@ -30,30 +31,19 @@ class MetaLossFunction(nn.Module):
 
         self.cw = cw
         self.device = device
-        self.class_weighted = class_weighted
+        self.loss_fun = loss_fun
 
-        match loss_fun:
-            case "CE":
-                self.loss_fun = nn.CrossEntropyLoss(reduction="none")
-            case "binary":
-                self.loss_fun = nn.L1Loss(reduction="none")
-            case default:
-                raise ValueError("Invalid loss function")
-
-    def forward(self, y_true, y_preds, choices):
-        # y_preds: List of tensors, length n_f, each (batch_size, num_classes)
-        # choices: (batch_size, n_f)  # FE selection probabilities
-        choices = nn.Softmax(dim=1)(choices)
+    def forward(self, losses: List[torch.Tensor], gate_logits: torch.Tensor):
+        """
+        losses - list of length n_f, each a (batch_size,) precomputed per-sample
+            loss for that fidelity.
+        gate_logits - (batch_size, n_f), the gate model's own raw routing logits
+            (pre-softmax).
+        """
+        choices = nn.Softmax(dim=1)(gate_logits)
         choices = choices.to(self.device)
 
-        # Compute per-fidelity losses for each sample, stack as (batch_size, n_f)
-        model_losses = []
-        for i, pred in enumerate(y_preds):
-            loss = self.loss_fun(pred, y_true)  # shape: (batch_size,)
-            model_losses.append(loss)
-
-        model_losses_tensor = torch.stack(model_losses, dim=1)  # (batch_size, n_f)
-        model_losses_tensor = model_losses_tensor.to(self.device)
+        model_losses_tensor = torch.stack([loss.to(self.device) for loss in losses], dim=1)  # (batch_size, n_f)
 
         # Cost ratio vector; shape (n_f,)
         ch_vec = torch.tensor(self.ch, device=self.device).float()
@@ -70,30 +60,7 @@ class MetaLossFunction(nn.Module):
         # For each sample, expected cost under FE probabilities:
         expected_costs = torch.sum(choices * total_costs, dim=1)  # (batch_size,)
 
-        if not self.class_weighted:
-            return expected_costs.mean()
-
-        # Per-fidelity correctness, derived the same way compute_gate_routing_details
-        # does (argmax(pred) == y_true). "Disagreement" samples (fidelities differ)
-        # are the only ones with any routing signal at all; "agreement" samples
-        # contribute the same expected cost regardless of the gate's choice modulo
-        # the ch penalty. Reweight disagreement samples so their total contribution
-        # to the batch loss matches the agreement samples' - i.e. per-batch inverse-
-        # frequency class balancing - rather than letting them get drowned out.
-        with torch.no_grad():
-            fidelity_correct = torch.stack(
-                [torch.argmax(pred, dim=1) == y_true for pred in y_preds], dim=1
-            )  # (batch_size, n_f)
-            disagreement = fidelity_correct.any(dim=1) & ~fidelity_correct.all(dim=1)
-
-            num_disagree = disagreement.sum()
-            num_agree = disagreement.numel() - num_disagree
-
-            weights = torch.ones_like(expected_costs)
-            if num_disagree > 0 and num_agree > 0:
-                weights[disagreement] = num_agree.float() / num_disagree.float()
-
-        return (weights * expected_costs).sum() / weights.sum()
+        return expected_costs.mean()
     
     # def forward(self, y_true: torch.tensor, y_preds: torch.tensor, choices: torch.tensor):
     #     batch_size = len(y_true)
