@@ -124,6 +124,48 @@ class HypercubeDataset(Dataset):
 
         return points, labels
 
+class IndependentHypercubeDataset(HypercubeDataset):
+    """Same hypercube-corner cluster geometry/labeling as HypercubeDataset
+    (reuses its _hypercube_corners/_get_label_set/_generate_points_and_labels
+    unchanged), but lf_points and hf_points are independent draws around each
+    cluster's mean rather than HypercubeDataset's lf = hf + extra_noise
+    coupling (extra_std = sqrt(lf_std^2 - hf_std^2)).
+
+    That coupling has a low ceiling whenever lf_std >> hf_std: extra_std ends
+    up close to lf_std itself (e.g. lf_std=0.75, hf_std=0.1 ->
+    extra_std=sqrt(0.75^2-0.1^2)=0.743), so ~99% of lf_point's variance is
+    noise that has nothing to do with hf_point's own (tiny-variance) draw -
+    confirmed directly via toy_test.py's disagreement probe (AUC ~0.6, barely
+    above chance, on a lf_std >> hf_std HypercubeDataset config). This class
+    is the "high ceiling" companion: LF is still noisier than HF, but it's an
+    independent, moderately-noisier observation of the same cluster mean, not
+    a noise-swamped function of HF's own draw.
+    """
+    def __init__(self, num_dims, num_samples, hf_std, lf_std, group_classes=True):
+        # Deliberately does NOT call HypercubeDataset.__init__ (that always
+        # does the coupled noise-injection construction) - reuses its helper
+        # methods directly instead, exactly the way HypercubeDataset itself
+        # generates hf_points/labels.
+        self.num_dims = num_dims
+        self.num_clusters = 2 ** num_dims
+        self.num_classes = self.num_clusters // 2 if group_classes else self.num_clusters
+        self.group_classes = group_classes
+
+        num_samples = np.insert(num_samples, 0, 0)
+
+        self.hf_points, self.labels = self._generate_points_and_labels(
+            num_dims, self.num_classes, num_samples, hf_std, group_classes
+        )
+        # Independent draw around the same per-cluster means - NOT derived
+        # from self.hf_points at all, unlike HypercubeDataset.
+        self.lf_points, _ = self._generate_points_and_labels(
+            num_dims, self.num_classes, num_samples, lf_std, group_classes
+        )
+
+        self.hf_points = torch.from_numpy(self.hf_points.astype(np.float32))
+        self.lf_points = torch.from_numpy(self.lf_points.astype(np.float32))
+        self.labels = torch.from_numpy(self.labels.astype(np.int64))
+
 class MNISTDataset(Dataset):
     def __init__(
         self,
@@ -845,7 +887,21 @@ class FE_Dataset(Dataset):
 
     def __init__(self, folder_path):
         self.folder_path = folder_path
-        self.files = sorted(os.listdir(folder_path))  # Sorted list of .pt file names
+        # Numeric sort by the idx save_latent encodes in the filename
+        # ("sample_{idx}.pt"), not sorted()'s default lexicographic string
+        # order - lexicographic would put "sample_10.pt" right after
+        # "sample_1.pt" (before "sample_2.pt"), so position k in self.files
+        # would silently stop meaning "the sample whose recorded idx is k".
+        # Anything that assumes position == idx (e.g. main.py's
+        # WeightedRandomSampler, which feeds positions straight into
+        # __getitem__ and needs them to line up with a position-indexed
+        # weights array) would then be scrambled relative to the file it
+        # actually gets served, even though idx itself still reads back
+        # correctly from inside the file.
+        self.files = sorted(
+            os.listdir(folder_path),
+            key=lambda fname: int(fname[len("sample_"):-len(".pt")])
+        )
 
         self._in_memory = False
         self._cache = None

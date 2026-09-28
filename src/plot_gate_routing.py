@@ -56,22 +56,54 @@ def compute_routing_counts(choice: np.ndarray, hf_needed: np.ndarray, lf_fine: n
     }
 
 
-def compute_oracle_curve(lf_correct: np.ndarray, hf_correct: np.ndarray, usage_values) -> np.ndarray:
+def compute_oracle_curve(
+        lf_correct: np.ndarray, hf_correct: np.ndarray, usage_values,
+        lf_pixel_acc: np.ndarray | None = None, hf_pixel_acc: np.ndarray | None = None) -> np.ndarray:
     """Best achievable accuracy (%) at each usage budget, escalating only samples
     that actually need it (never wastes budget on samples HF wouldn't help), up
     to how many "HF needed" samples that budget can cover. lf_correct/hf_correct
     are the same regardless of which gate model produced a given snapshot — they
-    only depend on the LF/HF models' own predictions on the fixed test set."""
-    hf_needed, lf_fine = compute_ground_truth(lf_correct, hf_correct)
+    only depend on the LF/HF models' own predictions on the fixed test set.
+
+    Candidates for escalation are every sample where hf_pixel_acc actually
+    exceeds lf_pixel_acc (a "gain > 0" test, not the boolean per-image-majority
+    lf_correct/hf_correct) - this is the strict generalization of "HF needed"
+    to continuous accuracy: with 0/1-valued lf_pixel_acc/hf_pixel_acc it
+    reduces to exactly hf_correct & ~lf_correct, but with real per-pixel
+    fractions it also (correctly) catches e.g. a sample where HF gets more
+    pixels right without crossing the same >50% majority threshold LF also
+    fell short of. Using the boolean partition here instead (as an earlier
+    version of this function did) can push the "oracle" *below* HF's own
+    plain accuracy - not a valid ceiling - since it would never escalate a
+    sample sitting in the boolean "LF fine" bucket even when HF's continuous
+    accuracy on it is higher. If a budget can't cover every gaining sample,
+    the ones with the largest gain (hf_pixel_acc - lf_pixel_acc) are
+    prioritized, since a limited budget should buy the most improvement it
+    can; samples with gain <= 0 are never escalated regardless of leftover
+    budget, matching the original behavior exactly.
+
+    Passing lf_pixel_acc=hf_pixel_acc=None (the default) reproduces the
+    original boolean-only formula exactly - this is a strict generalization,
+    not a behavior change, when the inputs happen to be 0/1-valued."""
     n = len(lf_correct)
-    n_needed = int(np.sum(hf_needed))
-    n_lf_fine_correct = int(np.sum(lf_fine & lf_correct))
+
+    if lf_pixel_acc is None or hf_pixel_acc is None:
+        lf_pixel_acc = lf_correct.astype(float)
+        hf_pixel_acc = hf_correct.astype(float)
+
+    gain = hf_pixel_acc - lf_pixel_acc
+    needed_idx = np.where(gain > 0)[0]
+    priority_order = needed_idx[np.argsort(-gain[needed_idx])]
+
+    base_acc = lf_pixel_acc.copy()  # everyone starts on their own LF accuracy
 
     oracle_acc = []
     for usage in usage_values:
         budget = int(round(usage * n))
-        escalated_needed = min(budget, n_needed)
-        oracle_acc.append(100 * (escalated_needed + n_lf_fine_correct) / n)
+        escalate = priority_order[:budget]
+        acc = base_acc.copy()
+        acc[escalate] = hf_pixel_acc[escalate]
+        oracle_acc.append(100 * acc.mean())
     return np.array(oracle_acc)
 
 

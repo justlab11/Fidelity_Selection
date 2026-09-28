@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchmetrics import JaccardIndex
 from typing import *
@@ -694,23 +694,72 @@ def main(config_file):
     # close its two fidelity's accuracies happen to land). Measuring it
     # directly generalizes the mitigation instead of hardcoding it to one
     # dataset name.
+    #
+    # disagreement_flags is indexed by each sample's *dataset* index (the idx
+    # FE_Dataset returns), not by iteration order - train_dl shuffles, so idx
+    # is the only way to scatter each batch's disagreement mask back to the
+    # right position for the sampler built below.
     hf_needed_count = 0
     total_count = 0
-    for _, _, _, lf_correct, hf_correct, _ in train_dl:
+    disagreement_flags = torch.zeros(len(train_ds), dtype=torch.bool)
+    for _, _, _, lf_correct, hf_correct, idx in train_dl:
         hf_needed_count += (hf_correct & ~lf_correct).sum().item()
         total_count += lf_correct.numel()
+        disagreement_flags[idx] = lf_correct ^ hf_correct
     hf_needed_rate = hf_needed_count / total_count
     logger.info(f"HF-needed rate on train set: {hf_needed_rate:.2%} ({hf_needed_count:,}/{total_count:,})")
 
     # Below this, an unweighted/un-clipped gate reliably collapses within a
     # handful of epochs regardless of cost (observed on both LLVIP/YOLO's ~5%
-    # rate and toy_2d's ~7%). class_weighted per-batch loss reweighting used to
-    # be the other half of this mitigation, but was removed - at low
-    # hf_needed_rate a 128-sample batch sees on the order of one disagreement
-    # sample, so its reweight factor swings wildly batch to batch (0x some
-    # batches, 100x+ on others), which turned out to destabilize gate training
-    # more than the imbalance itself did.
+    # rate and toy_2d's ~7%).
     imbalanced_gate = hf_needed_rate < 0.15
+
+    # class_weighted per-batch loss reweighting used to be the other half of
+    # this mitigation, but was removed - at low hf_needed_rate a 128-sample
+    # batch sees on the order of one disagreement sample, so its reweight
+    # factor swung wildly batch to batch (0x some batches, 100x+ on others),
+    # destabilizing gate training more than the imbalance itself did. This is
+    # a *global* (dataset-wide, fixed) weight instead: every disagreement
+    # sample is oversampled at a single fixed rate via WeightedRandomSampler,
+    # so the reweighting magnitude no longer depends on which handful of
+    # disagreement samples happen to land in a given batch - validated in
+    # toy_test.py (closed the "several usage targets collapse to the same
+    # cached 0%" gap from 4-6/10 colliding down to 0-1/10).
+    num_disagree = disagreement_flags.sum().item()
+    num_agree = len(disagreement_flags) - num_disagree
+    global_disagree_weight = (num_agree / num_disagree) if num_disagree > 0 else 1.0
+    logger.info(
+        f"Global disagreement weight: {global_disagree_weight:.2f} "
+        f"({num_disagree:,} disagreement / {num_agree:,} agreement samples)"
+    )
+
+    sample_weights = torch.where(
+        disagreement_flags,
+        torch.full_like(disagreement_flags, global_disagree_weight, dtype=torch.float),
+        torch.ones_like(disagreement_flags, dtype=torch.float),
+    )
+    gate_sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+    # Replaces the shuffle=True train_dl built earlier (used only for the
+    # hf_needed_rate measurement above) - same worker/pinning settings, since
+    # this still re-iterates every gate epoch across every bisection trial.
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=config.fe_training.batch_size,
+        sampler=gate_sampler,
+        num_workers=fe_dataloader_workers,
+        persistent_workers=True,
+        pin_memory=True,
+    )
+
+    # Per-pixel accuracy lookup for segmentation only (crop) - lets
+    # AdaptiveGridSearch report the FE/oracle curves' accuracy on the same
+    # per-pixel metric as this run's own "Final Test Summary" above, instead
+    # of compute_fidelity_loss_correct's per-image-majority "*_correct" flag.
+    # None for every other dataset (classification), where the two are
+    # identical anyway - see load_pixel_acc_lookup/compute_fidelity_loss_correct.
+    val_pixel_acc = load_pixel_acc_lookup(val_latent_folder) if dataset_name == "crop" else None
+    test_pixel_acc = load_pixel_acc_lookup(test_latent_folder) if dataset_name == "crop" else None
 
     adaptive_search: AdaptiveGridSearch = AdaptiveGridSearch(
         fe_model=fe_model,
@@ -725,7 +774,10 @@ def main(config_file):
         gate_epochs=config.fe_training.epochs,
         gate_lr=5e-5 if imbalanced_gate else 3e-4,
         gate_grad_clip_norm=1.0 if imbalanced_gate else None,
-        seed=seed
+        seed=seed,
+        min_bracket_width=config.fe_training.min_bracket_width,
+        val_pixel_acc=val_pixel_acc,
+        test_pixel_acc=test_pixel_acc
     )
 
     reset_peak_memory(DEVICE)
@@ -885,9 +937,14 @@ def main(config_file):
         # lf_correct/hf_correct only depend on the LF/HF models' own
         # predictions on the fixed test set, not on which gate model produced
         # a given snapshot — so any single snapshot's arrays (here, the
-        # first) give the ground truth.
+        # first) give the ground truth. lf_pixel_acc/hf_pixel_acc (only
+        # present for segmentation - see AdaptiveGridSearch.evaluate_fe_model)
+        # score the oracle on true per-pixel accuracy instead of falling back
+        # to the per-image-majority correct/incorrect flag.
         oracle_acc = compute_oracle_curve(
-            routing_snapshots["lf_correct"][0], routing_snapshots["hf_correct"][0], usage_values
+            routing_snapshots["lf_correct"][0], routing_snapshots["hf_correct"][0], usage_values,
+            lf_pixel_acc=routing_snapshots.get("lf_pixel_acc", [None])[0],
+            hf_pixel_acc=routing_snapshots.get("hf_pixel_acc", [None])[0]
         )
         oracle = (np.array(usage_values) * 100, oracle_acc)
 
@@ -1305,7 +1362,9 @@ def main(config_file):
     # the fixed test set, not on which gate model produced a given snapshot —
     # so any single snapshot's arrays (here, the first) give the ground truth.
     oracle_acc = compute_oracle_curve(
-        routing_snapshots["lf_correct"][0], routing_snapshots["hf_correct"][0], usage_values
+        routing_snapshots["lf_correct"][0], routing_snapshots["hf_correct"][0], usage_values,
+        lf_pixel_acc=routing_snapshots.get("lf_pixel_acc", [None])[0],
+        hf_pixel_acc=routing_snapshots.get("hf_pixel_acc", [None])[0]
     )
     oracle = (np.array(usage_values) * 100, oracle_acc)
 

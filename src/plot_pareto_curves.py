@@ -128,7 +128,11 @@ def plot_one_dataset(results_folder: str, output_folder: str | None) -> None:
         from plot_gate_routing import load_routing_snapshots, compute_oracle_curve
         snapshots = load_routing_snapshots(file_folder)
         usage_values = [i / 10 for i in range(1, 11)]
-        oracle_acc = compute_oracle_curve(snapshots["lf_correct"][0], snapshots["hf_correct"][0], usage_values)
+        oracle_acc = compute_oracle_curve(
+            snapshots["lf_correct"][0], snapshots["hf_correct"][0], usage_values,
+            lf_pixel_acc=snapshots.get("lf_pixel_acc", [None])[0],
+            hf_pixel_acc=snapshots.get("hf_pixel_acc", [None])[0]
+        )
         oracle = (np.array(usage_values) * 100, oracle_acc)
     except FileNotFoundError:
         logger.warning(f"No gate_routing_snapshots.npz under '{file_folder}' — skipping oracle curve")

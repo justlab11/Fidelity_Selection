@@ -17,7 +17,7 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from scipy.optimize import minimize
 
-from datasets import HypercubeDataset, MNISTDataset, CropDataset, CUBDataset, LLVIPDataset, BigEarthNetDataset
+from datasets import HypercubeDataset, IndependentHypercubeDataset, MNISTDataset, CropDataset, CUBDataset, LLVIPDataset, BigEarthNetDataset
 from custom_types import ConfigOptions, FEResult
 from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead, build_yolov5, YOLOv5FidelityModel
 from losses import MetaLossFunction
@@ -125,7 +125,56 @@ def build_dataset(dataset_name: str, seed: int, folder="../data"):
                 hf_std=hf_std,
                 lf_std=lf_std,
             )
-        
+
+        # Companion to "toy_2d" with a genuinely high ceiling, for contrast -
+        # same hypercube-corner geometry/labeling, but lf_points/hf_points are
+        # independent draws (IndependentHypercubeDataset) instead of "toy_2d"'s
+        # lf = hf + extra_noise coupling, with lf_std only moderately larger
+        # than hf_std rather than a several-x gap. That coupling has a low
+        # ceiling whenever lf_std >> hf_std: extra_std = sqrt(lf_std^2-hf_std^2)
+        # ends up close to lf_std itself, so most of lf_point's variance is
+        # noise unrelated to hf_point's own draw - confirmed via a disagreement
+        # probe (plain classifier predicting "would HF have helped" directly
+        # from lf_latent, no ch/expected-cost objective involved) getting
+        # AUC~0.6 (barely above chance) on a lf_std>>hf_std config, vs. AUC~0.76
+        # on this one. See toy_test.py's run_disagreement_probe/
+        # IndependentHypercubeDataset docstring for the full derivation.
+        case "toy_2d_high_ceiling":
+            num_dims = 2
+            num_clusters = 2 ** num_dims
+            hf_std = np.random.uniform(0.15, 0.20, size=num_clusters)
+            lf_std = np.random.uniform(0.35, 0.45, size=num_clusters)
+
+            total_num_samples = 3000
+            train_samples = int(total_num_samples*.8)
+            test_samples = int(total_num_samples*.1)
+            val_samples = int(total_num_samples*.1)
+
+            train_samples_per_cluster = np.full(num_clusters, train_samples // num_clusters)
+            test_samples_per_cluster = np.full(num_clusters, test_samples // num_clusters)
+            val_samples_per_cluster = np.full(num_clusters, val_samples // num_clusters)
+
+            train_ds = IndependentHypercubeDataset(
+                num_dims=num_dims,
+                num_samples=train_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            test_ds = IndependentHypercubeDataset(
+                num_dims=num_dims,
+                num_samples=test_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
+            val_ds = IndependentHypercubeDataset(
+                num_dims=num_dims,
+                num_samples=val_samples_per_cluster,
+                hf_std=hf_std,
+                lf_std=lf_std,
+            )
+
         # toy example where 5d points are split into 10 clusters
         # lf = noisy; hf = clean
         case "toy_5d":
@@ -812,27 +861,38 @@ def save_body(
     logger.info(f"Finished saving split to {save_folder}")
 
 def compute_fidelity_loss_correct(output: torch.Tensor, target: torch.Tensor):
-    """Per-sample (loss, correct) for a model's raw output vs. the true target -
-    the two things the gate stage (classifier_one_run's "gate" fidelity,
-    save_latent, compute_gate_routing_details) ever derive from a fidelity's
-    prediction. Computed once here instead of carrying the full output/label
-    through the whole gate pipeline.
+    """Per-sample (loss, correct, pixel_acc) for a model's raw output vs. the
+    true target - what the gate stage (classifier_one_run's "gate" fidelity,
+    save_latent, compute_gate_routing_details) derives from a fidelity's
+    prediction, plus a per-pixel accuracy fraction for segmentation reporting.
+    Computed once here instead of carrying the full output/label through the
+    whole gate pipeline.
 
     Handles both this repo's classification shape ((B, num_classes) output vs.
-    (B,) target - loss/correct come out (B,), one real number/bool per sample)
+    (B,) target - loss/correct/pixel_acc come out (B,), one value per sample)
     and its segmentation shape ((B, C, H, W) output vs. (B, H, W) target - the
-    per-pixel CE/hit map is averaged over pixels down to one number per image;
+    per-pixel CE/hit map is averaged over pixels down to one number per image.
     "correct" for segmentation means "more than half this image's pixels were
-    classified correctly", not "every pixel matched exactly").
+    classified correctly", not "every pixel matched exactly" - this remains
+    unchanged (still boolean) since gate training/weighting/routing logic
+    (compute_ground_truth's hf_needed = hf_correct & ~lf_correct, disagreement
+    sampling in main.py) uses bitwise &/~/^ on it directly and isn't being
+    revisited here. "pixel_acc" is the true per-pixel accuracy fraction that
+    "correct" thresholds away for segmentation (identical to "correct" cast to
+    float for classification, where there's no distinction) - it exists
+    purely so per-pixel-accuracy reporting (fe_results.npz's "acc", the
+    Pareto/oracle curves) can match main.py's own per-pixel "Final Test
+    Summary" numbers instead of silently switching to a per-image-majority
+    metric for segmentation. See load_pixel_acc_lookup/AdaptiveGridSearch's
+    *_pixel_acc plumbing for where this actually gets used.
 
     loss stays continuous (mean CE) so it keeps the confidence signal a hard
-    right/wrong wouldn't - "correct" is a separate, genuinely boolean value
-    because downstream ground-truth logic (compute_ground_truth's hf_needed =
-    hf_correct & ~lf_correct) uses bitwise &/~ on it directly.
+    right/wrong wouldn't.
 
     Not used for YOLO - its raw output isn't comparable to a target via CE at
     all, so it keeps its own compute_yolo_detection_correctness path (see
-    save_latent), with loss defined as 1 - correct there instead.
+    save_latent), with loss defined as 1 - correct there instead, and
+    pixel_acc == correct.float() (no separate per-pixel notion for detection).
     """
     target = target.long()
     is_segmentation = (output.ndim == 4 and target.ndim >= 3)
@@ -843,12 +903,14 @@ def compute_fidelity_loss_correct(output: torch.Tensor, target: torch.Tensor):
     if is_segmentation:
         spatial_dims = tuple(range(1, per_element_loss.ndim))
         loss = per_element_loss.mean(dim=spatial_dims)
-        correct = per_element_hit.float().mean(dim=spatial_dims) > 0.5
+        pixel_acc = per_element_hit.float().mean(dim=spatial_dims)
+        correct = pixel_acc > 0.5
     else:
         loss = per_element_loss
         correct = per_element_hit
+        pixel_acc = per_element_hit.float()
 
-    return loss, correct
+    return loss, correct, pixel_acc
 
 def save_latent(
         lf_model: nn.Module,
@@ -929,15 +991,19 @@ def save_latent(
                 hf_correct = compute_yolo_detection_correctness(hf_head["output"], labels, img_size=hf.shape[-2:]).bool()
                 lf_loss = 1.0 - lf_correct.float()
                 hf_loss = 1.0 - hf_correct.float()
+                lf_pixel_acc = lf_correct.float()
+                hf_pixel_acc = hf_correct.float()
             else:
-                lf_loss, lf_correct = compute_fidelity_loss_correct(lf_head["output"], labels)
-                hf_loss, hf_correct = compute_fidelity_loss_correct(hf_head["output"], labels)
+                lf_loss, lf_correct, lf_pixel_acc = compute_fidelity_loss_correct(lf_head["output"], labels)
+                hf_loss, hf_correct, hf_pixel_acc = compute_fidelity_loss_correct(hf_head["output"], labels)
 
             lf_latent = lf_latent.cpu()
             lf_loss = lf_loss.cpu()
             hf_loss = hf_loss.cpu()
             lf_correct = lf_correct.cpu()
             hf_correct = hf_correct.cpu()
+            lf_pixel_acc = lf_pixel_acc.cpu()
+            hf_pixel_acc = hf_pixel_acc.cpu()
 
             batch_size = lf_latent.size(0)
             for i in range(batch_size):
@@ -954,10 +1020,47 @@ def save_latent(
                     "hf_loss": hf_loss[i].clone(),
                     "lf_correct": lf_correct[i].clone(),
                     "hf_correct": hf_correct[i].clone(),
+                    "lf_pixel_acc": lf_pixel_acc[i].clone(),
+                    "hf_pixel_acc": hf_pixel_acc[i].clone(),
                     "idx": sample_idx
                 }, os.path.join(save_folder, f"sample_{sample_idx}.pt"))
 
     logger.info(f"Finished saving split to {save_folder}")
+
+def load_pixel_acc_lookup(latent_folder: str):
+    """Reads (lf_pixel_acc, hf_pixel_acc) back out of a save_latent split
+    folder as two (N,) numpy arrays, indexed by each sample's saved "idx" -
+    the plain per-pixel accuracy fraction save_latent now writes alongside
+    the existing per-image-majority "*_correct" boolean (see
+    compute_fidelity_loss_correct's docstring), for reporting the Pareto/
+    oracle curves on the same per-pixel metric as main.py's own "Final Test
+    Summary" instead of the majority-vote one.
+
+    Falls back to the boolean "*_correct" field (cast to float - identical
+    values for classification, where there's no separate per-pixel notion)
+    for any older save_latent output written before this field existed, so
+    this stays a no-op for every already-cached, non-crop split.
+
+    Loads directly from disk rather than through FE_Dataset/a DataLoader,
+    both to avoid changing FE_Dataset's existing 6-tuple shape (every one of
+    its several consumers unpacks exactly that many items) and because this
+    only runs once per split, not once per gate epoch.
+    """
+    files = sorted(
+        os.listdir(latent_folder),
+        key=lambda fname: int(fname[len("sample_"):-len(".pt")])
+    )
+
+    lf_pixel_acc = np.zeros(len(files), dtype=np.float32)
+    hf_pixel_acc = np.zeros(len(files), dtype=np.float32)
+
+    for pos, fname in enumerate(files):
+        data = torch.load(os.path.join(latent_folder, fname), weights_only=True)
+        sample_idx = data["idx"]
+        lf_pixel_acc[sample_idx] = float(data.get("lf_pixel_acc", data["lf_correct"].float()))
+        hf_pixel_acc[sample_idx] = float(data.get("hf_pixel_acc", data["hf_correct"].float()))
+
+    return lf_pixel_acc, hf_pixel_acc
 
 def get_folder_size(folder):
     total_size = 0
@@ -1157,7 +1260,8 @@ class GaussianProcessSearch:
 class AdaptiveGridSearch:
     def __init__(
             self, fe_model, device, train_dl, val_dl, test_dl, model_folder,
-            gate_epochs=30, gate_lr=3e-4, gate_grad_clip_norm=None, seed=42):
+            gate_epochs=30, gate_lr=3e-4, gate_grad_clip_norm=None, seed=42,
+            min_bracket_width=0.0005, val_pixel_acc=None, test_pixel_acc=None):
         # evaluated_points is reset at the start of every rerun (see run_reruns) so
         # each rerun's bracket search is a genuinely independent sweep, not warm-
         # started off a previous rerun's history. all_evaluated_points pools every
@@ -1182,6 +1286,16 @@ class AdaptiveGridSearch:
         self.gate_lr = gate_lr
         self.gate_grad_clip_norm = gate_grad_clip_norm
         self.seed = seed
+        self.min_bracket_width = min_bracket_width
+        # (lf_pixel_acc, hf_pixel_acc) arrays indexed by dataset idx, from
+        # load_pixel_acc_lookup - the true per-pixel accuracy fraction for
+        # segmentation (identical to *_correct for classification), used only
+        # for *reported* accuracy (evaluate_fe_model/run_fe_sr_grid), not for
+        # gate training/weighting/routing decisions, which stay on the
+        # existing boolean lf_correct/hf_correct throughout. None (the
+        # default) preserves the old per-image-majority-vote behavior.
+        self.val_pixel_acc = val_pixel_acc
+        self.test_pixel_acc = test_pixel_acc
 
         # Re-snapshotted at the start of every rerun (see run_reruns) - every
         # r_val *within* a rerun trains from this same fixed init/seed, so
@@ -1359,7 +1473,7 @@ class AdaptiveGridSearch:
         hf_prob = np.concatenate(hf_probs, axis=0)
         return hf_prob.reshape(self.boundary_xx.shape)
 
-    def find_bracket(self, usage, min_bracket_width=0.05):
+    def find_bracket(self, usage, min_bracket_width=None):
         """Only reuses an existing (r_a, r_b) pair from a prior target's search
         if it's wide enough to represent genuine exploration room. Bisection
         naturally converges its *own* final bracket down to ~tolerance width by
@@ -1374,7 +1488,23 @@ class AdaptiveGridSearch:
         instead of doing real work for this one. Requiring a minimum width
         forces a fresh full-range search whenever the only "bracket" on hand is
         really just a stale, over-converged sliver.
+
+        min_bracket_width defaults to self.min_bracket_width (constructor
+        param, itself defaulting to 0.0005 - see FESettings.min_bracket_width)
+        rather than hardcoding it here, so a caller can still tune it per-
+        dataset if needed. The default used to be 0.05, but crop's own
+        usage(r) collapse turned out to happen within an r-window of ~0.001,
+        an order of magnitude narrower, which made every bracket on hand
+        always look "too stale" and forced the full-range fallback on every
+        single search. 0.0005 was verified to reproduce byte-identical
+        usage/accuracy curves to the old 0.05 on toy_2d and LLVIP (LLVIP
+        being the dataset whose non-monotonic usage(r) swings motivated this
+        width check existing at all), so it's the new default rather than a
+        crop-only override.
         """
+        if min_bracket_width is None:
+            min_bracket_width = self.min_bracket_width
+
         # Sort points by r to ensure order
         self.evaluated_points.sort(key=lambda x: x[0])
 
@@ -1516,8 +1646,7 @@ class AdaptiveGridSearch:
         lf_latent_flat = self.routing_snapshots[0]["lf_latent"]
         latent_2d = (lf_latent_flat - self.proj_mean) @ self.proj_basis
 
-        np.savez(
-            file_path,
+        save_kwargs = dict(
             rerun=np.array([s["rerun"] for s in self.routing_snapshots]),
             target_usage=np.array([s["target_usage"] for s in self.routing_snapshots]),
             lf_latent=self.routing_snapshots[0]["lf_latent"],
@@ -1530,6 +1659,17 @@ class AdaptiveGridSearch:
             boundary_yy=self.boundary_yy,
             boundary_zz=np.stack([s["boundary_zz"] for s in self.routing_snapshots], axis=0)
         )
+
+        # Only present when self.test_pixel_acc was supplied (see
+        # evaluate_fe_model) - the per-pixel accuracy fraction for
+        # segmentation, so main.py/plot_pareto_curves.py's oracle computation
+        # can be scored on the same metric as everything else instead of
+        # falling back to the per-image-majority "*_correct" boolean.
+        if "lf_pixel_acc" in self.routing_snapshots[0]:
+            save_kwargs["lf_pixel_acc"] = np.stack([s["lf_pixel_acc"] for s in self.routing_snapshots], axis=0)
+            save_kwargs["hf_pixel_acc"] = np.stack([s["hf_pixel_acc"] for s in self.routing_snapshots], axis=0)
+
+        np.savez(file_path, **save_kwargs)
         logger.info(f"Saved {len(self.routing_snapshots)} routing snapshots to {file_path}")
 
     def evaluate_fe_model(self, r_val):
@@ -1544,8 +1684,21 @@ class AdaptiveGridSearch:
         # next rerun that happens to land on the same r_val.
         details = compute_gate_routing_details(self.fe_model, self.test_dl, self.device)
 
-        correct = np.where(details["choice"] == 1, details["hf_correct"], details["lf_correct"])
-        test_acc = float(correct.mean())
+        if self.test_pixel_acc is not None:
+            # Report per-pixel accuracy (matching main.py's own "Final Test
+            # Summary" metric for segmentation) rather than the per-image-
+            # majority "*_correct" boolean - same routing decision
+            # (details["choice"]), just scored on the metric that's actually
+            # comparable to the LF/HF numbers everything else is judged against.
+            test_lf_pixel_acc, test_hf_pixel_acc = self.test_pixel_acc
+            lf_pa = test_lf_pixel_acc[details["idx"]]
+            hf_pa = test_hf_pixel_acc[details["idx"]]
+            details["lf_pixel_acc"] = lf_pa
+            details["hf_pixel_acc"] = hf_pa
+            test_acc = float(np.where(details["choice"] == 1, hf_pa, lf_pa).mean())
+        else:
+            correct = np.where(details["choice"] == 1, details["hf_correct"], details["lf_correct"])
+            test_acc = float(correct.mean())
         test_use = float(details["choice"].mean())
 
         # Decision-boundary field for the routing plot: fits/caches the
@@ -1658,7 +1811,7 @@ class AdaptiveGridSearch:
         per (r, threshold) cell.
         """
         self.fe_model.eval()
-        p_hf_list, lf_correct_list, hf_correct_list = [], [], []
+        p_hf_list, lf_correct_list, hf_correct_list, idx_list = [], [], [], []
 
         with torch.no_grad():
             for lf_embeddings, lf_loss, hf_loss, lf_correct, hf_correct, idx in dataloader:
@@ -1670,11 +1823,13 @@ class AdaptiveGridSearch:
                 p_hf_list.append(p_hf.cpu().numpy())
                 lf_correct_list.append(lf_correct.cpu().numpy())
                 hf_correct_list.append(hf_correct.cpu().numpy())
+                idx_list.append(idx.cpu().numpy())
 
         return (
             np.concatenate(p_hf_list, axis=0),
             np.concatenate(lf_correct_list, axis=0),
             np.concatenate(hf_correct_list, axis=0),
+            np.concatenate(idx_list, axis=0),
         )
 
     def run_fe_sr_grid(self, usage_values, threshold_grid=None):
@@ -1722,20 +1877,32 @@ class AdaptiveGridSearch:
             )
             self.fe_model = self.fe_model.to(self.device)
 
-            val_p_hf, val_lf_correct, val_hf_correct = self._gate_scores(self.val_dl)
-            test_p_hf, test_lf_correct, test_hf_correct = self._gate_scores(self.test_dl)
+            val_p_hf, val_lf_correct, val_hf_correct, val_idx = self._gate_scores(self.val_dl)
+            test_p_hf, test_lf_correct, test_hf_correct, test_idx = self._gate_scores(self.test_dl)
 
             # decision[i, j] = route sample i to HF at threshold_grid[j]
             val_decision = val_p_hf[:, None] >= threshold_grid[None, :]
             test_decision = test_p_hf[:, None] >= threshold_grid[None, :]
 
+            # Same per-pixel-vs-per-image-majority swap as evaluate_fe_model:
+            # report accuracy on the true per-pixel fraction when available,
+            # scoring the exact same threshold decisions either way.
+            if self.val_pixel_acc is not None and self.test_pixel_acc is not None:
+                val_lf_acc = self.val_pixel_acc[0][val_idx]
+                val_hf_acc = self.val_pixel_acc[1][val_idx]
+                test_lf_acc = self.test_pixel_acc[0][test_idx]
+                test_hf_acc = self.test_pixel_acc[1][test_idx]
+            else:
+                val_lf_acc, val_hf_acc = val_lf_correct, val_hf_correct
+                test_lf_acc, test_hf_acc = test_lf_correct, test_hf_correct
+
             val_usage_grid[r_idx] = val_decision.mean(axis=0)
             val_acc_grid[r_idx] = np.where(
-                val_decision, val_hf_correct[:, None], val_lf_correct[:, None]
+                val_decision, val_hf_acc[:, None], val_lf_acc[:, None]
             ).mean(axis=0)
             test_usage_grid[r_idx] = test_decision.mean(axis=0)
             test_acc_grid[r_idx] = np.where(
-                test_decision, test_hf_correct[:, None], test_lf_correct[:, None]
+                test_decision, test_hf_acc[:, None], test_lf_acc[:, None]
             ).mean(axis=0)
 
         fe_sr_usage_vals, fe_sr_acc_vals, chosen_r, chosen_threshold = [], [], [], []

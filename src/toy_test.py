@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from sklearn.metrics import roc_auc_score
 
-from datasets import HypercubeDataset
+from datasets import HypercubeDataset, IndependentHypercubeDataset
 from helpers import (
     build_model, classifier_one_run, set_all_seeds,
     assemble_hf_input, compute_gate_routing_details, compute_fidelity_loss_correct,
@@ -44,49 +44,6 @@ ROUTED_LF_COLOR = "#6a51a3"
 ROUTED_HF_COLOR = "#238b45"
 LF_MARKER = "o"
 HF_MARKER = "^"
-
-
-class IndependentHypercubeDataset(HypercubeDataset):
-    """Same hypercube-corner cluster geometry/labeling as HypercubeDataset
-    (reuses its _hypercube_corners/_get_label_set/_generate_points_and_labels
-    unchanged), but lf_points and hf_points are independent draws around each
-    cluster's mean rather than HypercubeDataset's lf = hf + extra_noise
-    coupling (extra_std = sqrt(lf_std^2 - hf_std^2)).
-
-    That coupling has a low ceiling whenever lf_std >> hf_std: extra_std ends
-    up close to lf_std itself (e.g. lf_std=0.75, hf_std=0.1 ->
-    extra_std=sqrt(0.75^2-0.1^2)=0.743), so ~99% of lf_point's variance is
-    noise that has nothing to do with hf_point's own (tiny-variance) draw -
-    confirmed directly via the disagreement probe below (AUC ~0.6, barely
-    above chance, on the "hard case" build_toy_datasets produces). This class
-    is the "high ceiling" companion: LF is still noisier than HF, but it's an
-    independent, moderately-noisier observation of the same cluster mean, not
-    a noise-swamped function of HF's own draw - see build_high_ceiling_toy_datasets.
-    """
-    def __init__(self, num_dims, num_samples, hf_std, lf_std, group_classes=True):
-        # Deliberately does NOT call HypercubeDataset.__init__ (that always
-        # does the coupled noise-injection construction) - reuses its helper
-        # methods directly instead, exactly the way HypercubeDataset itself
-        # generates hf_points/labels.
-        self.num_dims = num_dims
-        self.num_clusters = 2 ** num_dims
-        self.num_classes = self.num_clusters // 2 if group_classes else self.num_clusters
-        self.group_classes = group_classes
-
-        num_samples = np.insert(num_samples, 0, 0)
-
-        self.hf_points, self.labels = self._generate_points_and_labels(
-            num_dims, self.num_classes, num_samples, hf_std, group_classes
-        )
-        # Independent draw around the same per-cluster means - NOT derived
-        # from self.hf_points at all, unlike HypercubeDataset.
-        self.lf_points, _ = self._generate_points_and_labels(
-            num_dims, self.num_classes, num_samples, lf_std, group_classes
-        )
-
-        self.hf_points = torch.from_numpy(self.hf_points.astype(np.float32))
-        self.lf_points = torch.from_numpy(self.lf_points.astype(np.float32))
-        self.labels = torch.from_numpy(self.labels.astype(np.int64))
 
 
 def _build_split_sizes(total_num_samples, num_clusters):
@@ -215,8 +172,8 @@ def compute_gate_tensors(lf_model, hf_model, ds, hf_input_mode, device):
     lf_head = lf_model(lf_x)
     hf_head = hf_model(hf_x)
 
-    lf_loss, lf_correct = compute_fidelity_loss_correct(lf_head["output"], labels)
-    hf_loss, hf_correct = compute_fidelity_loss_correct(hf_head["output"], labels)
+    lf_loss, lf_correct, _ = compute_fidelity_loss_correct(lf_head["output"], labels)
+    hf_loss, hf_correct, _ = compute_fidelity_loss_correct(hf_head["output"], labels)
 
     return (
         lf_head["latent"].cpu(),
@@ -246,8 +203,8 @@ def compute_diagnostic_latents(lf_model, hf_model, ds, hf_input_mode, device):
     lf_head = lf_model(lf_x)
     hf_head = hf_model(hf_x)
 
-    _, lf_correct = compute_fidelity_loss_correct(lf_head["output"], labels)
-    _, hf_correct = compute_fidelity_loss_correct(hf_head["output"], labels)
+    _, lf_correct, _ = compute_fidelity_loss_correct(lf_head["output"], labels)
+    _, hf_correct, _ = compute_fidelity_loss_correct(hf_head["output"], labels)
 
     return (
         lf_head["early_latent"].cpu(),

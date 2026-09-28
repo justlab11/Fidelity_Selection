@@ -8,7 +8,7 @@ class SplitData(BaseModel):
     val: List[float]
 
 class DatasetSettings(BaseModel):
-    name: Literal["toy_2d", "toy_5d", "mnist_noise", "mnist_rotation", "bird_grayscale", "bird_color", "crop", "llvip", "bigearthnet"]
+    name: Literal["toy_2d", "toy_2d_high_ceiling", "toy_5d", "mnist_noise", "mnist_rotation", "bird_grayscale", "bird_color", "crop", "llvip", "bigearthnet"]
     folder: str
 
 class ClassifierSettings(BaseModel):
@@ -47,6 +47,17 @@ class FESettings(BaseModel):
     batch_size: int
     reruns: int = 1
     r_range: ThresholdSettings
+    # Passed straight to AdaptiveGridSearch.find_bracket. Was 0.05 (its own
+    # prior hardcoded value) until crop's usage(r) turned out to collapse
+    # within an r-window of ~0.001 - an order of magnitude narrower - which
+    # made every cached bracket look "too stale" and forced the full
+    # [0.001, 1] fallback range on every single search. 0.0005 fixes that
+    # (verified against crop's own bracket/usage data) and was confirmed to
+    # reproduce byte-identical usage/accuracy curves to 0.05 on toy_2d and
+    # LLVIP - including LLVIP, which is the dataset whose non-monotonic
+    # usage(r) swings motivated the width check in the first place - so this
+    # is adopted as the new default rather than a per-dataset override.
+    min_bracket_width: float = 0.0005
 
 class ConfigOptions(BaseModel):
     dataset: DatasetSettings
