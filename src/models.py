@@ -585,7 +585,29 @@ class LatentCNNHead(nn.Module):
         x = self.conv(x)
         x = x.view(x.size(0), -1)
         return {"output": self.fc(x)}
-    
+
+class PooledGateMLP(nn.Module):
+    """Gate for datasets whose lf_latent used to be spatial (crop's UNet
+    bottleneck, YOLO's raw backbone feature map) - now that save_latent pools
+    those to a flat (C,) vector before caching (see save_latent's docstring),
+    this plain 2-layer MLP replaces LatentCNNHead as the gate architecture for
+    those datasets. A side experiment (pooling post-hoc from already-cached
+    spatial latents) found this matches-or-beats LatentCNNHead's accuracy at
+    much higher usage, with no collapse-to-zero step and ~25x faster training
+    - LatentCNNHead's own small 1x1-conv head was the bottleneck, not
+    anything about the spatial information it was discarding anyway (both
+    heads pool to a single vector before their final linear layer)."""
+    def __init__(self, in_dim, hidden=256, num_classes=2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, num_classes),
+        )
+
+    def forward(self, x):
+        return {"output": self.net(x)}
+
 class SelectiveNet(nn.Module):
     def __init__(self, latent_dim, num_classes):
         super().__init__()

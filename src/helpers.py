@@ -19,7 +19,7 @@ from scipy.optimize import minimize
 
 from datasets import HypercubeDataset, IndependentHypercubeDataset, MNISTDataset, CropDataset, CUBDataset, LLVIPDataset, BigEarthNetDataset
 from custom_types import ConfigOptions, FEResult
-from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead, build_yolov5, YOLOv5FidelityModel
+from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead, PooledGateMLP, build_yolov5, YOLOv5FidelityModel
 from losses import MetaLossFunction
 from comparisons import SelectiveNetMethod, IndexedDataset
 
@@ -470,10 +470,24 @@ def build_model(model_name, latent_size, output_size, input_size=None, weights_p
                 num_classes=output_size
             )
 
-        # CNN head specifically for the FE model if the UNET is used for the LF model
+        # CNN head specifically for the FE model if the UNET is used for the LF model.
+        # Superseded by "pooled_gate" below for datasets that used to need this
+        # (see save_latent's pooling) - kept available, not deleted, in case a
+        # future spatial-latent use case wants per-pixel/region gate decisions
+        # instead of a single pooled vector.
         case "cnn_head":
             model = LatentCNNHead(
                 in_channels=input_size,
+                num_classes=output_size
+            )
+
+        # Gate for datasets whose lf_latent used to be spatial (crop, YOLO) -
+        # save_latent now pools those to a flat (C,) vector before caching, so
+        # this plain 2-layer MLP is what actually consumes them (replaces
+        # "cnn_head"/LatentCNNHead - see PooledGateMLP's docstring for why).
+        case "pooled_gate":
+            model = PooledGateMLP(
+                in_dim=input_size,
                 num_classes=output_size
             )
 
@@ -979,6 +993,20 @@ def save_latent(
                 hf_head = hf_model.head(hf)
 
             lf_latent = lf_head[latent_key]
+
+            # Spatially pool a (B, C, H, W) latent down to (B, C) before it
+            # ever reaches disk - crop's UNet bottleneck and YOLO's raw
+            # backbone feature map are the only cases this applies to (every
+            # other model's "latent" is already flat). A side experiment
+            # (results/crop_pooled_gate_experiment) found the gate loses
+            # nothing by only ever seeing the pooled vector - LatentCNNHead's
+            # own conv head pools internally anyway - while cutting cached
+            # latent size ~195x (eliminating the disk-I/O-bound epoch cost
+            # documented in FE_Dataset's docstring) and letting a plain 2-
+            # layer MLP (PooledGateMLP) replace it as the gate architecture.
+            # Flat latents (ndim == 2 once batched) pass through unchanged.
+            if lf_latent.dim() > 2:
+                lf_latent = lf_latent.mean(dim=tuple(range(2, lf_latent.dim())))
 
             if lf_is_yolo:
                 # YOLO's raw output (boxes) isn't comparable to a target via CE

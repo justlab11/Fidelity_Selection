@@ -612,23 +612,29 @@ def main(config_file):
 
     # FE_Dataset falls back to per-sample torch.load() from disk whenever a split
     # doesn't fit in RAM (see FE_Dataset.__init__) - for a dataset the size of
-    # crop's train split, that's ~98% of an epoch's wall time (measured: ~190s of
-    # disk I/O vs. ~2.6s of actual gate-model compute per epoch), all serialized
-    # in the main process under the default num_workers=0. Parallelizing those
-    # reads across worker processes is the fix - this dataloader gets re-iterated
-    # every gate epoch, across every bisection trial, across every rerun, so it's
-    # worth paying for. persistent_workers avoids respawning that whole worker
-    # pool at the start of each of those re-iterations; pin_memory speeds up the
-    # host->GPU transfer. Harmless (if less impactful) for test/val too, which
-    # usually fit in RAM already.
-    fe_dataloader_workers = 8
+    # crop's train split *used to be* (full spatial latents), that was ~98% of an
+    # epoch's wall time (measured: ~190s of disk I/O vs. ~2.6s of actual gate-model
+    # compute per epoch), all serialized in the main process under the default
+    # num_workers=0. Parallelizing those reads across worker processes was the fix.
+    # Now that save_latent pools spatial latents down to (C,) before caching (crop's
+    # whole train split is ~530MB, not ~60GB), FE_Dataset's own RAM-budget check
+    # (self._in_memory) almost always caches the split entirely in memory instead -
+    # at that point, spawning/pickling-to 8 persistent worker processes to serve
+    # batches that are already sitting in the main process's RAM is pure overhead
+    # (observed to stall for 20+ minutes with no progress on crop's pooled latents,
+    # instead of the ~1.7s/epoch a single-process in-memory DataLoader gets - see
+    # results/crop_pooled_gate_experiment). Only pay for worker parallelism when a
+    # split actually fell back to disk.
+    fe_dataloader_workers = 0 if train_ds._in_memory else 8
+    if fe_dataloader_workers == 0:
+        logger.info("FE_Dataset splits fit in RAM - using num_workers=0 for gate dataloaders")
 
     train_dl: DataLoader = DataLoader(
         train_ds,
         batch_size=config.fe_training.batch_size,
         shuffle=True,
         num_workers=fe_dataloader_workers,
-        persistent_workers=True,
+        persistent_workers=fe_dataloader_workers > 0,
         pin_memory=True,
     )
 
@@ -636,7 +642,7 @@ def main(config_file):
         test_ds,
         batch_size=config.fe_training.batch_size,
         num_workers=fe_dataloader_workers,
-        persistent_workers=True,
+        persistent_workers=fe_dataloader_workers > 0,
         pin_memory=True,
     )
 
@@ -644,16 +650,19 @@ def main(config_file):
         val_ds,
         batch_size=config.fe_training.batch_size,
         num_workers=fe_dataloader_workers,
-        persistent_workers=True,
+        persistent_workers=fe_dataloader_workers > 0,
         pin_memory=True,
     )
 
-    # cnn_head is for a spatial (C, H, W) lf_latent - crop's UNet bottleneck
-    # (see gate_latent_key above) and YOLO's raw (unpooled) backbone feature
-    # map - vs. mlp for a flat (D,) latent (resnet/vit/mlp). Note LatentCNNHead
-    # itself still global-average-pools before its routing decision either
-    # way, so this is about which features feed that decision, not (yet)
-    # about making the decision itself per-pixel/region.
+    # is_spatial_latent flags datasets whose lf_latent USED TO BE spatial
+    # before save_latent (helpers.py) started pooling it down to (C,) on
+    # disk - crop's UNet bottleneck and YOLO's raw backbone feature map, vs.
+    # an already-flat (D,) latent (resnet/vit/mlp). Those datasets get
+    # PooledGateMLP (a plain 2-layer MLP) instead of LatentCNNHead - a side
+    # experiment (results/crop_pooled_gate_experiment) found the gate loses
+    # nothing from only ever seeing the pooled vector (LatentCNNHead pooled
+    # internally anyway), while training ~25x faster on ~195x smaller cached
+    # latents and reaching meaningfully higher usage with no collapse step.
     is_spatial_latent = (dataset_name == "crop" or lf_model_name == "yolo")
 
     # Either way, size the gate model off the *actual* saved latent, not
@@ -665,7 +674,7 @@ def main(config_file):
 
     if is_spatial_latent:
         fe_model: nn.Module = build_model(
-            model_name="cnn_head",
+            model_name="pooled_gate",
             input_size=lf_latent_channels,
             output_size=2,
             latent_size=None
@@ -748,7 +757,7 @@ def main(config_file):
         batch_size=config.fe_training.batch_size,
         sampler=gate_sampler,
         num_workers=fe_dataloader_workers,
-        persistent_workers=True,
+        persistent_workers=fe_dataloader_workers > 0,
         pin_memory=True,
     )
 
