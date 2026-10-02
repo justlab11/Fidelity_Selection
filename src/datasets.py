@@ -457,18 +457,39 @@ class CUBDataset(Dataset):
         self.split = split
         self.generator = torch.Generator().manual_seed(seed)
         self.grayscale = grayscale
-        
+
+        # Train had NO augmentation at all before this (just resize+normalize) -
+        # confirmed as the main driver of severe train/test overfitting on this
+        # checkpoint (train_body=True fully fine-tunes an 11M-parameter ResNet18
+        # for 200 epochs on only ~5,400 images; LF/HF both landed at ~100% train
+        # accuracy vs. 23-30%/52-58% test accuracy, 0 train-set disagreement
+        # samples for the FE gate to ever learn from - see
+        # results_cub_disagreement_probe_*/'s train_hf_needed_count=0 finding).
+        # RandomResizedCrop + RandomHorizontalFlip is the standard CUB-200
+        # fine-tuning recipe; val/test stay deterministic (Resize+CenterCrop) so
+        # evaluation numbers aren't affected by random augmentation.
+        if split == "train":
+            spatial_transforms = [
+                transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
+                transforms.RandomHorizontalFlip(),
+            ]
+        else:
+            spatial_transforms = [
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+            ]
+
         if self.grayscale:
             self.lf_transform = transforms.Compose([
                 transforms.Grayscale(num_output_channels=3),  # Convert image to grayscale with 3 channels
+                *spatial_transforms,
                 transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
-                transforms.Resize((224, 224)),  # Resize to model input size
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
 
         self.hf_transform = transforms.Compose([
+            *spatial_transforms,
             transforms.ToTensor(),  # Converts (H, W, C) numpy to (C, H, W) tensor
-            transforms.Resize((224, 224)),  # Resize to model input size
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
@@ -580,8 +601,35 @@ class LLVIPDataset(Dataset):
     scene(s) named in val_scene_prefixes as val, keeping every other test
     scene as the final test set - avoids that: every val/test boundary is a
     genuine scene boundary, not a mid-video cut. The unavoidable cost is a
-    smaller final test set (the default holds out scene "26", ~533 of test's
+    smaller final test set (the default holds out scene "20", 319 of test's
     3,463 images).
+
+    val_scene_prefixes previously defaulted to ("26",) - direct visual
+    inspection (first/mid/last frame) found scene 26 is daytime-lit, unlike
+    every other test-folder scene (19-24), which are genuinely low-light
+    night footage. That made val unrepresentative of the actual (nighttime)
+    task - e.g. LF/HF accuracy on old val (97.4%/99.2%, ~1.9pp gap) looked
+    far closer than the real nighttime gap on test (94.0%/98.3%, ~4.3pp).
+
+    Scene "24" was tried first as the replacement (confirmed dark throughout,
+    closest in size to the old val) but turned out to be an outlier-hard
+    scene, not a representative one: LF/HF accuracy there was 79.8%/92.6%
+    (12.8pp gap) vs. 97.0%/99.5% (2.55pp gap) on the remaining scenes 19-23 -
+    ground-truth box density doesn't explain it (slightly below the other
+    scenes' average), more likely the heavy tree-branch occlusion visible in
+    that scene's frames. Scene "20" tracks the real test gap much more
+    closely (94.0%/99.7%, 5.64pp gap vs. test's 2.55pp with 19/21-24 - about
+    2x overshoot, vs. scene 24's ~5x) and is smaller (319 vs. 500), so it's
+    the current default.
+
+    excluded_scene_prefixes exists because of a bug caught while making that
+    change: the test filter only ever excluded val_scene_prefixes, so simply
+    repointing val_scene_prefixes at "24" silently let the daytime scene "26"
+    fall back into test (it's no longer val, and "not in val_scene_prefixes"
+    now includes it) - reintroducing the exact contamination this fix is for,
+    just in the other split. excluded_scene_prefixes is scrubbed from test
+    independently of whatever val_scene_prefixes is currently set to, so a
+    scene known to not match the task (daytime, here) stays out of both.
 
     lf_img/hf_img are returned as (3, img_size, img_size) float tensors
     scaled to [0, 1] — YOLOv5's own preprocessing convention (no ImageNet
@@ -597,7 +645,8 @@ class LLVIPDataset(Dataset):
         img_size: int = 640,
         max_boxes: int = 20,
         lf_modality: str = "visible",
-        val_scene_prefixes: tuple = ("26",),
+        val_scene_prefixes: tuple = ("20",),
+        excluded_scene_prefixes: tuple = ("26",),
     ):
         assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
         assert lf_modality in ["visible", "infrared"], "lf_modality must be 'visible' or 'infrared'"
@@ -629,7 +678,10 @@ class LLVIPDataset(Dataset):
         if split == "val":
             self.basenames = [f for f in basenames if f[:2] in val_scene_prefixes]
         elif split == "test":
-            self.basenames = [f for f in basenames if f[:2] not in val_scene_prefixes]
+            self.basenames = [
+                f for f in basenames
+                if f[:2] not in val_scene_prefixes and f[:2] not in excluded_scene_prefixes
+            ]
         else:
             self.basenames = basenames
 

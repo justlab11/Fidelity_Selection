@@ -593,6 +593,88 @@ def compute_yolo_detection_correctness(
 
     return correct
 
+def compute_yolo_detection_loss(
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+        img_size,
+        conf_thres: float = 0.25,
+        nms_iou_thres: float = 0.45,
+        match_iou_thres: float = 0.5):
+    """Continuous per-image detection loss, replacing the old binary
+    1 - correct signal save_latent used for YOLO's lf_loss/hf_loss (which was
+    just compute_yolo_detection_correctness's boolean recomputed as a float -
+    not a real loss, and ternary {-1,0,+1} once differenced across
+    fidelities). This gives the gate (and any gain-based diagnostic) a
+    genuinely continuous per-sample training/ranking signal instead.
+
+    Same greedy-by-confidence IoU matching as compute_yolo_detection_correctness
+    (including the same conf_thres=0.25 default), but instead of reducing to a
+    single recall-threshold boolean, every box gets its own contribution:
+      - each ground-truth box matched to a surviving detection (IoU >=
+        match_iou_thres) contributes (1 - IoU) - 0 for a perfect box, up to
+        (1 - match_iou_thres) for a borderline one.
+      - each ground-truth box left unmatched (missed entirely) contributes 1
+        (maximum penalty).
+      - each surviving detection not claimed by any ground-truth box (a false
+        positive) also contributes 1 - same weight as a miss, kept simple per
+        spec rather than IoU-weighted (there's no matching box to compute an
+        IoU against).
+    Per-image loss is the mean of all those contributions. An image with zero
+    ground truth AND zero detections has no contributions to average - 0.0 by
+    convention (perfect), mirroring correctness's own same-situation special case.
+
+    Returns a (B,) float tensor, each entry in [0, 1].
+    """
+    from yolov5.utils.general import non_max_suppression, xywh2xyxy, box_iou
+
+    h, w = img_size
+    scale = torch.tensor([w, h, w, h], device=targets.device, dtype=targets.dtype)
+
+    detections = non_max_suppression(preds, conf_thres=conf_thres, iou_thres=nms_iou_thres)
+
+    loss = torch.zeros(preds.size(0), dtype=torch.float32)
+    for i, det in enumerate(detections):
+        valid = targets[i, :, 0] >= 0
+        gt_boxes = xywh2xyxy(targets[i, valid, 1:5] * scale)
+        num_gt = gt_boxes.size(0)
+        num_det = det.size(0)
+
+        if num_gt == 0 and num_det == 0:
+            loss[i] = 0.0
+            continue
+
+        if num_gt == 0:
+            loss[i] = 1.0  # every detection is a false positive
+            continue
+
+        if num_det == 0:
+            loss[i] = 1.0  # every ground-truth box is a miss
+            continue
+
+        ious = box_iou(det[:, :4], gt_boxes)  # (num_det, num_gt)
+        order = torch.argsort(det[:, 4], descending=True)
+        matched_gt = torch.zeros(num_gt, dtype=torch.bool, device=ious.device)
+        matched_det = torch.zeros(num_det, dtype=torch.bool, device=ious.device)
+        gt_best_iou = torch.zeros(num_gt, dtype=torch.float32, device=ious.device)
+
+        for d in order.tolist():
+            if matched_gt.all():
+                break
+            row = ious[d].clone()
+            row[matched_gt] = -1
+            best_gt = torch.argmax(row)
+            if row[best_gt] >= match_iou_thres:
+                matched_gt[best_gt] = True
+                matched_det[d] = True
+                gt_best_iou[best_gt] = row[best_gt]
+
+        gt_contributions = torch.where(matched_gt, 1.0 - gt_best_iou, torch.ones_like(gt_best_iou))
+        num_false_positives = int((~matched_det).sum())
+        fp_contributions = torch.ones(num_false_positives, device=ious.device)
+        loss[i] = torch.cat([gt_contributions, fp_contributions]).mean()
+
+    return loss
+
 def compute_gate_routing_details(model, dataloader, device):
     """One no-grad pass over a "gate"-fidelity dataloader (lf_embeddings, lf_loss,
     hf_loss, lf_correct, hf_correct, idx), returning per-sample arrays: the gate's
@@ -934,7 +1016,9 @@ def save_latent(
         train_body: bool,
         device="cpu",
         hf_input_mode: str = "concat",
-        latent_key: str = "latent"):
+        latent_key: str = "latent",
+        yolo_continuous_loss: bool = False,
+        yolo_loss_threshold: float = 0.8):
     """
     latent_key selects which of the LF model's forward()-dict entries gets
     saved as "lf_latent" per sample. Every model besides UNet only has one
@@ -1009,18 +1093,31 @@ def save_latent(
                 lf_latent = lf_latent.mean(dim=tuple(range(2, lf_latent.dim())))
 
             if lf_is_yolo:
-                # YOLO's raw output (boxes) isn't comparable to a target via CE
-                # at all, so correctness is the only signal available -
-                # compute_yolo_detection_correctness already reduces it to a
-                # per-image (B,) float in {0.0, 1.0}; loss is defined as
-                # 1 - correct to keep the same "0 = perfect, positive = worse"
-                # convention compute_fidelity_loss_correct's CE-based loss has.
-                lf_correct = compute_yolo_detection_correctness(lf_head["output"], labels, img_size=lf.shape[-2:]).bool()
-                hf_correct = compute_yolo_detection_correctness(hf_head["output"], labels, img_size=hf.shape[-2:]).bool()
-                lf_loss = 1.0 - lf_correct.float()
-                hf_loss = 1.0 - hf_correct.float()
-                lf_pixel_acc = lf_correct.float()
-                hf_pixel_acc = hf_correct.float()
+                if yolo_continuous_loss:
+                    # Continuous IoU-and-miss-based loss (see
+                    # compute_yolo_detection_loss's docstring) replacing the
+                    # old binary 1-correct signal - validated against the old
+                    # boolean accuracy at yolo_loss_threshold=0.8 (agreement
+                    # within <0.5pp) via llvip_validate_continuous_loss.py.
+                    lf_loss = compute_yolo_detection_loss(lf_head["output"], labels, img_size=lf.shape[-2:])
+                    hf_loss = compute_yolo_detection_loss(hf_head["output"], labels, img_size=hf.shape[-2:])
+                    lf_correct = (lf_loss < yolo_loss_threshold)
+                    hf_correct = (hf_loss < yolo_loss_threshold)
+                    lf_pixel_acc = lf_correct.float()
+                    hf_pixel_acc = hf_correct.float()
+                else:
+                    # YOLO's raw output (boxes) isn't comparable to a target via CE
+                    # at all, so correctness is the only signal available -
+                    # compute_yolo_detection_correctness already reduces it to a
+                    # per-image (B,) float in {0.0, 1.0}; loss is defined as
+                    # 1 - correct to keep the same "0 = perfect, positive = worse"
+                    # convention compute_fidelity_loss_correct's CE-based loss has.
+                    lf_correct = compute_yolo_detection_correctness(lf_head["output"], labels, img_size=lf.shape[-2:]).bool()
+                    hf_correct = compute_yolo_detection_correctness(hf_head["output"], labels, img_size=hf.shape[-2:]).bool()
+                    lf_loss = 1.0 - lf_correct.float()
+                    hf_loss = 1.0 - hf_correct.float()
+                    lf_pixel_acc = lf_correct.float()
+                    hf_pixel_acc = hf_correct.float()
             else:
                 lf_loss, lf_correct, lf_pixel_acc = compute_fidelity_loss_correct(lf_head["output"], labels)
                 hf_loss, hf_correct, hf_pixel_acc = compute_fidelity_loss_correct(hf_head["output"], labels)
@@ -1285,23 +1382,791 @@ class GaussianProcessSearch:
 
         return best_point
 
-class AdaptiveGridSearch:
+# --- OLD AdaptiveGridSearch (bisection-based search), kept for reference/rollback. ---
+# Replaced by LogSeededGreedySearch below - see that class's docstring for why.
+# class AdaptiveGridSearch:
+#     def __init__(
+#             self, fe_model, device, train_dl, val_dl, test_dl, model_folder,
+#             gate_epochs=30, gate_lr=3e-4, gate_grad_clip_norm=None, seed=42,
+#             min_bracket_width=0.0005, val_pixel_acc=None, test_pixel_acc=None):
+#         # evaluated_points is reset at the start of every rerun (see run_reruns) so
+#         # each rerun's bracket search is a genuinely independent sweep, not warm-
+#         # started off a previous rerun's history. all_evaluated_points pools every
+#         # rerun's points instead — more raw (r, usage, acc) samples only helps
+#         # plot_gate_sensitivity.py's derivative/zoom analysis, so nothing is reset there.
+#         self.evaluated_points = []
+#         self.all_evaluated_points = []
+#         self.epoch_log = []
+#         self.search_diagnostics = []
+#         # One entry per find_r_for_target call: the final gate model's per-sample
+#         # routing decision + both models' correctness, tagged by rerun/target_usage.
+#         # Feeds the routing projection plot and the routing confusion-table plot.
+#         self.routing_snapshots = []
+#         self.rerun_idx = 0
+#         self.fe_model = fe_model
+#         self.device = device
+#         self.train_dl = train_dl
+#         self.val_dl = val_dl
+#         self.test_dl = test_dl
+#         self.model_folder = model_folder
+#         self.gate_epochs = gate_epochs
+#         self.gate_lr = gate_lr
+#         self.gate_grad_clip_norm = gate_grad_clip_norm
+#         self.seed = seed
+#         self.min_bracket_width = min_bracket_width
+#         # (lf_pixel_acc, hf_pixel_acc) arrays indexed by dataset idx, from
+#         # load_pixel_acc_lookup - the true per-pixel accuracy fraction for
+#         # segmentation (identical to *_correct for classification), used only
+#         # for *reported* accuracy (evaluate_fe_model/run_fe_sr_grid), not for
+#         # gate training/weighting/routing decisions, which stay on the
+#         # existing boolean lf_correct/hf_correct throughout. None (the
+#         # default) preserves the old per-image-majority-vote behavior.
+#         self.val_pixel_acc = val_pixel_acc
+#         self.test_pixel_acc = test_pixel_acc
+#
+#         # Re-snapshotted at the start of every rerun (see run_reruns) - every
+#         # r_val *within* a rerun trains from this same fixed init/seed, so
+#         # differences in usage(r) reflect r itself rather than which random
+#         # basin that r_val's own from-scratch init happened to land near
+#         # (usage(r) was observed to swing from 0.99 to 0.26 to 1.0 across r
+#         # values barely 0.01 apart on LLVIP/YOLO, which is what motivated
+#         # this). Left un-fixed *across* reruns so run_reruns still measures
+#         # genuine run-to-run variance instead of repeating the same search
+#         # n_reruns times.
+#         self.fe_init_state = None
+#         self.rerun_seed = seed
+#
+#         # lf_latent is the same fixed test-set data on every call (it's precomputed
+#         # LF-model output, independent of the gate model), so the projection basis
+#         # is fit once and reused everywhere — every snapshot's 2D coordinates line
+#         # up in the same space.
+#         self.proj_mean = None
+#         self.proj_basis = None  # (latent_dim, 2), orthonormal columns
+#         self.boundary_xx = None
+#         self.boundary_yy = None
+#         # Per-sample shape of the real (possibly spatial) latent, e.g. (1024,)
+#         # for a flat mlp-gate latent or (1024, 20, 20) for a cnn_head-gate's
+#         # spatial one — needed to reshape the flattened projection basis's
+#         # reconstructions back into what self.fe_model actually expects.
+#         self.latent_sample_shape = None
+#
+#     def _project_latent(self, lf_latent, latent_sample_shape, hf_needed=None, grid_size=120, pad_frac=0.05):
+#         """Fits (once) a 2D linear basis on lf_latent and a matching decision-
+#         boundary meshgrid in that plane. Returns coords_2d.
+#
+#         Unlike plain PCA (which picks the directions of highest variance in
+#         lf_latent, with no reason to align with where the gate actually
+#         disagrees with itself), this basis is supervised: axis 1 is the
+#         logistic-regression direction that best separates hf_needed from
+#         lf_fine, axis 2 is the top PCA direction of what's left after removing
+#         axis 1 (so it's orthogonal to axis 1 and still soaks up leftover
+#         structure). The basis stays linear and exactly invertible — same as
+#         PCA — so _compute_decision_boundary's inverse-transform trick (running
+#         the real fe_model over reconstructed latents) still holds.
+#
+#         lf_latent is always the already-pooled (N, C) summary
+#         compute_gate_routing_details produces (mean over spatial dims for a
+#         cnn_head gate's (B, C, H, W) YOLO/UNet feature map) - flattening every
+#         spatial position instead (e.g. 409,600 dims for a 20x20x1024 YOLO
+#         feature) would blow up memory catastrophically (a single (N, D)
+#         float32 array several GB at N in the thousands) and put D far above
+#         N, where the supervised logistic-regression fit degenerates
+#         (near-perfect separation, unstable coefficients). latent_sample_shape
+#         (the true per-sample (C,) or (C, H, W) shape, from
+#         compute_gate_routing_details) is kept separately so
+#         _compute_decision_boundary still knows how to broadcast reconstructed
+#         grid points back into what self.fe_model actually expects - the real
+#         routing decisions elsewhere always use the true, unpooled spatial latent.
+#         """
+#         self.latent_sample_shape = latent_sample_shape
+#         lf_latent_flat = lf_latent
+#
+#         if self.proj_basis is None:
+#             if hf_needed is None:
+#                 raise ValueError("hf_needed labels are required to fit the projection basis")
+#
+#             self.proj_mean = lf_latent_flat.mean(axis=0)
+#             centered = lf_latent_flat - self.proj_mean
+#
+#             if len(np.unique(hf_needed)) < 2:
+#                 # hf_needed (hf_correct & ~lf_correct) is constant across this
+#                 # eval set - e.g. an easy task where lf_model is already ~100%
+#                 # accurate, so hf is essentially never "needed". No separating
+#                 # direction to fit, so fall back to plain (unsupervised) PCA for
+#                 # both axes instead of raising - this basis is only for the
+#                 # routing-projection plot, not the actual routing decision.
+#                 logger.warning(
+#                     "_project_latent: hf_needed has a single class in this eval set; "
+#                     "falling back to unsupervised PCA for the projection basis"
+#                 )
+#                 pca = PCA(n_components=2)
+#                 pca.fit(centered)
+#                 axis1, axis2 = pca.components_[0], pca.components_[1]
+#                 axis1 /= np.linalg.norm(axis1)
+#                 axis2 /= np.linalg.norm(axis2)
+#             else:
+#                 # Fit the separating direction inside the top-variance PCA
+#                 # subspace of the latent, not the raw D dims directly. A ReLU
+#                 # latent typically has several near-constant/sparse dimensions
+#                 # (zero for almost every sample, nonzero for a handful) - dividing
+#                 # by std below blows those up into huge standardized values for
+#                 # exactly those few points, and an L2-penalized logistic fit can
+#                 # exploit that "for free" to separate a handful of leverage
+#                 # points instead of the real hf_needed/lf_fine boundary (observed
+#                 # directly on toy_2d: axis1 ended up spanning ~1000x less range
+#                 # than axis2, with the extreme axis1 outliers turning out to be
+#                 # ordinary lf_fine points, not the hard/ambiguous ones).
+#                 # Restricting the fit to the top principal directions first
+#                 # denoises those degenerate dims away before the supervised step
+#                 # ever sees them.
+#                 n_components = min(15, centered.shape[0] - 1, centered.shape[1])
+#                 pca_denoise = PCA(n_components=n_components)
+#                 reduced = pca_denoise.fit_transform(centered)  # (N, k)
+#
+#                 reduced_std = reduced.std(axis=0)
+#                 reduced_std[reduced_std == 0] = 1
+#                 clf = LogisticRegression(max_iter=1000)
+#                 clf.fit(reduced / reduced_std, hf_needed.astype(int))
+#
+#                 # Undo the subspace standardization, then re-expand from the
+#                 # k-dim PCA subspace back into full latent space.
+#                 axis1 = pca_denoise.components_.T @ (clf.coef_[0] / reduced_std)
+#                 axis1 /= np.linalg.norm(axis1)
+#
+#                 # Remove axis1's component, then take the top PCA direction of the
+#                 # residual — orthogonal to axis1 by construction.
+#                 residual = centered - np.outer(centered @ axis1, axis1)
+#                 pca_resid = PCA(n_components=1)
+#                 pca_resid.fit(residual)
+#                 axis2 = pca_resid.components_[0]
+#                 axis2 /= np.linalg.norm(axis2)
+#
+#             self.proj_basis = np.stack([axis1, axis2], axis=1)
+#             coords_2d = centered @ self.proj_basis
+#
+#             x_min, x_max = coords_2d[:, 0].min(), coords_2d[:, 0].max()
+#             y_min, y_max = coords_2d[:, 1].min(), coords_2d[:, 1].max()
+#             x_pad = (x_max - x_min) * pad_frac
+#             y_pad = (y_max - y_min) * pad_frac
+#             self.boundary_xx, self.boundary_yy = np.meshgrid(
+#                 np.linspace(x_min - x_pad, x_max + x_pad, grid_size),
+#                 np.linspace(y_min - y_pad, y_max + y_pad, grid_size)
+#             )
+#         else:
+#             coords_2d = (lf_latent_flat - self.proj_mean) @ self.proj_basis
+#
+#         return coords_2d
+#
+#     def _compute_decision_boundary(self, batch_size=128):
+#         """Runs the *actual* trained self.fe_model (not a proxy classifier) over
+#         grid points in the cached projection plane, reconstructed back to the
+#         real latent dimensionality via the basis's transpose (exact since the
+#         basis columns are orthonormal). This is a genuine slice of the real
+#         decision surface through that 2D plane — necessarily an approximation
+#         (the plane can't capture the other latent_dim-2 axes), but it reflects
+#         the model's own nonlinearity rather than a re-fit linear stand-in.
+#
+#         For a spatial gate (cnn_head), proj_mean/proj_basis operate on the
+#         pooled (C,) summary _project_latent fits on, so each reconstructed grid
+#         point is broadcast out to the model's true (C, H, W) input shape -
+#         treating it as a spatially-uniform feature map, a further approximation
+#         on top of the 2D-plane one above. Processed in batches so this never
+#         materializes more than batch_size full spatial tensors at once (all
+#         grid_size**2 of them at full (C, H, W) size at once is the same
+#         multi-GB blowup _project_latent's pooling was written to avoid).
+#         """
+#         grid_2d = np.column_stack([self.boundary_xx.ravel(), self.boundary_yy.ravel()])
+#         grid_latent = (self.proj_mean + grid_2d @ self.proj_basis.T).astype(np.float32)
+#
+#         is_spatial = len(self.latent_sample_shape) > 1
+#         pooled_channels = self.latent_sample_shape[0] if is_spatial else None
+#
+#         self.fe_model.eval()
+#         hf_probs = []
+#         with torch.no_grad():
+#             for start in range(0, grid_latent.shape[0], batch_size):
+#                 chunk = torch.from_numpy(grid_latent[start:start + batch_size]).to(self.device)
+#
+#                 if is_spatial:
+#                     spatial_dims = self.latent_sample_shape[1:]
+#                     chunk = chunk.view(chunk.shape[0], pooled_channels, *([1] * len(spatial_dims)))
+#                     chunk = chunk.expand(chunk.shape[0], *self.latent_sample_shape).contiguous()
+#                 else:
+#                     chunk = chunk.reshape((-1,) + self.latent_sample_shape)
+#
+#                 logits = self.fe_model(chunk)["output"]
+#                 hf_probs.append(torch.softmax(logits, dim=1)[:, 1].cpu().numpy())
+#
+#         hf_prob = np.concatenate(hf_probs, axis=0)
+#         return hf_prob.reshape(self.boundary_xx.shape)
+#
+#     def find_bracket(self, usage, min_bracket_width=None):
+#         """Only reuses an existing (r_a, r_b) pair from a prior target's search
+#         if it's wide enough to represent genuine exploration room. Bisection
+#         naturally converges its *own* final bracket down to ~tolerance width by
+#         design (see find_r_for_target) - blindly reusing that razor-thin final
+#         bracket as if it were informative for a completely different target
+#         usage is where this used to go wrong: usage(r) has repeatedly turned
+#         out to behave more like a step function than the smooth monotonic
+#         curve bisection assumes (see the gate's per-epoch routing logs), so a
+#         narrow leftover bracket can spuriously "contain" almost any target
+#         usage - silently skipping bisection (0 passes) and just replaying
+#         whichever checkpoint happened to converge for the earlier target,
+#         instead of doing real work for this one. Requiring a minimum width
+#         forces a fresh full-range search whenever the only "bracket" on hand is
+#         really just a stale, over-converged sliver.
+#
+#         min_bracket_width defaults to self.min_bracket_width (constructor
+#         param, itself defaulting to 0.0005 - see FESettings.min_bracket_width)
+#         rather than hardcoding it here, so a caller can still tune it per-
+#         dataset if needed. The default used to be 0.05, but crop's own
+#         usage(r) collapse turned out to happen within an r-window of ~0.001,
+#         an order of magnitude narrower, which made every bracket on hand
+#         always look "too stale" and forced the full-range fallback on every
+#         single search. 0.0005 was verified to reproduce byte-identical
+#         usage/accuracy curves to the old 0.05 on toy_2d and LLVIP (LLVIP
+#         being the dataset whose non-monotonic usage(r) swings motivated this
+#         width check existing at all), so it's the new default rather than a
+#         crop-only override.
+#         """
+#         if min_bracket_width is None:
+#             min_bracket_width = self.min_bracket_width
+#
+#         # Sort points by r to ensure order
+#         self.evaluated_points.sort(key=lambda x: x[0])
+#
+#         for i in range(len(self.evaluated_points) - 1):
+#             r_a, use_a, *_ = self.evaluated_points[i]
+#             r_b, use_b, *_ = self.evaluated_points[i+1]
+#             # usage decreases as r increases (see the bisection direction in
+#             # find_r_for_target), so for r_a < r_b we expect use_a >= use_b
+#             if use_b <= usage <= use_a and (r_b - r_a) >= min_bracket_width:
+#                 return r_a, r_b, False
+#
+#         # If no sufficiently wide bracket, use full range as fallback — this is
+#         # also the concrete signal that a target usage may end up unreachable
+#         # within tolerance.
+#         logger.warning(f"No sufficiently wide bracket found for usage={usage}; falling back to full range [0.001, 1]")
+#         return 0.001, 1, True
+#
+#     def train_fe_model(self, r_val):
+#         criterion = MetaLossFunction(
+#             ch=[r_val],
+#             cw=1,
+#             device=self.device
+#         )
+#
+#         set_all_seeds(self.rerun_seed)
+#         self.fe_model.load_state_dict(self.fe_init_state)
+#         self.fe_model = self.fe_model.to(self.device)
+#         fe_optimizer = torch.optim.Adam(self.fe_model.parameters(), lr=self.gate_lr, weight_decay=1e-5)
+#
+#         best_val_loss = float('inf')
+#         best_val_acc = None
+#         best_val_use = None
+#         fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
+#
+#         for epoch in range(self.gate_epochs):
+#             epoch_start = time.perf_counter()
+#
+#             train_loss, _, _ = classifier_one_run(
+#                 model=self.fe_model,
+#                 dataloader=self.train_dl,
+#                 criterion=criterion,
+#                 fidelity="gate",
+#                 optimizer=fe_optimizer,
+#                 grad_clip_norm=self.gate_grad_clip_norm
+#             )
+#
+#             val_loss, val_acc, val_use = classifier_one_run(
+#                 model=self.fe_model,
+#                 dataloader=self.val_dl,
+#                 criterion=criterion,
+#                 fidelity="gate",
+#             )
+#
+#             # Diagnostic: min/max/mean-abs of the gate's raw routing logits. Climbing
+#             # toward the tens/hundreds while val_usage/val_loss go flat is the
+#             # signature of softmax saturation killing the gradient - see gate_logit_stats.
+#             logit_min, logit_max, logit_absmean = gate_logit_stats(self.fe_model, self.val_dl, self.device)
+#
+#             epoch_time_sec = time.perf_counter() - epoch_start
+#
+#             if not math.isfinite(val_loss):
+#                 logger.warning(f"Non-finite val_loss ({val_loss}) training gate model at r_val={r_val}, epoch={epoch}")
+#
+#             # Live progress - previously the only record of gate training was
+#             # self.epoch_log, written to gate_epoch_metrics.csv once at the very
+#             # end of the whole run, so a long search gave zero visibility into
+#             # whether it was progressing or stuck.
+#             logger.info(
+#                 f"[gate rerun={self.rerun_idx} r={r_val:.6f}] epoch {epoch + 1}/{self.gate_epochs} "
+#                 f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} "
+#                 f"val_usage={val_use:.4f} logit_absmean={logit_absmean:.2f} ({epoch_time_sec:.2f}s/epoch)"
+#             )
+#
+#             self.epoch_log.append({
+#                 "rerun": self.rerun_idx, "r_val": r_val, "epoch": epoch, "train_loss": train_loss,
+#                 "val_loss": val_loss, "val_acc": val_acc, "val_usage": val_use,
+#                 "logit_min": logit_min, "logit_max": logit_max, "logit_absmean": logit_absmean,
+#                 "epoch_time_sec": epoch_time_sec
+#             })
+#
+#             if val_loss < best_val_loss:
+#                 best_val_loss = val_loss
+#                 best_val_acc = val_acc
+#                 best_val_use = val_use
+#                 torch.save(self.fe_model.state_dict(), fe_model_file)
+#
+#         return best_val_use, best_val_acc
+#
+#     def save_epoch_log(self, file_path):
+#         if not self.epoch_log:
+#             logger.warning("AdaptiveGridSearch.epoch_log is empty; nothing to save")
+#             return
+#
+#         fieldnames = list(self.epoch_log[0].keys())
+#         with open(file_path, "w", newline="") as f:
+#             writer = csv.DictWriter(f, fieldnames=fieldnames)
+#             writer.writeheader()
+#             writer.writerows(self.epoch_log)
+#         logger.info(f"Saved {len(self.epoch_log)} gate-model epoch rows to {file_path}")
+#
+#     def save_search_diagnostics(self, file_path):
+#         if not self.search_diagnostics:
+#             logger.warning("AdaptiveGridSearch.search_diagnostics is empty; nothing to save")
+#             return
+#
+#         fieldnames = list(self.search_diagnostics[0].keys())
+#         with open(file_path, "w", newline="") as f:
+#             writer = csv.DictWriter(f, fieldnames=fieldnames)
+#             writer.writeheader()
+#             writer.writerows(self.search_diagnostics)
+#         logger.info(f"Saved {len(self.search_diagnostics)} search diagnostic rows to {file_path}")
+#
+#     def save_evaluated_points(self, file_path):
+#         if not self.all_evaluated_points:
+#             logger.warning("AdaptiveGridSearch.all_evaluated_points is empty; nothing to save")
+#             return
+#
+#         points = np.array(self.all_evaluated_points, dtype=float)
+#         np.savez(
+#             file_path,
+#             r_values=points[:, 0],
+#             usage_values=points[:, 1],
+#             acc_values=points[:, 2],
+#             rerun_values=points[:, 3]
+#         )
+#         logger.info(f"Saved {len(self.all_evaluated_points)} (r, usage, acc, rerun) points to {file_path}")
+#
+#     def save_routing_snapshots(self, file_path):
+#         if not self.routing_snapshots:
+#             logger.warning("AdaptiveGridSearch.routing_snapshots is empty; nothing to save")
+#             return
+#
+#         # lf_latent/latent_2d/boundary_xx/boundary_yy are identical for every
+#         # snapshot (same fixed test-set lf_latent - already pooled to (N, C) by
+#         # compute_gate_routing_details regardless of gate type, same cached
+#         # projection basis/grid), so they're saved once rather than duplicated
+#         # per snapshot; only boundary_zz (the actual per-gate-model decision
+#         # field) legitimately varies.
+#         lf_latent_flat = self.routing_snapshots[0]["lf_latent"]
+#         latent_2d = (lf_latent_flat - self.proj_mean) @ self.proj_basis
+#
+#         save_kwargs = dict(
+#             rerun=np.array([s["rerun"] for s in self.routing_snapshots]),
+#             target_usage=np.array([s["target_usage"] for s in self.routing_snapshots]),
+#             lf_latent=self.routing_snapshots[0]["lf_latent"],
+#             lf_correct=np.stack([s["lf_correct"] for s in self.routing_snapshots], axis=0),
+#             hf_correct=np.stack([s["hf_correct"] for s in self.routing_snapshots], axis=0),
+#             choice=np.stack([s["choice"] for s in self.routing_snapshots], axis=0),
+#             idx=np.stack([s["idx"] for s in self.routing_snapshots], axis=0),
+#             latent_2d=latent_2d,
+#             boundary_xx=self.boundary_xx,
+#             boundary_yy=self.boundary_yy,
+#             boundary_zz=np.stack([s["boundary_zz"] for s in self.routing_snapshots], axis=0)
+#         )
+#
+#         # Only present when self.test_pixel_acc was supplied (see
+#         # evaluate_fe_model) - the per-pixel accuracy fraction for
+#         # segmentation, so main.py/plot_pareto_curves.py's oracle computation
+#         # can be scored on the same metric as everything else instead of
+#         # falling back to the per-image-majority "*_correct" boolean.
+#         if "lf_pixel_acc" in self.routing_snapshots[0]:
+#             save_kwargs["lf_pixel_acc"] = np.stack([s["lf_pixel_acc"] for s in self.routing_snapshots], axis=0)
+#             save_kwargs["hf_pixel_acc"] = np.stack([s["hf_pixel_acc"] for s in self.routing_snapshots], axis=0)
+#
+#         np.savez(file_path, **save_kwargs)
+#         logger.info(f"Saved {len(self.routing_snapshots)} routing snapshots to {file_path}")
+#
+#     def evaluate_fe_model(self, r_val):
+#         fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
+#         self.fe_model.load_state_dict(torch.load(fe_model_file, weights_only=True))
+#         self.fe_model = self.fe_model.to(self.device)
+#
+#         # Single forward pass over the test set gets us test_acc/test_use *and*
+#         # everything the routing/projection plots need, in one shot — done here (right
+#         # after loading this r_val's just-trained weights) rather than reloading
+#         # the checkpoint later, since fe_model-{r_val}.pt gets overwritten by the
+#         # next rerun that happens to land on the same r_val.
+#         details = compute_gate_routing_details(self.fe_model, self.test_dl, self.device)
+#
+#         if self.test_pixel_acc is not None:
+#             # Report per-pixel accuracy (matching main.py's own "Final Test
+#             # Summary" metric for segmentation) rather than the per-image-
+#             # majority "*_correct" boolean - same routing decision
+#             # (details["choice"]), just scored on the metric that's actually
+#             # comparable to the LF/HF numbers everything else is judged against.
+#             test_lf_pixel_acc, test_hf_pixel_acc = self.test_pixel_acc
+#             lf_pa = test_lf_pixel_acc[details["idx"]]
+#             hf_pa = test_hf_pixel_acc[details["idx"]]
+#             details["lf_pixel_acc"] = lf_pa
+#             details["hf_pixel_acc"] = hf_pa
+#             test_acc = float(np.where(details["choice"] == 1, hf_pa, lf_pa).mean())
+#         else:
+#             correct = np.where(details["choice"] == 1, details["hf_correct"], details["lf_correct"])
+#             test_acc = float(correct.mean())
+#         test_use = float(details["choice"].mean())
+#
+#         # Decision-boundary field for the routing plot: fits/caches the
+#         # projection plane on first call (using this call's ground truth to
+#         # pick a separating basis), then runs *this* r_val's actual fe_model
+#         # (still loaded above) over the plane's grid, reconstructed back to
+#         # latent space — so the contour reflects the real model, not a re-fit
+#         # proxy.
+#         hf_needed = details["hf_correct"] & ~details["lf_correct"]
+#         self._project_latent(details["lf_latent"], details["latent_sample_shape"], hf_needed)
+#         details["boundary_zz"] = self._compute_decision_boundary()
+#
+#         return test_acc, test_use, details
+#
+#     def _cached_eval(self, r_val, tol=1e-6):
+#         """Looks up an r_val already trained earlier in this rerun (e.g. every
+#         full-range fallback in find_bracket starts bisection from the same
+#         deterministic first midpoint, 0.5005 - without this, every target that
+#         falls back would silently retrain that same r_val from scratch)."""
+#         for r, use, acc in self.evaluated_points:
+#             if abs(r - r_val) <= tol:
+#                 return use, acc
+#         return None
+#
+#     def find_r_for_target(self, usage, tolerance=1e-3):
+#         r_low, r_high, bracket_fallback_used = self.find_bracket(usage)
+#         bisection_passes = 0
+#         while r_high - r_low > tolerance:
+#             bisection_passes += 1
+#             r_mid = (r_low + r_high) / 2
+#
+#             cached = self._cached_eval(r_mid)
+#             if cached is not None:
+#                 use_mid, acc_mid = cached
+#             else:
+#                 use_mid, acc_mid = self.train_fe_model(r_mid)
+#                 self.evaluated_points.append((r_mid, use_mid, acc_mid))
+#                 self.all_evaluated_points.append((r_mid, use_mid, acc_mid, self.rerun_idx))
+#
+#             if use_mid > usage:
+#                 r_low = r_mid
+#             else:
+#                 r_high = r_mid
+#
+#         test_acc, test_use, gate_details = self.evaluate_fe_model(r_high)
+#         test_acc *= 100
+#         test_use *= 100
+#
+#         self.routing_snapshots.append({
+#             "rerun": self.rerun_idx,
+#             "target_usage": usage,
+#             **gate_details
+#         })
+#
+#         self.search_diagnostics.append({
+#             "rerun": self.rerun_idx, "target_usage": usage, "bisection_passes": bisection_passes,
+#             "bracket_fallback_used": bracket_fallback_used,
+#             "final_r": r_high, "final_test_usage": test_use, "final_test_acc": test_acc
+#         })
+#
+#         logger.info(f"\nTook {bisection_passes} passes to find best r value")
+#         logger.info(f"For usage {usage}:")
+#         logger.info(f"\tBest r: {r_high}")
+#         logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]:.4f}")
+#         logger.info(f"\tTest usage: {test_use:.2f} / Test acc: {test_acc:.2f}")
+#
+#         return r_high, test_acc, test_use
+#
+#     def run_reruns(self, usage_values, n_reruns):
+#         """Runs the full usage_values sweep n_reruns times, resetting the live
+#         bracket-search history (evaluated_points) at the start of each rerun so
+#         every rerun is a genuinely independent search — not warm-started off a
+#         previous rerun's bisection results, which would understate the true
+#         run-to-run variance. epoch_log/search_diagnostics/all_evaluated_points
+#         keep accumulating across every rerun (each row tagged via self.rerun_idx)
+#         for full traceability.
+#
+#         Returns (usage_runs, acc_runs), each shape (n_reruns, len(usage_values)),
+#         already on the 0-100 scale find_r_for_target reports.
+#         """
+#         usage_runs = np.zeros((n_reruns, len(usage_values)))
+#         acc_runs = np.zeros((n_reruns, len(usage_values)))
+#
+#         for rerun_idx in range(n_reruns):
+#             self.rerun_idx = rerun_idx
+#             self.evaluated_points = []
+#
+#             # Fresh random init + seed per rerun (so reruns still capture
+#             # genuine run-to-run variance), but every r_val's search within
+#             # this rerun trains from this same snapshot/seed (see __init__).
+#             self.rerun_seed = self.seed + rerun_idx
+#             set_all_seeds(self.rerun_seed)
+#             reset_all_weights(self.fe_model)
+#             self.fe_init_state = {k: v.clone() for k, v in self.fe_model.state_dict().items()}
+#
+#             for target_idx, target_usage in enumerate(usage_values):
+#                 _, test_acc, test_use = self.find_r_for_target(usage=target_usage)
+#                 usage_runs[rerun_idx, target_idx] = test_use
+#                 acc_runs[rerun_idx, target_idx] = test_acc
+#
+#         return usage_runs, acc_runs
+#
+#     def _gate_scores(self, dataloader):
+#         """One pass over a gate-fidelity dataloader, returning per-sample
+#         arrays: self.fe_model's own softmax confidence that HF is needed
+#         (p_hf), and each fidelity's own correctness (lf_correct/hf_correct).
+#         Doesn't apply a hard routing decision itself - run_fe_sr_grid sweeps
+#         that post-hoc over a threshold grid, which is what makes a fine
+#         threshold grid cheap: one forward pass per r checkpoint here, not one
+#         per (r, threshold) cell.
+#         """
+#         self.fe_model.eval()
+#         p_hf_list, lf_correct_list, hf_correct_list, idx_list = [], [], [], []
+#
+#         with torch.no_grad():
+#             for lf_embeddings, lf_loss, hf_loss, lf_correct, hf_correct, idx in dataloader:
+#                 lf_embeddings = lf_embeddings.to(self.device, torch.float)
+#
+#                 outputs = self.fe_model(lf_embeddings)["output"]
+#                 p_hf = torch.softmax(outputs, dim=1)[:, 1]
+#
+#                 p_hf_list.append(p_hf.cpu().numpy())
+#                 lf_correct_list.append(lf_correct.cpu().numpy())
+#                 hf_correct_list.append(hf_correct.cpu().numpy())
+#                 idx_list.append(idx.cpu().numpy())
+#
+#         return (
+#             np.concatenate(p_hf_list, axis=0),
+#             np.concatenate(lf_correct_list, axis=0),
+#             np.concatenate(hf_correct_list, axis=0),
+#             np.concatenate(idx_list, axis=0),
+#         )
+#
+#     def run_fe_sr_grid(self, usage_values, threshold_grid=None):
+#         """"FE model + softmax response": builds a (r, threshold) usage/accuracy
+#         grid by reusing the already-trained fe_model-{r}.pt checkpoints this
+#         search saved along the way (one per r value it explored - see
+#         train_fe_model), the same way SelectiveNet/SAT sweep a (c, threshold)
+#         grid in main.py. "Just the FE model" (fe_results.npz, from run_reruns)
+#         uses each r's gate with its own hard argmax routing decision; this
+#         reuses those SAME checkpoints but replaces the hard argmax with the
+#         gate's own continuous confidence that HF is needed (self._gate_scores'
+#         p_hf), swept over a threshold grid. Sweeping is cheap - one forward
+#         pass per r (not per (r, threshold) cell), since usage/accuracy at every
+#         threshold can be computed in one vectorized pass over already-collected
+#         per-sample scores - so this can afford a much finer grid than r alone.
+#
+#         For each target usage, picks the (r, threshold) cell whose val usage is
+#         <= target with the *highest val accuracy* (not necessarily the highest
+#         usage under budget, unlike the SelectiveNet/SAT selection in main.py -
+#         usage(r) has repeatedly turned out non-monotonic enough here that
+#         "more usage" isn't a safe proxy for "more accurate").
+#
+#         Returns a dict with the selected per-target-usage results plus the
+#         full grids, for main.py to save to fe_sr_results.npz/fe_sr_grid.npz.
+#         """
+#         if threshold_grid is None:
+#             threshold_grid = np.linspace(0.0, 1.0, 21)
+#         threshold_grid = np.asarray(threshold_grid)
+#
+#         r_files = sorted(
+#             f for f in os.listdir(self.model_folder)
+#             if f.startswith("fe_model-") and f.endswith(".pt")
+#         )
+#         r_values = [float(f[len("fe_model-"):-len(".pt")]) for f in r_files]
+#
+#         n_r, n_t = len(r_values), len(threshold_grid)
+#         val_usage_grid = np.zeros((n_r, n_t))
+#         val_acc_grid = np.zeros((n_r, n_t))
+#         test_usage_grid = np.zeros((n_r, n_t))
+#         test_acc_grid = np.zeros((n_r, n_t))
+#
+#         for r_idx, fname in enumerate(r_files):
+#             self.fe_model.load_state_dict(
+#                 torch.load(os.path.join(self.model_folder, fname), weights_only=True)
+#             )
+#             self.fe_model = self.fe_model.to(self.device)
+#
+#             val_p_hf, val_lf_correct, val_hf_correct, val_idx = self._gate_scores(self.val_dl)
+#             test_p_hf, test_lf_correct, test_hf_correct, test_idx = self._gate_scores(self.test_dl)
+#
+#             # decision[i, j] = route sample i to HF at threshold_grid[j]
+#             val_decision = val_p_hf[:, None] >= threshold_grid[None, :]
+#             test_decision = test_p_hf[:, None] >= threshold_grid[None, :]
+#
+#             # Same per-pixel-vs-per-image-majority swap as evaluate_fe_model:
+#             # report accuracy on the true per-pixel fraction when available,
+#             # scoring the exact same threshold decisions either way.
+#             if self.val_pixel_acc is not None and self.test_pixel_acc is not None:
+#                 val_lf_acc = self.val_pixel_acc[0][val_idx]
+#                 val_hf_acc = self.val_pixel_acc[1][val_idx]
+#                 test_lf_acc = self.test_pixel_acc[0][test_idx]
+#                 test_hf_acc = self.test_pixel_acc[1][test_idx]
+#             else:
+#                 val_lf_acc, val_hf_acc = val_lf_correct, val_hf_correct
+#                 test_lf_acc, test_hf_acc = test_lf_correct, test_hf_correct
+#
+#             val_usage_grid[r_idx] = val_decision.mean(axis=0)
+#             val_acc_grid[r_idx] = np.where(
+#                 val_decision, val_hf_acc[:, None], val_lf_acc[:, None]
+#             ).mean(axis=0)
+#             test_usage_grid[r_idx] = test_decision.mean(axis=0)
+#             test_acc_grid[r_idx] = np.where(
+#                 test_decision, test_hf_acc[:, None], test_lf_acc[:, None]
+#             ).mean(axis=0)
+#
+#         fe_sr_usage_vals, fe_sr_acc_vals, chosen_r, chosen_threshold = [], [], [], []
+#         flat_val_usage = val_usage_grid.ravel()
+#         flat_val_acc = val_acc_grid.ravel()
+#
+#         for target_usage in usage_values:
+#             under_budget = np.where(flat_val_usage <= target_usage)[0]
+#
+#             if under_budget.size > 0:
+#                 best_flat_idx = under_budget[np.argmax(flat_val_acc[under_budget])]
+#             else:
+#                 logger.warning(
+#                     f"No (r, threshold) combo has val usage <= {target_usage}; "
+#                     f"falling back to the closest val usage overall"
+#                 )
+#                 best_flat_idx = np.argmin(np.abs(flat_val_usage - target_usage))
+#
+#             r_idx, t_idx = np.unravel_index(best_flat_idx, val_usage_grid.shape)
+#
+#             fe_sr_usage_vals.append(100 * test_usage_grid[r_idx, t_idx])
+#             fe_sr_acc_vals.append(100 * test_acc_grid[r_idx, t_idx])
+#             chosen_r.append(r_values[r_idx])
+#             chosen_threshold.append(threshold_grid[t_idx])
+#
+#         return {
+#             "usage": np.array(fe_sr_usage_vals),
+#             "acc": np.array(fe_sr_acc_vals),
+#             "target_usage": np.array(usage_values),
+#             "chosen_r": np.array(chosen_r),
+#             "chosen_threshold": np.array(chosen_threshold),
+#             "r_grid": np.array(r_values),
+#             "threshold_grid": threshold_grid,
+#             "val_usage_grid": val_usage_grid,
+#             "val_acc_grid": val_acc_grid,
+#             "test_usage_grid": test_usage_grid,
+#             "test_acc_grid": test_acc_grid,
+#         }
+
+
+# def fe_svm_one_run(fe_m odel, hf_model, lf_model, dataloader, hf_weight, mode="train"):
+#     device = next(hf_model.parameters()).device
+
+#     lf_body = create_feature_extractor(
+#         lf_model, {"7": "body"}
+#     ).to(device)
+
+#     num_samples = len(dataloader.dataset)
+#     batch_size = dataloader.batch_size
+
+#     lf_embeddings = np.zeros((num_samples, 32))
+#     lf_preds = np.zeros((num_samples, 2))
+#     hf_preds = np.zeros((num_samples, 2))
+#     labels = np.zeros(num_samples)
+
+#     for i, (hf_data, lf_data, target) in enumerate(dataloader):
+#         target = target.type(torch.LongTensor) 
+#         hf_data = hf_data.to(device, torch.float)
+#         lf_data = lf_data.to(device, torch.float)
+#         target = target.to(device)
+
+#         lf_embs_tmp = lf_body(lf_data)["body"].detach().cpu().numpy()
+#         lf_output_tmp = lf_model(lf_data).detach().cpu().numpy()
+#         hf_output_tmp = hf_model(hf_data).detach().cpu().numpy()
+
+#         offset = len(lf_embs_tmp)
+
+#         lf_embeddings[i*batch_size:(i*batch_size+offset)] = lf_embs_tmp
+#         lf_preds[i*batch_size:(i*batch_size+offset)] = lf_output_tmp
+#         hf_preds[i*batch_size:(i*batch_size+offset)] = hf_output_tmp
+#         labels[i*batch_size:(i*batch_size+offset)] = target.cpu().numpy()
+
+#     lf_correct = np.argmax(lf_preds, axis=1) == labels
+#     hf_correct = np.argmax(hf_preds, axis=1) == labels
+
+#     best_choices = np.logical_and(~lf_correct, hf_correct).astype(int)
+
+#     if mode=="train":
+#         weights = np.where(best_choices==1, hf_weight, 1)
+#         fe_model.fit(lf_embeddings, labels, sample_weights=weights)
+
+class LogSeededGreedySearch:
+    """Replaces AdaptiveGridSearch's per-target bisection with a single
+    shared point-collection phase per rerun, then derives all 10 usage
+    targets by interpolation along that one dense curve - no repeated
+    bisection search per target.
+
+    Motivated by crop: AdaptiveGridSearch's bisection assumes usage(c_h) is
+    smooth enough that bisecting toward a target usage converges efficiently,
+    but crop's actual transition window was a narrow [0.002, 0.0073]-style
+    sliver - bisection either never found it (landing on the same "0% usage"
+    or "100% usage" cached point for many different targets, see the 3-point
+    plateau-and-cliff pattern in earlier Pareto plots) or needed many wasted
+    passes once a lucky bracket did straddle it, since min_bracket_width's
+    fallback-to-full-range behavior ([0.001, 1]) also starts from a point
+    (0.5005) nowhere near where such a narrow window usually sits.
+
+    New strategy:
+      1. Evaluate c_h=0 and c_h=1 directly (the true domain endpoints, not
+         inferred from whichever usage target happened to resolve near them).
+      2. Evaluate a fixed log-spaced seed grid (default 1e-5..1e-1, 5 points)
+         - guarantees a narrow transition window anywhere in (0, 1) is
+         bracketed by at least one adjacent seed pair immediately, without
+         any search needed to find roughly where it is.
+      3. Gap-based greedy refinement: repeatedly split the adjacent pair with
+         the largest observed |usage_i - usage_{i+1}| gap - geometric
+         midpoint for wide (>~4x) brackets (appropriate for an unknown-scale
+         narrow window), arithmetic for narrow brackets and for any bracket
+         touching c_h=0 (geometric mean undefined there). Runs for a fixed
+         point budget or until the largest remaining gap is already below
+         gap_tolerance - whichever comes first.
+      4. The 10 usage targets are then read off this one dense, shared
+         curve by linear interpolation in usage-space (no further gate
+         training needed to locate them) - only one confirmatory gate
+         training per target, at the interpolated c_h, to get real
+         test-set routing/accuracy numbers (interpolating *those* instead of
+         the underlying latent wouldn't give genuine per-sample routing
+         decisions for the downstream routing/oracle plots).
+
+    External interface deliberately mirrors AdaptiveGridSearch: same
+    constructor shape (minus min_bracket_width, which has no equivalent
+    here), same public attributes (all_evaluated_points, epoch_log,
+    search_diagnostics, routing_snapshots) and save_*/run_fe_sr_grid methods,
+    same run_reruns(usage_values, n_reruns) -> (usage_runs, acc_runs) return
+    shape - so main.py and every plotting/reporting script that consumes
+    those stay unchanged.
+    """
+
     def __init__(
             self, fe_model, device, train_dl, val_dl, test_dl, model_folder,
             gate_epochs=30, gate_lr=3e-4, gate_grad_clip_norm=None, seed=42,
-            min_bracket_width=0.0005, val_pixel_acc=None, test_pixel_acc=None):
-        # evaluated_points is reset at the start of every rerun (see run_reruns) so
-        # each rerun's bracket search is a genuinely independent sweep, not warm-
-        # started off a previous rerun's history. all_evaluated_points pools every
-        # rerun's points instead — more raw (r, usage, acc) samples only helps
-        # plot_gate_sensitivity.py's derivative/zoom analysis, so nothing is reset there.
-        self.evaluated_points = []
+            log_seed_points=(1e-5, 1e-4, 1e-3, 1e-2, 1e-1),
+            refinement_budget=15, gap_tolerance=0.02, wide_bracket_ratio=4.0,
+            val_pixel_acc=None, test_pixel_acc=None):
         self.all_evaluated_points = []
         self.epoch_log = []
         self.search_diagnostics = []
-        # One entry per find_r_for_target call: the final gate model's per-sample
-        # routing decision + both models' correctness, tagged by rerun/target_usage.
-        # Feeds the routing projection plot and the routing confusion-table plot.
         self.routing_snapshots = []
         self.rerun_idx = 0
         self.fe_model = fe_model
@@ -1314,241 +2179,29 @@ class AdaptiveGridSearch:
         self.gate_lr = gate_lr
         self.gate_grad_clip_norm = gate_grad_clip_norm
         self.seed = seed
-        self.min_bracket_width = min_bracket_width
-        # (lf_pixel_acc, hf_pixel_acc) arrays indexed by dataset idx, from
-        # load_pixel_acc_lookup - the true per-pixel accuracy fraction for
-        # segmentation (identical to *_correct for classification), used only
-        # for *reported* accuracy (evaluate_fe_model/run_fe_sr_grid), not for
-        # gate training/weighting/routing decisions, which stay on the
-        # existing boolean lf_correct/hf_correct throughout. None (the
-        # default) preserves the old per-image-majority-vote behavior.
+        self.log_seed_points = list(log_seed_points)
+        self.refinement_budget = refinement_budget
+        self.gap_tolerance = gap_tolerance
+        self.wide_bracket_ratio = wide_bracket_ratio
         self.val_pixel_acc = val_pixel_acc
         self.test_pixel_acc = test_pixel_acc
 
-        # Re-snapshotted at the start of every rerun (see run_reruns) - every
-        # r_val *within* a rerun trains from this same fixed init/seed, so
-        # differences in usage(r) reflect r itself rather than which random
-        # basin that r_val's own from-scratch init happened to land near
-        # (usage(r) was observed to swing from 0.99 to 0.26 to 1.0 across r
-        # values barely 0.01 apart on LLVIP/YOLO, which is what motivated
-        # this). Left un-fixed *across* reruns so run_reruns still measures
-        # genuine run-to-run variance instead of repeating the same search
-        # n_reruns times.
         self.fe_init_state = None
         self.rerun_seed = seed
 
-        # lf_latent is the same fixed test-set data on every call (it's precomputed
-        # LF-model output, independent of the gate model), so the projection basis
-        # is fit once and reused everywhere — every snapshot's 2D coordinates line
-        # up in the same space.
         self.proj_mean = None
-        self.proj_basis = None  # (latent_dim, 2), orthonormal columns
+        self.proj_basis = None
         self.boundary_xx = None
         self.boundary_yy = None
-        # Per-sample shape of the real (possibly spatial) latent, e.g. (1024,)
-        # for a flat mlp-gate latent or (1024, 20, 20) for a cnn_head-gate's
-        # spatial one — needed to reshape the flattened projection basis's
-        # reconstructions back into what self.fe_model actually expects.
         self.latent_sample_shape = None
 
-    def _project_latent(self, lf_latent, latent_sample_shape, hf_needed=None, grid_size=120, pad_frac=0.05):
-        """Fits (once) a 2D linear basis on lf_latent and a matching decision-
-        boundary meshgrid in that plane. Returns coords_2d.
+        # Per-rerun dense (r, usage, acc) curve from the point-collection
+        # phase - kept per rerun_idx so a caller can inspect/plot the raw
+        # curve (e.g. for the "points found" report) without re-deriving it.
+        self.rerun_points = {}
 
-        Unlike plain PCA (which picks the directions of highest variance in
-        lf_latent, with no reason to align with where the gate actually
-        disagrees with itself), this basis is supervised: axis 1 is the
-        logistic-regression direction that best separates hf_needed from
-        lf_fine, axis 2 is the top PCA direction of what's left after removing
-        axis 1 (so it's orthogonal to axis 1 and still soaks up leftover
-        structure). The basis stays linear and exactly invertible — same as
-        PCA — so _compute_decision_boundary's inverse-transform trick (running
-        the real fe_model over reconstructed latents) still holds.
-
-        lf_latent is always the already-pooled (N, C) summary
-        compute_gate_routing_details produces (mean over spatial dims for a
-        cnn_head gate's (B, C, H, W) YOLO/UNet feature map) - flattening every
-        spatial position instead (e.g. 409,600 dims for a 20x20x1024 YOLO
-        feature) would blow up memory catastrophically (a single (N, D)
-        float32 array several GB at N in the thousands) and put D far above
-        N, where the supervised logistic-regression fit degenerates
-        (near-perfect separation, unstable coefficients). latent_sample_shape
-        (the true per-sample (C,) or (C, H, W) shape, from
-        compute_gate_routing_details) is kept separately so
-        _compute_decision_boundary still knows how to broadcast reconstructed
-        grid points back into what self.fe_model actually expects - the real
-        routing decisions elsewhere always use the true, unpooled spatial latent.
-        """
-        self.latent_sample_shape = latent_sample_shape
-        lf_latent_flat = lf_latent
-
-        if self.proj_basis is None:
-            if hf_needed is None:
-                raise ValueError("hf_needed labels are required to fit the projection basis")
-
-            self.proj_mean = lf_latent_flat.mean(axis=0)
-            centered = lf_latent_flat - self.proj_mean
-
-            if len(np.unique(hf_needed)) < 2:
-                # hf_needed (hf_correct & ~lf_correct) is constant across this
-                # eval set - e.g. an easy task where lf_model is already ~100%
-                # accurate, so hf is essentially never "needed". No separating
-                # direction to fit, so fall back to plain (unsupervised) PCA for
-                # both axes instead of raising - this basis is only for the
-                # routing-projection plot, not the actual routing decision.
-                logger.warning(
-                    "_project_latent: hf_needed has a single class in this eval set; "
-                    "falling back to unsupervised PCA for the projection basis"
-                )
-                pca = PCA(n_components=2)
-                pca.fit(centered)
-                axis1, axis2 = pca.components_[0], pca.components_[1]
-                axis1 /= np.linalg.norm(axis1)
-                axis2 /= np.linalg.norm(axis2)
-            else:
-                # Fit the separating direction inside the top-variance PCA
-                # subspace of the latent, not the raw D dims directly. A ReLU
-                # latent typically has several near-constant/sparse dimensions
-                # (zero for almost every sample, nonzero for a handful) - dividing
-                # by std below blows those up into huge standardized values for
-                # exactly those few points, and an L2-penalized logistic fit can
-                # exploit that "for free" to separate a handful of leverage
-                # points instead of the real hf_needed/lf_fine boundary (observed
-                # directly on toy_2d: axis1 ended up spanning ~1000x less range
-                # than axis2, with the extreme axis1 outliers turning out to be
-                # ordinary lf_fine points, not the hard/ambiguous ones).
-                # Restricting the fit to the top principal directions first
-                # denoises those degenerate dims away before the supervised step
-                # ever sees them.
-                n_components = min(15, centered.shape[0] - 1, centered.shape[1])
-                pca_denoise = PCA(n_components=n_components)
-                reduced = pca_denoise.fit_transform(centered)  # (N, k)
-
-                reduced_std = reduced.std(axis=0)
-                reduced_std[reduced_std == 0] = 1
-                clf = LogisticRegression(max_iter=1000)
-                clf.fit(reduced / reduced_std, hf_needed.astype(int))
-
-                # Undo the subspace standardization, then re-expand from the
-                # k-dim PCA subspace back into full latent space.
-                axis1 = pca_denoise.components_.T @ (clf.coef_[0] / reduced_std)
-                axis1 /= np.linalg.norm(axis1)
-
-                # Remove axis1's component, then take the top PCA direction of the
-                # residual — orthogonal to axis1 by construction.
-                residual = centered - np.outer(centered @ axis1, axis1)
-                pca_resid = PCA(n_components=1)
-                pca_resid.fit(residual)
-                axis2 = pca_resid.components_[0]
-                axis2 /= np.linalg.norm(axis2)
-
-            self.proj_basis = np.stack([axis1, axis2], axis=1)
-            coords_2d = centered @ self.proj_basis
-
-            x_min, x_max = coords_2d[:, 0].min(), coords_2d[:, 0].max()
-            y_min, y_max = coords_2d[:, 1].min(), coords_2d[:, 1].max()
-            x_pad = (x_max - x_min) * pad_frac
-            y_pad = (y_max - y_min) * pad_frac
-            self.boundary_xx, self.boundary_yy = np.meshgrid(
-                np.linspace(x_min - x_pad, x_max + x_pad, grid_size),
-                np.linspace(y_min - y_pad, y_max + y_pad, grid_size)
-            )
-        else:
-            coords_2d = (lf_latent_flat - self.proj_mean) @ self.proj_basis
-
-        return coords_2d
-
-    def _compute_decision_boundary(self, batch_size=128):
-        """Runs the *actual* trained self.fe_model (not a proxy classifier) over
-        grid points in the cached projection plane, reconstructed back to the
-        real latent dimensionality via the basis's transpose (exact since the
-        basis columns are orthonormal). This is a genuine slice of the real
-        decision surface through that 2D plane — necessarily an approximation
-        (the plane can't capture the other latent_dim-2 axes), but it reflects
-        the model's own nonlinearity rather than a re-fit linear stand-in.
-
-        For a spatial gate (cnn_head), proj_mean/proj_basis operate on the
-        pooled (C,) summary _project_latent fits on, so each reconstructed grid
-        point is broadcast out to the model's true (C, H, W) input shape -
-        treating it as a spatially-uniform feature map, a further approximation
-        on top of the 2D-plane one above. Processed in batches so this never
-        materializes more than batch_size full spatial tensors at once (all
-        grid_size**2 of them at full (C, H, W) size at once is the same
-        multi-GB blowup _project_latent's pooling was written to avoid).
-        """
-        grid_2d = np.column_stack([self.boundary_xx.ravel(), self.boundary_yy.ravel()])
-        grid_latent = (self.proj_mean + grid_2d @ self.proj_basis.T).astype(np.float32)
-
-        is_spatial = len(self.latent_sample_shape) > 1
-        pooled_channels = self.latent_sample_shape[0] if is_spatial else None
-
-        self.fe_model.eval()
-        hf_probs = []
-        with torch.no_grad():
-            for start in range(0, grid_latent.shape[0], batch_size):
-                chunk = torch.from_numpy(grid_latent[start:start + batch_size]).to(self.device)
-
-                if is_spatial:
-                    spatial_dims = self.latent_sample_shape[1:]
-                    chunk = chunk.view(chunk.shape[0], pooled_channels, *([1] * len(spatial_dims)))
-                    chunk = chunk.expand(chunk.shape[0], *self.latent_sample_shape).contiguous()
-                else:
-                    chunk = chunk.reshape((-1,) + self.latent_sample_shape)
-
-                logits = self.fe_model(chunk)["output"]
-                hf_probs.append(torch.softmax(logits, dim=1)[:, 1].cpu().numpy())
-
-        hf_prob = np.concatenate(hf_probs, axis=0)
-        return hf_prob.reshape(self.boundary_xx.shape)
-
-    def find_bracket(self, usage, min_bracket_width=None):
-        """Only reuses an existing (r_a, r_b) pair from a prior target's search
-        if it's wide enough to represent genuine exploration room. Bisection
-        naturally converges its *own* final bracket down to ~tolerance width by
-        design (see find_r_for_target) - blindly reusing that razor-thin final
-        bracket as if it were informative for a completely different target
-        usage is where this used to go wrong: usage(r) has repeatedly turned
-        out to behave more like a step function than the smooth monotonic
-        curve bisection assumes (see the gate's per-epoch routing logs), so a
-        narrow leftover bracket can spuriously "contain" almost any target
-        usage - silently skipping bisection (0 passes) and just replaying
-        whichever checkpoint happened to converge for the earlier target,
-        instead of doing real work for this one. Requiring a minimum width
-        forces a fresh full-range search whenever the only "bracket" on hand is
-        really just a stale, over-converged sliver.
-
-        min_bracket_width defaults to self.min_bracket_width (constructor
-        param, itself defaulting to 0.0005 - see FESettings.min_bracket_width)
-        rather than hardcoding it here, so a caller can still tune it per-
-        dataset if needed. The default used to be 0.05, but crop's own
-        usage(r) collapse turned out to happen within an r-window of ~0.001,
-        an order of magnitude narrower, which made every bracket on hand
-        always look "too stale" and forced the full-range fallback on every
-        single search. 0.0005 was verified to reproduce byte-identical
-        usage/accuracy curves to the old 0.05 on toy_2d and LLVIP (LLVIP
-        being the dataset whose non-monotonic usage(r) swings motivated this
-        width check existing at all), so it's the new default rather than a
-        crop-only override.
-        """
-        if min_bracket_width is None:
-            min_bracket_width = self.min_bracket_width
-
-        # Sort points by r to ensure order
-        self.evaluated_points.sort(key=lambda x: x[0])
-
-        for i in range(len(self.evaluated_points) - 1):
-            r_a, use_a, *_ = self.evaluated_points[i]
-            r_b, use_b, *_ = self.evaluated_points[i+1]
-            # usage decreases as r increases (see the bisection direction in
-            # find_r_for_target), so for r_a < r_b we expect use_a >= use_b
-            if use_b <= usage <= use_a and (r_b - r_a) >= min_bracket_width:
-                return r_a, r_b, False
-
-        # If no sufficiently wide bracket, use full range as fallback — this is
-        # also the concrete signal that a target usage may end up unreachable
-        # within tolerance.
-        logger.warning(f"No sufficiently wide bracket found for usage={usage}; falling back to full range [0.001, 1]")
-        return 0.001, 1, True
+    # --- reused verbatim from AdaptiveGridSearch (train/eval a single r,
+    # projection-plane plotting support, persistence, FE+SR grid) ---
 
     def train_fe_model(self, r_val):
         criterion = MetaLossFunction(
@@ -1586,9 +2239,6 @@ class AdaptiveGridSearch:
                 fidelity="gate",
             )
 
-            # Diagnostic: min/max/mean-abs of the gate's raw routing logits. Climbing
-            # toward the tens/hundreds while val_usage/val_loss go flat is the
-            # signature of softmax saturation killing the gradient - see gate_logit_stats.
             logit_min, logit_max, logit_absmean = gate_logit_stats(self.fe_model, self.val_dl, self.device)
 
             epoch_time_sec = time.perf_counter() - epoch_start
@@ -1596,12 +2246,8 @@ class AdaptiveGridSearch:
             if not math.isfinite(val_loss):
                 logger.warning(f"Non-finite val_loss ({val_loss}) training gate model at r_val={r_val}, epoch={epoch}")
 
-            # Live progress - previously the only record of gate training was
-            # self.epoch_log, written to gate_epoch_metrics.csv once at the very
-            # end of the whole run, so a long search gave zero visibility into
-            # whether it was progressing or stuck.
             logger.info(
-                f"[gate rerun={self.rerun_idx} r={r_val:.6f}] epoch {epoch + 1}/{self.gate_epochs} "
+                f"[gate rerun={self.rerun_idx} r={r_val:.6g}] epoch {epoch + 1}/{self.gate_epochs} "
                 f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f} "
                 f"val_usage={val_use:.4f} logit_absmean={logit_absmean:.2f} ({epoch_time_sec:.2f}s/epoch)"
             )
@@ -1621,9 +2267,116 @@ class AdaptiveGridSearch:
 
         return best_val_use, best_val_acc
 
+    def evaluate_fe_model(self, r_val):
+        fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
+        self.fe_model.load_state_dict(torch.load(fe_model_file, weights_only=True))
+        self.fe_model = self.fe_model.to(self.device)
+
+        details = compute_gate_routing_details(self.fe_model, self.test_dl, self.device)
+
+        if self.test_pixel_acc is not None:
+            test_lf_pixel_acc, test_hf_pixel_acc = self.test_pixel_acc
+            lf_pa = test_lf_pixel_acc[details["idx"]]
+            hf_pa = test_hf_pixel_acc[details["idx"]]
+            details["lf_pixel_acc"] = lf_pa
+            details["hf_pixel_acc"] = hf_pa
+            test_acc = float(np.where(details["choice"] == 1, hf_pa, lf_pa).mean())
+        else:
+            correct = np.where(details["choice"] == 1, details["hf_correct"], details["lf_correct"])
+            test_acc = float(correct.mean())
+        test_use = float(details["choice"].mean())
+
+        hf_needed = details["hf_correct"] & ~details["lf_correct"]
+        self._project_latent(details["lf_latent"], details["latent_sample_shape"], hf_needed)
+        details["boundary_zz"] = self._compute_decision_boundary()
+
+        return test_acc, test_use, details
+
+    def _project_latent(self, lf_latent, latent_sample_shape, hf_needed=None, grid_size=120, pad_frac=0.05):
+        self.latent_sample_shape = latent_sample_shape
+        lf_latent_flat = lf_latent
+
+        if self.proj_basis is None:
+            if hf_needed is None:
+                raise ValueError("hf_needed labels are required to fit the projection basis")
+
+            self.proj_mean = lf_latent_flat.mean(axis=0)
+            centered = lf_latent_flat - self.proj_mean
+
+            if len(np.unique(hf_needed)) < 2:
+                logger.warning(
+                    "_project_latent: hf_needed has a single class in this eval set; "
+                    "falling back to unsupervised PCA for the projection basis"
+                )
+                pca = PCA(n_components=2)
+                pca.fit(centered)
+                axis1, axis2 = pca.components_[0], pca.components_[1]
+                axis1 /= np.linalg.norm(axis1)
+                axis2 /= np.linalg.norm(axis2)
+            else:
+                n_components = min(15, centered.shape[0] - 1, centered.shape[1])
+                pca_denoise = PCA(n_components=n_components)
+                reduced = pca_denoise.fit_transform(centered)
+
+                reduced_std = reduced.std(axis=0)
+                reduced_std[reduced_std == 0] = 1
+                clf = LogisticRegression(max_iter=1000)
+                clf.fit(reduced / reduced_std, hf_needed.astype(int))
+
+                axis1 = pca_denoise.components_.T @ (clf.coef_[0] / reduced_std)
+                axis1 /= np.linalg.norm(axis1)
+
+                residual = centered - np.outer(centered @ axis1, axis1)
+                pca_resid = PCA(n_components=1)
+                pca_resid.fit(residual)
+                axis2 = pca_resid.components_[0]
+                axis2 /= np.linalg.norm(axis2)
+
+            self.proj_basis = np.stack([axis1, axis2], axis=1)
+            coords_2d = centered @ self.proj_basis
+
+            x_min, x_max = coords_2d[:, 0].min(), coords_2d[:, 0].max()
+            y_min, y_max = coords_2d[:, 1].min(), coords_2d[:, 1].max()
+            x_pad = (x_max - x_min) * pad_frac
+            y_pad = (y_max - y_min) * pad_frac
+            self.boundary_xx, self.boundary_yy = np.meshgrid(
+                np.linspace(x_min - x_pad, x_max + x_pad, grid_size),
+                np.linspace(y_min - y_pad, y_max + y_pad, grid_size)
+            )
+        else:
+            coords_2d = (lf_latent_flat - self.proj_mean) @ self.proj_basis
+
+        return coords_2d
+
+    def _compute_decision_boundary(self, batch_size=128):
+        grid_2d = np.column_stack([self.boundary_xx.ravel(), self.boundary_yy.ravel()])
+        grid_latent = (self.proj_mean + grid_2d @ self.proj_basis.T).astype(np.float32)
+
+        is_spatial = len(self.latent_sample_shape) > 1
+        pooled_channels = self.latent_sample_shape[0] if is_spatial else None
+
+        self.fe_model.eval()
+        hf_probs = []
+        with torch.no_grad():
+            for start in range(0, grid_latent.shape[0], batch_size):
+                chunk = torch.from_numpy(grid_latent[start:start + batch_size]).to(self.device)
+
+                if is_spatial:
+                    spatial_dims = self.latent_sample_shape[1:]
+                    chunk = chunk.view(chunk.shape[0], pooled_channels, *([1] * len(spatial_dims)))
+                    chunk = chunk.expand(chunk.shape[0], *self.latent_sample_shape).contiguous()
+                else:
+                    chunk = chunk.reshape((-1,) + self.latent_sample_shape)
+
+                logits = self.fe_model(chunk)["output"]
+                hf_probs.append(torch.softmax(logits, dim=1)[:, 1].cpu().numpy())
+
+        hf_prob = np.concatenate(hf_probs, axis=0)
+        return hf_prob.reshape(self.boundary_xx.shape)
+
     def save_epoch_log(self, file_path):
         if not self.epoch_log:
-            logger.warning("AdaptiveGridSearch.epoch_log is empty; nothing to save")
+            logger.warning("LogSeededGreedySearch.epoch_log is empty; nothing to save")
             return
 
         fieldnames = list(self.epoch_log[0].keys())
@@ -1635,7 +2388,7 @@ class AdaptiveGridSearch:
 
     def save_search_diagnostics(self, file_path):
         if not self.search_diagnostics:
-            logger.warning("AdaptiveGridSearch.search_diagnostics is empty; nothing to save")
+            logger.warning("LogSeededGreedySearch.search_diagnostics is empty; nothing to save")
             return
 
         fieldnames = list(self.search_diagnostics[0].keys())
@@ -1647,7 +2400,7 @@ class AdaptiveGridSearch:
 
     def save_evaluated_points(self, file_path):
         if not self.all_evaluated_points:
-            logger.warning("AdaptiveGridSearch.all_evaluated_points is empty; nothing to save")
+            logger.warning("LogSeededGreedySearch.all_evaluated_points is empty; nothing to save")
             return
 
         points = np.array(self.all_evaluated_points, dtype=float)
@@ -1662,15 +2415,9 @@ class AdaptiveGridSearch:
 
     def save_routing_snapshots(self, file_path):
         if not self.routing_snapshots:
-            logger.warning("AdaptiveGridSearch.routing_snapshots is empty; nothing to save")
+            logger.warning("LogSeededGreedySearch.routing_snapshots is empty; nothing to save")
             return
 
-        # lf_latent/latent_2d/boundary_xx/boundary_yy are identical for every
-        # snapshot (same fixed test-set lf_latent - already pooled to (N, C) by
-        # compute_gate_routing_details regardless of gate type, same cached
-        # projection basis/grid), so they're saved once rather than duplicated
-        # per snapshot; only boundary_zz (the actual per-gate-model decision
-        # field) legitimately varies.
         lf_latent_flat = self.routing_snapshots[0]["lf_latent"]
         latent_2d = (lf_latent_flat - self.proj_mean) @ self.proj_basis
 
@@ -1688,11 +2435,6 @@ class AdaptiveGridSearch:
             boundary_zz=np.stack([s["boundary_zz"] for s in self.routing_snapshots], axis=0)
         )
 
-        # Only present when self.test_pixel_acc was supplied (see
-        # evaluate_fe_model) - the per-pixel accuracy fraction for
-        # segmentation, so main.py/plot_pareto_curves.py's oracle computation
-        # can be scored on the same metric as everything else instead of
-        # falling back to the per-image-majority "*_correct" boolean.
         if "lf_pixel_acc" in self.routing_snapshots[0]:
             save_kwargs["lf_pixel_acc"] = np.stack([s["lf_pixel_acc"] for s in self.routing_snapshots], axis=0)
             save_kwargs["hf_pixel_acc"] = np.stack([s["hf_pixel_acc"] for s in self.routing_snapshots], axis=0)
@@ -1700,144 +2442,7 @@ class AdaptiveGridSearch:
         np.savez(file_path, **save_kwargs)
         logger.info(f"Saved {len(self.routing_snapshots)} routing snapshots to {file_path}")
 
-    def evaluate_fe_model(self, r_val):
-        fe_model_file = os.path.join(self.model_folder, f"fe_model-{r_val}.pt")
-        self.fe_model.load_state_dict(torch.load(fe_model_file, weights_only=True))
-        self.fe_model = self.fe_model.to(self.device)
-
-        # Single forward pass over the test set gets us test_acc/test_use *and*
-        # everything the routing/projection plots need, in one shot — done here (right
-        # after loading this r_val's just-trained weights) rather than reloading
-        # the checkpoint later, since fe_model-{r_val}.pt gets overwritten by the
-        # next rerun that happens to land on the same r_val.
-        details = compute_gate_routing_details(self.fe_model, self.test_dl, self.device)
-
-        if self.test_pixel_acc is not None:
-            # Report per-pixel accuracy (matching main.py's own "Final Test
-            # Summary" metric for segmentation) rather than the per-image-
-            # majority "*_correct" boolean - same routing decision
-            # (details["choice"]), just scored on the metric that's actually
-            # comparable to the LF/HF numbers everything else is judged against.
-            test_lf_pixel_acc, test_hf_pixel_acc = self.test_pixel_acc
-            lf_pa = test_lf_pixel_acc[details["idx"]]
-            hf_pa = test_hf_pixel_acc[details["idx"]]
-            details["lf_pixel_acc"] = lf_pa
-            details["hf_pixel_acc"] = hf_pa
-            test_acc = float(np.where(details["choice"] == 1, hf_pa, lf_pa).mean())
-        else:
-            correct = np.where(details["choice"] == 1, details["hf_correct"], details["lf_correct"])
-            test_acc = float(correct.mean())
-        test_use = float(details["choice"].mean())
-
-        # Decision-boundary field for the routing plot: fits/caches the
-        # projection plane on first call (using this call's ground truth to
-        # pick a separating basis), then runs *this* r_val's actual fe_model
-        # (still loaded above) over the plane's grid, reconstructed back to
-        # latent space — so the contour reflects the real model, not a re-fit
-        # proxy.
-        hf_needed = details["hf_correct"] & ~details["lf_correct"]
-        self._project_latent(details["lf_latent"], details["latent_sample_shape"], hf_needed)
-        details["boundary_zz"] = self._compute_decision_boundary()
-
-        return test_acc, test_use, details
-
-    def _cached_eval(self, r_val, tol=1e-6):
-        """Looks up an r_val already trained earlier in this rerun (e.g. every
-        full-range fallback in find_bracket starts bisection from the same
-        deterministic first midpoint, 0.5005 - without this, every target that
-        falls back would silently retrain that same r_val from scratch)."""
-        for r, use, acc in self.evaluated_points:
-            if abs(r - r_val) <= tol:
-                return use, acc
-        return None
-
-    def find_r_for_target(self, usage, tolerance=1e-3):
-        r_low, r_high, bracket_fallback_used = self.find_bracket(usage)
-        bisection_passes = 0
-        while r_high - r_low > tolerance:
-            bisection_passes += 1
-            r_mid = (r_low + r_high) / 2
-
-            cached = self._cached_eval(r_mid)
-            if cached is not None:
-                use_mid, acc_mid = cached
-            else:
-                use_mid, acc_mid = self.train_fe_model(r_mid)
-                self.evaluated_points.append((r_mid, use_mid, acc_mid))
-                self.all_evaluated_points.append((r_mid, use_mid, acc_mid, self.rerun_idx))
-
-            if use_mid > usage:
-                r_low = r_mid
-            else:
-                r_high = r_mid
-
-        test_acc, test_use, gate_details = self.evaluate_fe_model(r_high)
-        test_acc *= 100
-        test_use *= 100
-
-        self.routing_snapshots.append({
-            "rerun": self.rerun_idx,
-            "target_usage": usage,
-            **gate_details
-        })
-
-        self.search_diagnostics.append({
-            "rerun": self.rerun_idx, "target_usage": usage, "bisection_passes": bisection_passes,
-            "bracket_fallback_used": bracket_fallback_used,
-            "final_r": r_high, "final_test_usage": test_use, "final_test_acc": test_acc
-        })
-
-        logger.info(f"\nTook {bisection_passes} passes to find best r value")
-        logger.info(f"For usage {usage}:")
-        logger.info(f"\tBest r: {r_high}")
-        logger.info(f"\tClosest val usage: {self.evaluated_points[-1][1]:.4f}")
-        logger.info(f"\tTest usage: {test_use:.2f} / Test acc: {test_acc:.2f}")
-
-        return r_high, test_acc, test_use
-
-    def run_reruns(self, usage_values, n_reruns):
-        """Runs the full usage_values sweep n_reruns times, resetting the live
-        bracket-search history (evaluated_points) at the start of each rerun so
-        every rerun is a genuinely independent search — not warm-started off a
-        previous rerun's bisection results, which would understate the true
-        run-to-run variance. epoch_log/search_diagnostics/all_evaluated_points
-        keep accumulating across every rerun (each row tagged via self.rerun_idx)
-        for full traceability.
-
-        Returns (usage_runs, acc_runs), each shape (n_reruns, len(usage_values)),
-        already on the 0-100 scale find_r_for_target reports.
-        """
-        usage_runs = np.zeros((n_reruns, len(usage_values)))
-        acc_runs = np.zeros((n_reruns, len(usage_values)))
-
-        for rerun_idx in range(n_reruns):
-            self.rerun_idx = rerun_idx
-            self.evaluated_points = []
-
-            # Fresh random init + seed per rerun (so reruns still capture
-            # genuine run-to-run variance), but every r_val's search within
-            # this rerun trains from this same snapshot/seed (see __init__).
-            self.rerun_seed = self.seed + rerun_idx
-            set_all_seeds(self.rerun_seed)
-            reset_all_weights(self.fe_model)
-            self.fe_init_state = {k: v.clone() for k, v in self.fe_model.state_dict().items()}
-
-            for target_idx, target_usage in enumerate(usage_values):
-                _, test_acc, test_use = self.find_r_for_target(usage=target_usage)
-                usage_runs[rerun_idx, target_idx] = test_use
-                acc_runs[rerun_idx, target_idx] = test_acc
-
-        return usage_runs, acc_runs
-
     def _gate_scores(self, dataloader):
-        """One pass over a gate-fidelity dataloader, returning per-sample
-        arrays: self.fe_model's own softmax confidence that HF is needed
-        (p_hf), and each fidelity's own correctness (lf_correct/hf_correct).
-        Doesn't apply a hard routing decision itself - run_fe_sr_grid sweeps
-        that post-hoc over a threshold grid, which is what makes a fine
-        threshold grid cheap: one forward pass per r checkpoint here, not one
-        per (r, threshold) cell.
-        """
         self.fe_model.eval()
         p_hf_list, lf_correct_list, hf_correct_list, idx_list = [], [], [], []
 
@@ -1861,28 +2466,6 @@ class AdaptiveGridSearch:
         )
 
     def run_fe_sr_grid(self, usage_values, threshold_grid=None):
-        """"FE model + softmax response": builds a (r, threshold) usage/accuracy
-        grid by reusing the already-trained fe_model-{r}.pt checkpoints this
-        search saved along the way (one per r value it explored - see
-        train_fe_model), the same way SelectiveNet/SAT sweep a (c, threshold)
-        grid in main.py. "Just the FE model" (fe_results.npz, from run_reruns)
-        uses each r's gate with its own hard argmax routing decision; this
-        reuses those SAME checkpoints but replaces the hard argmax with the
-        gate's own continuous confidence that HF is needed (self._gate_scores'
-        p_hf), swept over a threshold grid. Sweeping is cheap - one forward
-        pass per r (not per (r, threshold) cell), since usage/accuracy at every
-        threshold can be computed in one vectorized pass over already-collected
-        per-sample scores - so this can afford a much finer grid than r alone.
-
-        For each target usage, picks the (r, threshold) cell whose val usage is
-        <= target with the *highest val accuracy* (not necessarily the highest
-        usage under budget, unlike the SelectiveNet/SAT selection in main.py -
-        usage(r) has repeatedly turned out non-monotonic enough here that
-        "more usage" isn't a safe proxy for "more accurate").
-
-        Returns a dict with the selected per-target-usage results plus the
-        full grids, for main.py to save to fe_sr_results.npz/fe_sr_grid.npz.
-        """
         if threshold_grid is None:
             threshold_grid = np.linspace(0.0, 1.0, 21)
         threshold_grid = np.asarray(threshold_grid)
@@ -1908,13 +2491,9 @@ class AdaptiveGridSearch:
             val_p_hf, val_lf_correct, val_hf_correct, val_idx = self._gate_scores(self.val_dl)
             test_p_hf, test_lf_correct, test_hf_correct, test_idx = self._gate_scores(self.test_dl)
 
-            # decision[i, j] = route sample i to HF at threshold_grid[j]
             val_decision = val_p_hf[:, None] >= threshold_grid[None, :]
             test_decision = test_p_hf[:, None] >= threshold_grid[None, :]
 
-            # Same per-pixel-vs-per-image-majority swap as evaluate_fe_model:
-            # report accuracy on the true per-pixel fraction when available,
-            # scoring the exact same threshold decisions either way.
             if self.val_pixel_acc is not None and self.test_pixel_acc is not None:
                 val_lf_acc = self.val_pixel_acc[0][val_idx]
                 val_hf_acc = self.val_pixel_acc[1][val_idx]
@@ -1970,46 +2549,165 @@ class AdaptiveGridSearch:
             "test_acc_grid": test_acc_grid,
         }
 
-# def fe_svm_one_run(fe_m odel, hf_model, lf_model, dataloader, hf_weight, mode="train"):
-#     device = next(hf_model.parameters()).device
+    # --- new orchestration: point collection + gap-based refinement + interpolation ---
 
-#     lf_body = create_feature_extractor(
-#         lf_model, {"7": "body"}
-#     ).to(device)
+    def _cached_eval(self, points, r_val, tol=1e-9):
+        for r, use, acc in points:
+            if abs(r - r_val) <= tol:
+                return use, acc
+        return None
 
-#     num_samples = len(dataloader.dataset)
-#     batch_size = dataloader.batch_size
+    def _collect_points(self):
+        """Point-collection phase for the current rerun: c_h=0, c_h=1, the
+        log-spaced seed grid, then gap-based greedy refinement. Returns the
+        sorted list of (r, usage, acc) tuples (usage/acc as fractions, 0-1 -
+        this class's internal scale throughout; *100 only happens where the
+        old class's find_r_for_target used to do it, at the final per-target
+        report step, for exact external-interface parity)."""
+        points = []
 
-#     lf_embeddings = np.zeros((num_samples, 32))
-#     lf_preds = np.zeros((num_samples, 2))
-#     hf_preds = np.zeros((num_samples, 2))
-#     labels = np.zeros(num_samples)
+        seeds = [0.0, 1.0] + list(self.log_seed_points)
+        for r in seeds:
+            cached = self._cached_eval(points, r)
+            if cached is not None:
+                continue
+            use, acc = self.train_fe_model(r)
+            points.append((r, use, acc))
+            self.all_evaluated_points.append((r, use, acc, self.rerun_idx))
+        points.sort(key=lambda p: p[0])
 
-#     for i, (hf_data, lf_data, target) in enumerate(dataloader):
-#         target = target.type(torch.LongTensor) 
-#         hf_data = hf_data.to(device, torch.float)
-#         lf_data = lf_data.to(device, torch.float)
-#         target = target.to(device)
+        budget_used = 0
+        while budget_used < self.refinement_budget:
+            if len(points) < 2:
+                break
+            gaps = [(abs(points[i][1] - points[i + 1][1]), i) for i in range(len(points) - 1)]
+            gaps.sort(key=lambda g: -g[0])
 
-#         lf_embs_tmp = lf_body(lf_data)["body"].detach().cpu().numpy()
-#         lf_output_tmp = lf_model(lf_data).detach().cpu().numpy()
-#         hf_output_tmp = hf_model(hf_data).detach().cpu().numpy()
+            if gaps[0][0] < self.gap_tolerance:
+                break
 
-#         offset = len(lf_embs_tmp)
+            chosen_r = None
+            for gap_size, i in gaps:
+                if gap_size < self.gap_tolerance:
+                    break
+                r_lo, r_hi = points[i][0], points[i + 1][0]
+                if r_lo <= 0 or (r_hi / max(r_lo, 1e-12)) <= self.wide_bracket_ratio:
+                    r_mid = (r_lo + r_hi) / 2
+                else:
+                    r_mid = (r_lo * r_hi) ** 0.5
+                if self._cached_eval(points, r_mid) is None:
+                    chosen_r = r_mid
+                    break
 
-#         lf_embeddings[i*batch_size:(i*batch_size+offset)] = lf_embs_tmp
-#         lf_preds[i*batch_size:(i*batch_size+offset)] = lf_output_tmp
-#         hf_preds[i*batch_size:(i*batch_size+offset)] = hf_output_tmp
-#         labels[i*batch_size:(i*batch_size+offset)] = target.cpu().numpy()
+            if chosen_r is None:
+                # every remaining gap's midpoint has already been evaluated -
+                # genuinely exhausted, not just budget-limited.
+                break
 
-#     lf_correct = np.argmax(lf_preds, axis=1) == labels
-#     hf_correct = np.argmax(hf_preds, axis=1) == labels
+            use, acc = self.train_fe_model(chosen_r)
+            points.append((chosen_r, use, acc))
+            points.sort(key=lambda p: p[0])
+            self.all_evaluated_points.append((chosen_r, use, acc, self.rerun_idx))
+            budget_used += 1
 
-#     best_choices = np.logical_and(~lf_correct, hf_correct).astype(int)
+        return points
 
-#     if mode=="train":
-#         weights = np.where(best_choices==1, hf_weight, 1)
-#         fe_model.fit(lf_embeddings, labels, sample_weights=weights)
+    @staticmethod
+    def _interpolate_target_r(points, target_usage):
+        """points: sorted-by-r list of (r, usage, acc), usage expected to
+        trend downward as r increases (not strictly monotonic - gate
+        training noise). Scans for the last point at/above target_usage and
+        the first point after it below target_usage, and linearly
+        interpolates r in usage-space between them. Clamps to the nearest
+        endpoint's r if target_usage is outside the observed usage range
+        entirely (e.g. above the dataset's own usage ceiling - the same
+        situation that made several targets share one r under the old
+        bisection search)."""
+        rs = [p[0] for p in points]
+        uses = [p[1] for p in points]
+
+        if target_usage >= uses[0]:
+            return rs[0]
+        if target_usage <= uses[-1]:
+            return rs[-1]
+
+        for i in range(len(points) - 1):
+            u_hi, u_lo = uses[i], uses[i + 1]
+            if u_hi >= target_usage >= u_lo:
+                if u_hi == u_lo:
+                    return rs[i]
+                frac = (u_hi - target_usage) / (u_hi - u_lo)
+                return rs[i] + frac * (rs[i + 1] - rs[i])
+
+        # Non-monotonic curve with no clean crossing found (rare, noisy gate
+        # training) - fall back to whichever observed point's usage is
+        # closest to the target.
+        closest_idx = min(range(len(points)), key=lambda i: abs(uses[i] - target_usage))
+        return rs[closest_idx]
+
+    def find_r_for_target(self, usage, points):
+        """Looks up (interpolating, not searching) the c_h for one usage
+        target from an already-collected points curve, then trains one
+        confirmatory gate there (reusing the cache if that exact r was
+        already evaluated) to get real test-set routing/accuracy - mirrors
+        AdaptiveGridSearch.find_r_for_target's return shape and
+        routing_snapshots/search_diagnostics side effects exactly, so
+        downstream code needs no changes."""
+        r_target = self._interpolate_target_r(points, usage)
+
+        cached = self._cached_eval(points, r_target)
+        if cached is None:
+            self.train_fe_model(r_target)
+
+        test_acc, test_use, gate_details = self.evaluate_fe_model(r_target)
+        test_acc *= 100
+        test_use *= 100
+
+        self.routing_snapshots.append({
+            "rerun": self.rerun_idx,
+            "target_usage": usage,
+            **gate_details
+        })
+
+        self.search_diagnostics.append({
+            "rerun": self.rerun_idx, "target_usage": usage, "bisection_passes": len(points),
+            "bracket_fallback_used": False,
+            "final_r": r_target, "final_test_usage": test_use, "final_test_acc": test_acc
+        })
+
+        logger.info(f"\nInterpolated r (no bisection) for usage {usage}:")
+        logger.info(f"\tr: {r_target}")
+        logger.info(f"\tTest usage: {test_use:.2f} / Test acc: {test_acc:.2f}")
+
+        return r_target, test_acc, test_use
+
+    def run_reruns(self, usage_values, n_reruns):
+        """Same external shape as AdaptiveGridSearch.run_reruns: runs the
+        full usage_values sweep n_reruns times, returns (usage_runs,
+        acc_runs) each (n_reruns, len(usage_values)) on the 0-100 scale.
+        Internally: one point-collection phase per rerun (shared across all
+        usage_values, not repeated per target - the actual point of this
+        rewrite), then one interpolation + confirmatory training per target."""
+        usage_runs = np.zeros((n_reruns, len(usage_values)))
+        acc_runs = np.zeros((n_reruns, len(usage_values)))
+
+        for rerun_idx in range(n_reruns):
+            self.rerun_idx = rerun_idx
+            self.rerun_seed = self.seed + rerun_idx
+            set_all_seeds(self.rerun_seed)
+            reset_all_weights(self.fe_model)
+            self.fe_init_state = {k: v.clone() for k, v in self.fe_model.state_dict().items()}
+
+            points = self._collect_points()
+            self.rerun_points[rerun_idx] = points
+
+            for target_idx, target_usage in enumerate(usage_values):
+                _, test_acc, test_use = self.find_r_for_target(target_usage, points)
+                usage_runs[rerun_idx, target_idx] = test_use
+                acc_runs[rerun_idx, target_idx] = test_acc
+
+        return usage_runs, acc_runs
+
 
 class EarlyStopper:
     def __init__(self, patience=1, min_delta=0):
