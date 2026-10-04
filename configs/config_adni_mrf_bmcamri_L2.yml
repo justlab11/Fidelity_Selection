@@ -1,0 +1,35 @@
+dataset:
+  name: adni_mrf_bmcamri
+  folder: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/dcf-adni/results/mri_classification_L2
+
+latent_size: 16
+random_seed: 42
+run_comparisons: False
+train_body: True
+
+
+classifier_training:
+  # Each "input" here is a single pre-computed dcf-adni OOF probability
+  # score (see ADNIOOFDataset's docstring in datasets.py) - lf_model/hf_model
+  # are tiny single-feature MLPs that recalibrate/threshold that frozen
+  # score into this pipeline's required interface, not a refit of dcf-adni's
+  # own CatBoost. 1e-5 default lr (tuned for fine-tuning pretrained CNNs)
+  # would barely move a from-scratch MLP this small.
+  epochs: 200
+  batch_size: 32
+  loss_fun: CE
+  hf_input_mode: hf_only # HF model sees only its own OOF score (oof_bmca_mri), not concatenated with LF's
+  lf_model: mlp
+  hf_model: mlp
+  trained_lf_model:
+  trained_hf_model:
+  lr: 1e-3
+
+fe_training:
+  epochs: 40
+  batch_size: 32
+  reruns: 1
+
+  # adni_mrf_bmcamri has no registered sample_identity mapping (would just
+  # warn+skip anyway, but explicit here for clarity)
+  run_diagnostic_suite: false

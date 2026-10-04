@@ -28,11 +28,11 @@ classifier_training:
 fe_training:
   epochs: 40
   batch_size: 32
-  reruns: 1
-
-  r_range:
-    start: 0.0
-    stop: 1.0
-    num_steps: 25
-    scale: linear
-    direction: reversed # normal: 0 -> 1, reversed 1 -> 0
+  # 5 reruns - validates the new reruns>1 wiring (usage_vs_ch_std.png,
+  # pareto.png's existing std error bars) end-to-end. Separate config file
+  # (not a reruns edit to config_toy.yml) so the quick single-rerun sanity
+  # config stays at its original reruns=1 default.
+  reruns: 5
+  # dataset: toy_2d has no sample_identity mapping (would just warn+skip
+  # anyway, but explicit here for clarity)
+  run_diagnostic_suite: false

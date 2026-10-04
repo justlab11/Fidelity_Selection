@@ -22,11 +22,16 @@ classifier_training:
 fe_training:
   epochs: 40
   batch_size: 128
-  reruns: 1
+  reruns: 5
+  # min_bracket_width (AdaptiveGridSearch-era) retired - this was the dataset
+  # that motivated dropping its default from 0.05 to 0.0005, since usage(r)
+  # collapses within an r-window of ~0.001 here, narrower than the old
+  # default. LogSeededGreedySearch (helpers.py) replaces bisection with
+  # log-seeded + gap-based greedy refinement instead, which resolved this
+  # same narrow window directly (see the crop smoke test report) - using
+  # FESettings' global log_seed_points/refinement_budget/gap_tolerance/
+  # wide_bracket_ratio defaults for now. refinement_budget may still need a
+  # crop-specific override once its full 5-rerun LogSeededGreedySearch sweep
+  # validates whether the default (23) resolves crop's transition as well as
+  # the smoke test's budget=15 did, or needs raising further.
 
-  r_range:
-    start: 0.0
-    stop: 1.0
-    num_steps: 100
-    scale: linear
-    direction: reversed # normal: 0 -> 1, reversed 1 -> 0

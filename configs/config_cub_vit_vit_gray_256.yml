@@ -1,0 +1,28 @@
+dataset:
+  name: bird_grayscale
+  folder: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/data/CUB_200_2011/CUB_200_2011
+
+latent_size: 256
+random_seed: 42
+run_comparisons: False
+train_body: True
+
+
+classifier_training:
+  epochs: 200
+  batch_size: 64
+  loss_fun: CE
+  lf_model: vit
+  hf_model: vit
+  # hf_only, not the concat default - see config_cub_resnet_vit_color_256.yml's
+  # comment: CustomViT hardcodes a 3-channel pretrained backbone and crashes
+  # on concat's 6-channel stacked input.
+  hf_input_mode: hf_only
+  trained_lf_model:
+  trained_hf_model:
+
+fe_training:
+  epochs: 200
+  batch_size: 128
+  reruns: 1
+

@@ -1,0 +1,51 @@
+dataset:
+  name: bird_grayscale
+  folder: C:/Users/Justin/Documents/Github_Work/MetaLearner_V1_main/data/CUB_200_2011/CUB_200_2011
+
+latent_size: 256
+random_seed: 42
+run_comparisons: False
+train_body: True
+
+
+classifier_training:
+  epochs: 200
+  batch_size: 64
+  loss_fun: CE
+  hf_input_mode: concat
+  lf_model: resnet
+  hf_model: resnet
+  trained_lf_model: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/models/cub_resnet_resnet_gray_color_lf_model.pt
+  trained_hf_model: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/models/cub_resnet_resnet_gray_color_hf_model.pt
+  # 1e-4 (not the usual 1e-5 fine-tuning rate): classifier_training.lr is
+  # shared by LF/HF fine-tuning AND SelectiveNet/SAT's from-scratch heads -
+  # 1e-5 is right for the former but badly undertrains the latter's fresh
+  # output/selection/abstain heads within a realistic epoch budget (observed:
+  # SelectiveNet's own usage=0 accuracy stuck at 6.6% after 30 real epochs).
+  # Only matters for --comparisons_only runs specifically: LF/HF are always
+  # loaded from the checkpoint below and never retrained there, so this bump
+  # never touches them. If this config is ever used for a normal (non-
+  # comparisons-only) run that trains LF/HF fresh, drop this back to 1e-5
+  # first - 1e-4 on top of a full LF/HF retrain risks disturbing the
+  # pretrained backbone, same concern the old 1e-5 comment here was about.
+  lr: 1e-4
+
+fe_training:
+  epochs: 40
+  batch_size: 128
+  reruns: 5
+  # Validated on this dataset via tmp_experiments/epoch40_highlr_sweep (a
+  # 180-run grid at a fixed 40-epoch budget): gate_lr=5e-4 + capping the
+  # disagreement-oversampling weight at 5.0 beat the old 5e-5/uncapped
+  # combo on best-achieved val_loss. Only set here and in
+  # config_cub_resnet_vit_color_256.yml - every other dataset keeps the old
+  # defaults (see FESettings' docstring on these two fields).
+  gate_lr: 5e-4
+  disagreement_weight_cap: 5.0
+
+selectivenet_training:
+  epochs: 30
+
+sat_training:
+  epochs: 100
+

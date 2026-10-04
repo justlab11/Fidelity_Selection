@@ -1,0 +1,31 @@
+dataset:
+  name: bird_grayscale
+  folder: C:/Users/Justin/Documents/ML_Work/Fidelity_Selection/data/CUB_200_2011/CUB_200_2011
+
+latent_size: 256
+random_seed: 42
+run_comparisons: False
+train_body: True
+
+
+classifier_training:
+  epochs: 200
+  batch_size: 64
+  loss_fun: CE
+  lf_model: resnet
+  hf_model: resnet
+  # Reuse the already-retrained (augmentation-fixed) checkpoints instead of
+  # retraining LF/HF from scratch - only the gate search is being redone here,
+  # with more gate_epochs (see fe_training.epochs below) after confirming via
+  # cub_gate_ceiling_diagnostic.py that the ~65% usage ceiling was an
+  # underdosed gate-training budget, not a collapse the global disagreement
+  # reweighting mitigation (already active - see main.py's imbalanced_gate
+  # path) couldn't escape.
+  trained_lf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\src\results\bird_grayscale-resnet-resnet-42-256\models\lf_model.pt
+  trained_hf_model: C:\Users\Justin\Documents\ML_Work\Fidelity_Selection\src\results\bird_grayscale-resnet-resnet-42-256\models\hf_model.pt
+
+fe_training:
+  epochs: 200
+  batch_size: 128
+  reruns: 1
+
