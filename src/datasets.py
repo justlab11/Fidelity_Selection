@@ -1003,4 +1003,81 @@ class FE_Dataset(Dataset):
         idx = data['idx']
 
         return lf_latent, lf_loss, hf_loss, lf_correct, hf_correct, idx
-    
+
+class ADNIOOFDataset(Dataset):
+    """Wraps a dcf-adni `oof_predictions.csv` (one row per primary-pair
+    subject; columns include 'group' - the matched-pair id - 'y_true', and
+    one `oof_<feature_set>` column per feature set dcf-adni's own nested-CV
+    harness already fit and scored out-of-fold) as an LF/HF pair for this
+    pipeline.
+
+    LF/HF "inputs" are each just a single pre-computed probability score
+    (dcf-adni's frozen CatBoost OOF output for that feature set), packed into
+    a (1,) tensor - there is no raw per-sample feature vector here, only the
+    two scalar scores a dataset config names via lf_col/hf_col. This means
+    main.py's classifier-training phase trains a tiny single-feature MLP
+    that recalibrates/thresholds dcf-adni's own frozen score into this
+    pipeline's required (latent, 2-class logits) interface - it does NOT
+    refit dcf-adni's CatBoost itself, which never changes.
+
+    The train/val/test split here is new, introduced by this wrapper, and is
+    NOT the split dcf-adni's own nested CV used (that rotates every primary
+    pair through the test fold exactly once via grouped K-fold, pooling
+    every fold's OOF score into one file - there's no separate held-out set
+    left over to reuse as "test" directly). Pairs (rows sharing the same
+    'group') are kept together in one split so a matched pair's two subjects
+    never straddle train/test/val - splitting is done over unique group ids,
+    not rows, before rows are assigned.
+    """
+
+    def __init__(
+        self,
+        csv_path: str,
+        lf_col: str,
+        hf_col: str,
+        split: str,
+        seed: int = 42,
+        train_frac: float = 0.7,
+        val_frac: float = 0.15,
+    ):
+        assert split in ["train", "test", "val"], "split must be 'train', 'test', or 'val'"
+
+        df = pd.read_csv(csv_path)
+
+        groups = df["group"].unique()
+        rng = np.random.RandomState(seed)
+        rng.shuffle(groups)
+
+        n = len(groups)
+        n_train = int(n * train_frac)
+        n_val = int(n * val_frac)
+
+        split_groups = {
+            "train": groups[:n_train],
+            "val": groups[n_train:n_train + n_val],
+            "test": groups[n_train + n_val:],
+        }[split]
+
+        self.data = df[df["group"].isin(split_groups)].reset_index(drop=True)
+        self.lf_col = lf_col
+        self.hf_col = hf_col
+
+    def get_num_classes(self):
+        return 2
+
+    def get_lf_input_size(self):
+        return 1
+
+    def get_hf_input_size(self):
+        return 1
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        lf = torch.tensor([row[self.lf_col]], dtype=torch.float32)
+        hf = torch.tensor([row[self.hf_col]], dtype=torch.float32)
+        label = int(row["y_true"])
+
+        return lf, hf, label

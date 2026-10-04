@@ -199,7 +199,8 @@ def fit_isotonic_usage(r: np.ndarray, usage: np.ndarray):
     return iso
 
 
-def plot_isotonic_smoothing(r: np.ndarray, usage: np.ndarray, save_path: str, benefit: np.ndarray = None) -> None:
+def plot_isotonic_smoothing(r: np.ndarray, usage: np.ndarray, save_path: str, benefit: np.ndarray = None,
+                             anchors: list = None) -> None:
     """Raw (c_h, usage) points from every gate retrained during the sweep —
     scattered to show just how noisy per-c_h estimates really are — overlaid
     with the isotonic (non-increasing) fit: the denoised estimate of the true
@@ -210,9 +211,40 @@ def plot_isotonic_smoothing(r: np.ndarray, usage: np.ndarray, save_path: str, be
     gate's own noisy estimates, it's still an approximation of the true curve,
     whereas the oracle line is that true curve, computed directly from the
     frozen models' losses with no training involved.
+
+    anchors, if given, is a list of (r_val, usage_values) fixed c_h anchor
+    points (e.g. c_h=0/c_h=1, trained directly rather than found via
+    bisection) - usage_values is that anchor's raw per-rerun usage fractions
+    (0-1), not a mean/std. An in-range anchor's raw samples are merged
+    directly into the same scatter and the same isotonic-fit input as the
+    regular bisection-trial points - same marker/color, and the fit line
+    itself extends to reach it - rather than being drawn as a separate
+    overlay series. "In range" means r_val falls within the raw data's own
+    extent plus matplotlib's default 5% autoscale margin (replicated here
+    explicitly rather than read back from the axes, since the whole point is
+    deciding this *before* anything is drawn); the axis is then pinned to
+    exactly that range so an included anchor can still nudge the fit line
+    without ever extending the plot beyond what the raw sweep data alone
+    would already show.
     """
-    iso = fit_isotonic_usage(r, usage)
-    r_line = np.linspace(r.min(), r.max(), 200)
+    data_min, data_max = r.min(), r.max()
+    margin = 0.05 * (data_max - data_min)
+    display_min, display_max = data_min - margin, data_max + margin
+
+    r_plot, usage_plot = r, usage
+    included_anchor_rs = []
+    if anchors:
+        for r_val, usage_values in anchors:
+            if display_min <= r_val <= display_max:
+                usage_values = np.asarray(usage_values, dtype=float)
+                r_plot = np.concatenate([r_plot, np.full(len(usage_values), r_val)])
+                usage_plot = np.concatenate([usage_plot, usage_values])
+                included_anchor_rs.append(r_val)
+
+    iso = fit_isotonic_usage(r_plot, usage_plot)
+    line_min = min([data_min] + included_anchor_rs)
+    line_max = max([data_max] + included_anchor_rs)
+    r_line = np.linspace(line_min, line_max, 200)
     usage_line = iso.predict(r_line)
 
     fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
@@ -220,7 +252,7 @@ def plot_isotonic_smoothing(r: np.ndarray, usage: np.ndarray, save_path: str, be
     ax.set_facecolor("#fcfcfb")
     _style_axes(ax)
 
-    ax.scatter(r, usage * 100, s=20, color=RAW_POINT_COLOR, alpha=0.55, zorder=2,
+    ax.scatter(r_plot, usage_plot * 100, s=20, color=RAW_POINT_COLOR, alpha=0.55, zorder=2,
                label="Raw per-run samples (training noise)")
     ax.plot(r_line, usage_line * 100, color=SERIES_COLOR, linewidth=2.5, zorder=3,
             label="Isotonic fit (non-increasing)")
@@ -229,6 +261,9 @@ def plot_isotonic_smoothing(r: np.ndarray, usage: np.ndarray, save_path: str, be
         oracle_usage_line = compute_oracle_usage_curve(benefit, r_line)
         ax.plot(r_line, oracle_usage_line * 100, color=INK_MUTED, linewidth=1.5, linestyle="--", zorder=4,
                 label="Oracle (exact Bayes-optimal)")
+
+    if anchors:
+        ax.set_xlim(display_min, display_max)
 
     ax.set_xlabel("c_h", color=INK_SECONDARY)
     ax.set_ylabel("Usage (%)", color=INK_PRIMARY)
@@ -242,6 +277,62 @@ def plot_isotonic_smoothing(r: np.ndarray, usage: np.ndarray, save_path: str, be
     fig.savefig(save_path, facecolor=fig.get_facecolor())
     plt.close(fig)
     logger.info(f"Saved isotonic smoothing plot to {save_path}")
+
+
+def plot_usage_vs_ch_std(search_diagnostics: list, save_path: str, dataset_label: str = "") -> None:
+    """Usage (%) vs c_h, averaged across reruns with a +/- std band - built
+    directly from search_diagnostics (one dict per (rerun, target_usage) pair,
+    with 'final_r' and 'final_test_usage' keys, as LogSeededGreedySearch.
+    run_reruns populates self.search_diagnostics), grouped by target_usage.
+    No sweep restructuring needed - this data already exists in memory right
+    after run_reruns returns.
+
+    Only meaningful when fe_training.reruns > 1 (a single rerun has zero std
+    by construction - still renders fine, just as a zero-width band, rather
+    than being skipped outright)."""
+    by_target = {}
+    for d in search_diagnostics:
+        by_target.setdefault(d["target_usage"], []).append(d)
+
+    r_mean, r_std, usage_mean, usage_std = [], [], [], []
+    for target in sorted(by_target):
+        rows = by_target[target]
+        rs = np.array([row["final_r"] for row in rows])
+        us = np.array([row["final_test_usage"] for row in rows])  # already 0-100 scale
+        r_mean.append(rs.mean())
+        r_std.append(rs.std())
+        usage_mean.append(us.mean())
+        usage_std.append(us.std())
+
+    r_mean = np.array(r_mean)
+    usage_mean = np.array(usage_mean)
+    usage_std = np.array(usage_std)
+
+    order = np.argsort(r_mean)
+    r_sorted = r_mean[order]
+    usage_sorted = usage_mean[order]
+    usage_std_sorted = usage_std[order]
+
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
+    fig.patch.set_facecolor("#fcfcfb")
+    ax.set_facecolor("#fcfcfb")
+    _style_axes(ax)
+
+    ax.fill_between(r_sorted, usage_sorted - usage_std_sorted, usage_sorted + usage_std_sorted,
+                     color=SERIES_COLOR, alpha=0.2, linewidth=0, zorder=2)
+    ax.plot(r_sorted, usage_sorted, color=SERIES_COLOR, linewidth=2, marker="o", markersize=6,
+            markerfacecolor=SERIES_COLOR, markeredgewidth=0, zorder=3)
+
+    ax.set_xlabel("c_h", color=INK_SECONDARY)
+    ax.set_ylabel("Usage (% routed to HF)", color=INK_PRIMARY)
+    title = "Usage vs c_h (mean ± std across reruns)"
+    ax.set_title(f"{dataset_label} - {title}" if dataset_label else title, color=INK_PRIMARY, fontweight="bold")
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    logger.info(f"Saved usage-vs-c_h std-band plot to {save_path}")
 
 
 def _style_axes(ax):

@@ -10,14 +10,16 @@ import logging
 import time
 import math
 import csv
-from torch.utils.data import DataLoader
+import shutil
+import glob
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from scipy.optimize import minimize
 
-from datasets import HypercubeDataset, IndependentHypercubeDataset, MNISTDataset, CropDataset, CUBDataset, LLVIPDataset, BigEarthNetDataset
+from datasets import HypercubeDataset, IndependentHypercubeDataset, MNISTDataset, CropDataset, CUBDataset, LLVIPDataset, BigEarthNetDataset, FE_Dataset, ADNIOOFDataset
 from custom_types import ConfigOptions, FEResult
 from models import CustomMLP, CustomResNet18, CustomViT, build_unet, LatentCNNHead, PooledGateMLP, build_yolov5, YOLOv5FidelityModel
 from losses import MetaLossFunction
@@ -418,6 +420,84 @@ def build_dataset(dataset_name: str, seed: int, folder="../data"):
                 split="val",
                 seed=seed,
             )
+
+        # dcf-adni (separate repo, ../dcf-adni) reused as LF/HF pairs: each
+        # "input" is a single pre-computed OOF probability score, not a raw
+        # feature vector - see ADNIOOFDataset's docstring for what that
+        # means for classifier training here. folder points at the
+        # dcf-adni results/mri_classification_<variant>/ directory holding
+        # that variant's oof_predictions.csv (one per labeling variant
+        # L1/L2/L3 - pass the matching folder per config, this case is the
+        # same regardless of variant).
+        # lf = MRF; hf = BMCA+MRI (rerun of the earlier MRF-vs-BMCA+MRI
+        # fidelity-gate pairing on this consolidated pipeline instead of the
+        # original standalone scratchpad harness)
+        case "adni_mrf_bmcamri":
+            csv_path = os.path.join(folder, "oof_predictions.csv")
+
+            train_ds = ADNIOOFDataset(csv_path, lf_col="oof_mrf", hf_col="oof_bmca_mri", split="train", seed=seed)
+            test_ds = ADNIOOFDataset(csv_path, lf_col="oof_mrf", hf_col="oof_bmca_mri", split="test", seed=seed)
+            val_ds = ADNIOOFDataset(csv_path, lf_col="oof_mrf", hf_col="oof_bmca_mri", split="val", seed=seed)
+
+        # lf = BMCA (biomarkers+cognition); hf = MRI only. Deliberately
+        # backwards per dcf-adni's own numbers (oof_mri AUC ~0.57-0.60 vs.
+        # oof_bmca AUC ~0.78-0.81 in every labeling variant - see
+        # ADNI_OVERVIEW.md) - kept in anyway because this was the original
+        # recommended pairing and the failure mode itself is of interest,
+        # not despite knowing HF is the weaker model here.
+        case "adni_bmca_mri":
+            csv_path = os.path.join(folder, "oof_predictions.csv")
+
+            train_ds = ADNIOOFDataset(csv_path, lf_col="oof_bmca", hf_col="oof_mri", split="train", seed=seed)
+            test_ds = ADNIOOFDataset(csv_path, lf_col="oof_bmca", hf_col="oof_mri", split="test", seed=seed)
+            val_ds = ADNIOOFDataset(csv_path, lf_col="oof_bmca", hf_col="oof_mri", split="val", seed=seed)
+
+        # lf = LIBRA (free composite risk score, no lab test or scan needed);
+        # hf = MRI only. Correctly-ordered pairing (LIBRA AUC ~0.52-0.54 <
+        # MRI AUC ~0.57-0.60 in every labeling variant - see ADNI_OVERVIEW.md)
+        # that keeps MRI in the HF/escalation role as originally recommended,
+        # by swapping out biomarkers (which beats MRI) for a weaker, genuinely
+        # free LF instead.
+        case "adni_libra_mri":
+            csv_path = os.path.join(folder, "oof_predictions.csv")
+
+            train_ds = ADNIOOFDataset(csv_path, lf_col="oof_libra", hf_col="oof_mri", split="train", seed=seed)
+            test_ds = ADNIOOFDataset(csv_path, lf_col="oof_libra", hf_col="oof_mri", split="test", seed=seed)
+            val_ds = ADNIOOFDataset(csv_path, lf_col="oof_libra", hf_col="oof_mri", split="val", seed=seed)
+
+        # lf = LIBRA; hf = BMCA (biomarkers+cognition). Correctly-ordered
+        # (LIBRA AUC ~0.52-0.54 << BMCA AUC ~0.78-0.81) and the largest clean
+        # margin of any pairing tried so far - LIBRA is a free score, BMCA is
+        # the strongest feature set in the whole dcf-adni project.
+        case "adni_libra_bmca":
+            csv_path = os.path.join(folder, "oof_predictions.csv")
+
+            train_ds = ADNIOOFDataset(csv_path, lf_col="oof_libra", hf_col="oof_bmca", split="train", seed=seed)
+            test_ds = ADNIOOFDataset(csv_path, lf_col="oof_libra", hf_col="oof_bmca", split="test", seed=seed)
+            val_ds = ADNIOOFDataset(csv_path, lf_col="oof_libra", hf_col="oof_bmca", split="val", seed=seed)
+
+        # lf = MRI; hf = BMCA (biomarkers+cognition). Correctly-ordered
+        # (MRI AUC ~0.57-0.60 < BMCA AUC ~0.78-0.81) - the "swap the roles"
+        # fix discussed for the backwards BMCA-as-LF/MRI-as-HF pairing above,
+        # distinct feature families (imaging vs. fluid+cognition) so it
+        # should avoid the same-family objective-mismatch failure mode seen
+        # in the earlier BMCA-vs-BMCA+MRI pairing.
+        case "adni_mri_bmca":
+            csv_path = os.path.join(folder, "oof_predictions.csv")
+
+            train_ds = ADNIOOFDataset(csv_path, lf_col="oof_mri", hf_col="oof_bmca", split="train", seed=seed)
+            test_ds = ADNIOOFDataset(csv_path, lf_col="oof_mri", hf_col="oof_bmca", split="test", seed=seed)
+            val_ds = ADNIOOFDataset(csv_path, lf_col="oof_mri", hf_col="oof_bmca", split="val", seed=seed)
+
+        # lf = MRF; hf = MRI only (new pairing - MRI alone as HF, not
+        # BMCA+MRI, so HF is a feature-disjoint set from LF rather than a
+        # superset that contains LF-adjacent information)
+        case "adni_mrf_mri":
+            csv_path = os.path.join(folder, "oof_predictions.csv")
+
+            train_ds = ADNIOOFDataset(csv_path, lf_col="oof_mrf", hf_col="oof_mri", split="train", seed=seed)
+            test_ds = ADNIOOFDataset(csv_path, lf_col="oof_mrf", hf_col="oof_mri", split="test", seed=seed)
+            val_ds = ADNIOOFDataset(csv_path, lf_col="oof_mrf", hf_col="oof_mri", split="val", seed=seed)
 
         case _:
             logger.error("Dataset Name is invalid")
@@ -2111,6 +2191,142 @@ class GaussianProcessSearch:
 #         weights = np.where(best_choices==1, hf_weight, 1)
 #         fe_model.fit(lf_embeddings, labels, sample_weights=weights)
 
+def build_gate_dataloaders_with_reweighting(train_ds, val_ds, test_ds, batch_size, workers=None, max_weight=None):
+    """Cached-FE-latent gate dataloaders plus the global (not per-batch)
+    disagreement reweighting via WeightedRandomSampler - the exact scheme
+    main.py and every per-dataset 5-rerun sweep script (crop/CUB/LLVIP) had
+    copy-pasted identically. Promoted here as the single shared
+    implementation during the LogSeededGreedySearch consolidation.
+
+    Measures hf_needed_rate/disagreement from one pass over train_ds (via a
+    plain, unsampled DataLoader) before building the real, sampler-weighted
+    train_dl - disagreement_flags is indexed by each sample's *dataset* idx
+    (what FE_Dataset returns), not iteration order, so it scatters correctly
+    regardless of shuffling.
+
+    workers defaults to 0 if train_ds fits in RAM (FE_Dataset._in_memory),
+    else 8 - parallelizing disk reads only when the split doesn't already
+    fit in memory (see FE_Dataset's docstring for why paying for worker
+    processes on an in-memory split is pure overhead instead of a speedup).
+
+    max_weight caps the disagreement-oversampling weight (normally
+    num_agree/num_disagree, uncapped - None preserves that old behavior).
+    A severely imbalanced split (e.g. bird_color's ~72x, from only 74
+    disagreeing train samples) oversamples those few samples so heavily the
+    gate can memorize them within a couple epochs and then overfits/degrades
+    for the rest of training - see tmp_experiments/gate_overfit_fix in a
+    past session for the diagnosis and tmp_experiments/epoch40_highlr_sweep
+    for the validated fix (cap=5.0 alongside a higher gate_lr, on CUB).
+
+    Returns (train_dl, val_dl, test_dl, hf_needed_rate).
+    """
+    if workers is None:
+        workers = 0 if train_ds._in_memory else 8
+
+    plain_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=workers)
+    disagreement_flags = torch.zeros(len(train_ds), dtype=torch.bool)
+    hf_needed_count, total = 0, 0
+    for _, _, _, lf_correct, hf_correct, idx in plain_dl:
+        hf_needed_count += (hf_correct & ~lf_correct).sum().item()
+        total += lf_correct.numel()
+        disagreement_flags[idx] = lf_correct ^ hf_correct
+    hf_needed_rate = hf_needed_count / total
+
+    num_disagree = disagreement_flags.sum().item()
+    num_agree = len(disagreement_flags) - num_disagree
+    weight = (num_agree / num_disagree) if num_disagree > 0 else 1.0
+    if max_weight is not None:
+        weight = min(weight, max_weight)
+    sample_weights = torch.where(
+        disagreement_flags,
+        torch.full_like(disagreement_flags, weight, dtype=torch.float),
+        torch.ones_like(disagreement_flags, dtype=torch.float),
+    )
+    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+    train_dl = DataLoader(
+        train_ds, batch_size=batch_size, sampler=sampler,
+        num_workers=workers, persistent_workers=workers > 0, pin_memory=True,
+    )
+    val_dl = DataLoader(
+        val_ds, batch_size=batch_size,
+        num_workers=workers, persistent_workers=workers > 0, pin_memory=True,
+    )
+    test_dl = DataLoader(
+        test_ds, batch_size=batch_size,
+        num_workers=workers, persistent_workers=workers > 0, pin_memory=True,
+    )
+    return train_dl, val_dl, test_dl, hf_needed_rate
+
+
+def build_gate_dataloaders(checkpoint_dir, batch_size=128):
+    """Thin wrapper over build_gate_dataloaders_with_reweighting for the
+    common case of reading an already-cached checkpoint's latent/{train,val,
+    test} off disk (the standalone 5-rerun sweep scripts' original call
+    shape) - constructs the three FE_Datasets, then delegates. Also returns
+    the per-sample latent dim (train_ds[0][0].shape[0]), needed by every
+    pooled-gate (crop/LLVIP) caller to size the gate model.
+
+    Returns (train_dl, val_dl, test_dl, hf_needed_rate, latent_dim).
+    """
+    latent_dir = os.path.join(checkpoint_dir, "latent")
+    train_ds = FE_Dataset(os.path.join(latent_dir, "train"))
+    val_ds = FE_Dataset(os.path.join(latent_dir, "val"))
+    test_ds = FE_Dataset(os.path.join(latent_dir, "test"))
+
+    train_dl, val_dl, test_dl, hf_needed_rate = build_gate_dataloaders_with_reweighting(
+        train_ds, val_ds, test_ds, batch_size
+    )
+    return train_dl, val_dl, test_dl, hf_needed_rate, train_ds[0][0].shape[0]
+
+
+def backup_old_results(checkpoint_dir, file_patterns=None, image_patterns=None):
+    """Moves (not deletes) any pre-existing result files matching the given
+    glob patterns into files/adaptivegridsearch_backup/ and
+    images/adaptivegridsearch_backup/ before a new search method overwrites
+    them in place - lets AdaptiveGridSearch-era results survive the switch
+    to LogSeededGreedySearch instead of being silently clobbered.
+
+    Only creates/reports a backup directory when something was actually
+    moved into it (fixes the earlier bug where both subfolders were created
+    and logged unconditionally, even against a brand-new checkpoint with
+    nothing to back up - see HANDOFF.md's inventory, flag 5).
+    """
+    if file_patterns is None:
+        file_patterns = [
+            "per_sample_routing_rerun*.csv", "gate_routing_snapshots*.npz",
+            "fe_results_5runs.npz", "fe_sr_results_5runs.npz",
+            "class_never_escalated_summary.csv",
+        ]
+    if image_patterns is None:
+        image_patterns = ["pareto_std.png", "usage_vs_ch_std.png", "entry_usage_vs_gain*.png",
+                           "never_escalated_gain_distribution.png"]
+
+    file_folder = os.path.join(checkpoint_dir, "files")
+    image_folder = os.path.join(checkpoint_dir, "images")
+    file_backup = os.path.join(file_folder, "adaptivegridsearch_backup")
+    image_backup = os.path.join(image_folder, "adaptivegridsearch_backup")
+
+    if os.path.isdir(file_backup) or os.path.isdir(image_backup):
+        logger.info(f"backup already exists for {checkpoint_dir}, skipping re-backup")
+        return
+
+    moved = []
+    for folder, backup_folder, patterns in [(file_folder, file_backup, file_patterns),
+                                             (image_folder, image_backup, image_patterns)]:
+        for pattern in patterns:
+            for src in glob.glob(os.path.join(folder, pattern)):
+                os.makedirs(backup_folder, exist_ok=True)
+                shutil.move(src, os.path.join(backup_folder, os.path.basename(src)))
+                moved.append(src)
+
+    if moved:
+        logger.info(f"backed up {len(moved)} old result file(s) for {checkpoint_dir} to "
+                    f"{file_backup} / {image_backup}")
+    else:
+        logger.info(f"no pre-existing results to back up for {checkpoint_dir}")
+
+
 class LogSeededGreedySearch:
     """Replaces AdaptiveGridSearch's per-target bisection with a single
     shared point-collection phase per rerun, then derives all 10 usage
@@ -2465,13 +2681,19 @@ class LogSeededGreedySearch:
             np.concatenate(idx_list, axis=0),
         )
 
-    def run_fe_sr_grid(self, usage_values, threshold_grid=None):
+    def run_fe_sr_grid(self, usage_values, threshold_grid=None, model_folder=None):
+        """model_folder, if given, overrides self.model_folder for locating
+        fe_model-{r}.pt checkpoints - lets a caller scope this to one rerun's
+        isolated subfolder (model_folder/rerun_{i}/, see run_reruns) to get
+        that rerun's own FE+SR curve, instead of pooling every rerun's
+        checkpoints into one shared (r, threshold) grid."""
         if threshold_grid is None:
             threshold_grid = np.linspace(0.0, 1.0, 21)
         threshold_grid = np.asarray(threshold_grid)
+        model_folder = model_folder or self.model_folder
 
         r_files = sorted(
-            f for f in os.listdir(self.model_folder)
+            f for f in os.listdir(model_folder)
             if f.startswith("fe_model-") and f.endswith(".pt")
         )
         r_values = [float(f[len("fe_model-"):-len(".pt")]) for f in r_files]
@@ -2484,7 +2706,7 @@ class LogSeededGreedySearch:
 
         for r_idx, fname in enumerate(r_files):
             self.fe_model.load_state_dict(
-                torch.load(os.path.join(self.model_folder, fname), weights_only=True)
+                torch.load(os.path.join(model_folder, fname), weights_only=True)
             )
             self.fe_model = self.fe_model.to(self.device)
 
@@ -2552,9 +2774,17 @@ class LogSeededGreedySearch:
     # --- new orchestration: point collection + gap-based refinement + interpolation ---
 
     def _cached_eval(self, points, r_val, tol=1e-9):
+        """Returns (matched_r, use, acc) for the first point within tol of
+        r_val, or None. Callers that go on to load a checkpoint file by r
+        (evaluate_fe_model) MUST use the returned matched_r, not their own
+        r_val - the checkpoint was saved under the matched point's exact
+        float, and a "within tolerance but not bit-identical" r_val (e.g. an
+        interpolated target landing within 1e-9 of an existing point without
+        being identical to it - observed in practice in a dense refinement
+        region) would otherwise build a filename nothing was ever saved to."""
         for r, use, acc in points:
             if abs(r - r_val) <= tol:
-                return use, acc
+                return r, use, acc
         return None
 
     def _collect_points(self):
@@ -2568,8 +2798,7 @@ class LogSeededGreedySearch:
 
         seeds = [0.0, 1.0] + list(self.log_seed_points)
         for r in seeds:
-            cached = self._cached_eval(points, r)
-            if cached is not None:
+            if self._cached_eval(points, r) is not None:
                 continue
             use, acc = self.train_fe_model(r)
             points.append((r, use, acc))
@@ -2658,6 +2887,12 @@ class LogSeededGreedySearch:
         cached = self._cached_eval(points, r_target)
         if cached is None:
             self.train_fe_model(r_target)
+        else:
+            # Use the exact r that was actually trained/saved to disk, not
+            # r_target itself - they can differ by up to _cached_eval's
+            # tolerance (interpolation landed close to, but not bit-identical
+            # with, an already-evaluated point) - see _cached_eval's docstring.
+            r_target = cached[0]
 
         test_acc, test_use, gate_details = self.evaluate_fe_model(r_target)
         test_acc *= 100
@@ -2687,13 +2922,36 @@ class LogSeededGreedySearch:
         acc_runs) each (n_reruns, len(usage_values)) on the 0-100 scale.
         Internally: one point-collection phase per rerun (shared across all
         usage_values, not repeated per target - the actual point of this
-        rewrite), then one interpolation + confirmatory training per target."""
+        rewrite), then one interpolation + confirmatory training per target.
+
+        When n_reruns > 1, each rerun's fe_model-{r}.pt checkpoints are
+        written to their own model_folder/rerun_{i}/ subfolder, not pooled
+        flat into model_folder - otherwise reruns can (and in practice do)
+        collide on checkpoint filenames at the shared seed points (c_h=0,
+        c_h=1, and the 5 log-spaced seeds are literally the same r values
+        every rerun), each later rerun silently overwriting an earlier
+        rerun's checkpoint at that r before run_fe_sr_grid ever gets to pool
+        them. Isolating by rerun also lets a caller get a per-rerun FE+SR
+        curve (its own std across reruns) by calling run_fe_sr_grid once per
+        rerun_{i} subfolder, instead of one pooled curve with no std - see
+        run_fe_sr_grid's model_folder param.
+
+        When n_reruns == 1 (the common case for callers that already isolate
+        their own model_folder per rerun externally - e.g. the standalone
+        5-rerun sweep scripts, which construct a fresh search instance per
+        rerun with its own model_folder), checkpoints stay flat in
+        model_folder exactly as before - no rerun_0/ nesting, since there's
+        only one rerun and nothing to collide with."""
         usage_runs = np.zeros((n_reruns, len(usage_values)))
         acc_runs = np.zeros((n_reruns, len(usage_values)))
+        base_model_folder = self.model_folder
 
         for rerun_idx in range(n_reruns):
             self.rerun_idx = rerun_idx
             self.rerun_seed = self.seed + rerun_idx
+            if n_reruns > 1:
+                self.model_folder = os.path.join(base_model_folder, f"rerun_{rerun_idx}")
+                os.makedirs(self.model_folder, exist_ok=True)
             set_all_seeds(self.rerun_seed)
             reset_all_weights(self.fe_model)
             self.fe_init_state = {k: v.clone() for k, v in self.fe_model.state_dict().items()}
@@ -2706,6 +2964,7 @@ class LogSeededGreedySearch:
                 usage_runs[rerun_idx, target_idx] = test_use
                 acc_runs[rerun_idx, target_idx] = test_acc
 
+        self.model_folder = base_model_folder
         return usage_runs, acc_runs
 
 

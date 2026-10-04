@@ -8,7 +8,7 @@ class SplitData(BaseModel):
     val: List[float]
 
 class DatasetSettings(BaseModel):
-    name: Literal["toy_2d", "toy_2d_high_ceiling", "toy_5d", "mnist_noise", "mnist_rotation", "bird_grayscale", "bird_color", "crop", "llvip", "bigearthnet"]
+    name: Literal["toy_2d", "toy_2d_high_ceiling", "toy_5d", "mnist_noise", "mnist_rotation", "bird_grayscale", "bird_color", "crop", "llvip", "bigearthnet", "adni_mrf_bmcamri", "adni_mrf_mri", "adni_bmca_mri", "adni_libra_mri", "adni_libra_bmca", "adni_mri_bmca"]
     folder: str
 
 class ClassifierSettings(BaseModel):
@@ -35,29 +35,59 @@ class ClassifierSettings(BaseModel):
             raise ValueError("trained_hf_model must be set when hf_model is 'yolo'")
         return self
 
-class ThresholdSettings(BaseModel):
-    start: float
-    stop: float
-    num_steps: int
-    scale: Literal["linear", "logarithmic"]
-    direction: Literal["normal", "reversed"]
-
 class FESettings(BaseModel):
     epochs: int
     batch_size: int
     reruns: int = 1
-    r_range: ThresholdSettings
-    # Passed straight to AdaptiveGridSearch.find_bracket. Was 0.05 (its own
-    # prior hardcoded value) until crop's usage(r) turned out to collapse
-    # within an r-window of ~0.001 - an order of magnitude narrower - which
-    # made every cached bracket look "too stale" and forced the full
-    # [0.001, 1] fallback range on every single search. 0.0005 fixes that
-    # (verified against crop's own bracket/usage data) and was confirmed to
-    # reproduce byte-identical usage/accuracy curves to 0.05 on toy_2d and
-    # LLVIP - including LLVIP, which is the dataset whose non-monotonic
-    # usage(r) swings motivated the width check in the first place - so this
-    # is adopted as the new default rather than a per-dataset override.
-    min_bracket_width: float = 0.0005
+    # LogSeededGreedySearch's search params (replaces AdaptiveGridSearch's
+    # min_bracket_width, which has no equivalent concept here - see
+    # helpers.LogSeededGreedySearch's docstring for the full algorithm).
+    # Defaults match the budget validated on CUB/LLVIP's 5-rerun sweeps
+    # (7 seed points + 23 refinement = 30 total, matching
+    # AdaptiveGridSearch's old fixed 30-model grid budget).
+    log_seed_points: List[float] = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+    refinement_budget: int = 23
+    gap_tolerance: float = 0.02
+    wide_bracket_ratio: float = 4.0
+    # Override for main.py's gate_lr (normally 5e-5 if imbalanced_gate else
+    # 3e-4). None = keep that old behavior - only set explicitly per-config
+    # once validated there (see config.yml/config_cub_resnet_vit_color_256.yml's
+    # comments): a tmp_experiments/epoch40_highlr_sweep grid search over both
+    # CUB experiments found gate_lr=5e-4 + disagreement_weight_cap=5.0 beat
+    # the old 5e-5/uncapped combo on best-achieved val_loss at a 40-epoch
+    # budget for both. Left as None (unvalidated) for every other dataset.
+    gate_lr: float | None = None
+    # Caps build_gate_dataloaders_with_reweighting's disagreement-oversampling
+    # weight (normally uncapped num_agree/num_disagree, which was ~72x for
+    # bird_color - a handful of disagreeing train samples oversampled that
+    # hard overfits/collapses the gate within a couple epochs; see
+    # tmp_experiments/gate_overfit_fix/experiment.py). None = old uncapped
+    # behavior.
+    disagreement_weight_cap: float | None = None
+    # Post-sweep step: per-rerun per-sample routing CSVs (filename/class,
+    # fe_0.1..fe_1.0) plus the three diagnostics.py analyses (entry-usage-vs-
+    # gain, never-escalated gain distribution, class/scene clustering).
+    # Default True - datasets without a registered sample_identity mapping
+    # (toy_2d and friends) are skipped gracefully with a warning rather than
+    # failing, so this default is safe for every dataset; set to False
+    # explicitly per-config to suppress the warning/skip entirely instead.
+    run_diagnostic_suite: bool = True
+
+class SelectiveNetTrainingSettings(BaseModel):
+    # SelectiveNet trains one model per c (= 1-usage target); this was
+    # hardcoded to 40 in main.py regardless of dataset/model - set this to
+    # override just for SelectiveNet. Falls back to that same 40 when unset,
+    # so every existing config keeps its current behavior unchanged.
+    epochs: int | None = None
+
+class SATSettings(BaseModel):
+    # SAT's training length defaults to classifier_training.epochs (set this
+    # to override just for SAT without changing LF/HF/SelectiveNet's shared
+    # epoch budget). With alpha=0.99 the EMA target's effective memory is
+    # ~100 epochs (1/(1-alpha)) - main.py logs a warning if the resolved
+    # epoch count is below that, since the abstain head may not have had
+    # enough updates to adapt.
+    epochs: int | None = None
 
 class ConfigOptions(BaseModel):
     dataset: DatasetSettings
@@ -67,6 +97,8 @@ class ConfigOptions(BaseModel):
     train_body: bool
     classifier_training: ClassifierSettings
     fe_training: FESettings
+    selectivenet_training: SelectiveNetTrainingSettings = SelectiveNetTrainingSettings()
+    sat_training: SATSettings = SATSettings()
 
     @model_validator(mode="after")
     def check_yolo_compatible_settings(self):

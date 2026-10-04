@@ -56,55 +56,85 @@ def compute_routing_counts(choice: np.ndarray, hf_needed: np.ndarray, lf_fine: n
     }
 
 
-def compute_oracle_curve(
-        lf_correct: np.ndarray, hf_correct: np.ndarray, usage_values,
-        lf_pixel_acc: np.ndarray | None = None, hf_pixel_acc: np.ndarray | None = None) -> np.ndarray:
-    """Best achievable accuracy (%) at each usage budget, escalating only samples
-    that actually need it (never wastes budget on samples HF wouldn't help), up
-    to how many "HF needed" samples that budget can cover. lf_correct/hf_correct
-    are the same regardless of which gate model produced a given snapshot — they
-    only depend on the LF/HF models' own predictions on the fixed test set.
+def compute_dense_oracle_curve(
+        lf_correct: np.ndarray, hf_correct: np.ndarray, grid_step_pct: float = 0.5,
+        lf_pixel_acc: np.ndarray | None = None, hf_pixel_acc: np.ndarray | None = None,
+        clip_negative_gain: bool = True):
+    """Best achievable accuracy (%) at every possible usage budget (not just a
+    sparse set of usage_values targets), escalating samples in order of gain -
+    the greedy, provably cost-optimal policy. Rank once by gain descending,
+    take one cumulative sum over that ranking, and read off the oracle
+    accuracy at prefix length k (usage=k/N) for every k=0..N in a single
+    O(N log N) pass - then subsample to an evenly-spaced grid for plotting.
+    Replaces the old per-usage-value loop (compute_oracle_curve), which only
+    ever produced ~10 points and so only spanned a narrow x-range instead of
+    the full 0-100% usage axis.
 
-    Candidates for escalation are every sample where hf_pixel_acc actually
-    exceeds lf_pixel_acc (a "gain > 0" test, not the boolean per-image-majority
-    lf_correct/hf_correct) - this is the strict generalization of "HF needed"
-    to continuous accuracy: with 0/1-valued lf_pixel_acc/hf_pixel_acc it
-    reduces to exactly hf_correct & ~lf_correct, but with real per-pixel
-    fractions it also (correctly) catches e.g. a sample where HF gets more
-    pixels right without crossing the same >50% majority threshold LF also
-    fell short of. Using the boolean partition here instead (as an earlier
-    version of this function did) can push the "oracle" *below* HF's own
+    Candidates for escalation are ranked by gain = hf_pixel_acc - lf_pixel_acc
+    (not the boolean per-image-majority lf_correct/hf_correct) - this is the
+    strict generalization of "HF needed" to continuous accuracy: with
+    0/1-valued lf_pixel_acc/hf_pixel_acc it reduces to exactly
+    hf_correct & ~lf_correct, but with real per-pixel fractions it also
+    (correctly) catches e.g. a sample where HF gets more pixels right without
+    crossing the same >50% majority threshold LF also fell short of. Using
+    the boolean partition instead can push the "oracle" *below* HF's own
     plain accuracy - not a valid ceiling - since it would never escalate a
     sample sitting in the boolean "LF fine" bucket even when HF's continuous
-    accuracy on it is higher. If a budget can't cover every gaining sample,
-    the ones with the largest gain (hf_pixel_acc - lf_pixel_acc) are
-    prioritized, since a limited budget should buy the most improvement it
-    can; samples with gain <= 0 are never escalated regardless of leftover
-    budget, matching the original behavior exactly.
+    accuracy on it is higher.
 
     Passing lf_pixel_acc=hf_pixel_acc=None (the default) reproduces the
-    original boolean-only formula exactly - this is a strict generalization,
-    not a behavior change, when the inputs happen to be 0/1-valued."""
-    n = len(lf_correct)
+    boolean-only formula exactly - this is a strict generalization, not a
+    behavior change, when the inputs happen to be 0/1-valued.
 
+    clip_negative_gain controls what happens once usage exceeds the fraction
+    of samples that actually benefit from HF:
+      - True (default): clip negative gain to 0, so a budget large enough to
+        reach harmful samples never pulls the curve down - "never voluntarily
+        escalate a sample that hurts," a monotonic, true budget-constrained
+        ceiling. Used for the main pareto.png.
+      - False: no clipping - once every helpful sample is covered, the curve
+        is forced to keep escalating (since usage is an exact fraction, not
+        an upper bound), including harmful ones, so it can decline after its
+        peak and is guaranteed to end exactly at HF-alone accuracy at
+        usage=100%. Matches the original dense-oracle script this was first
+        prototyped in (historical/cub_oracle_pareto_update.py) - used for the
+        scatter pareto plot (pareto_scatter.png), where the declining tail is
+        informative (it shows the literal cost of being forced to escalate
+        strictly by rank past the point where it stops helping).
+
+    Returns (usage_pct_grid, oracle_acc_pct_grid), both length
+    round(100/grid_step_pct)+1, evenly spaced over [0, 100]."""
     if lf_pixel_acc is None or hf_pixel_acc is None:
         lf_pixel_acc = lf_correct.astype(float)
         hf_pixel_acc = hf_correct.astype(float)
+    else:
+        lf_pixel_acc = lf_pixel_acc.astype(float)
+        hf_pixel_acc = hf_pixel_acc.astype(float)
+    n = len(lf_pixel_acc)
 
     gain = hf_pixel_acc - lf_pixel_acc
-    needed_idx = np.where(gain > 0)[0]
-    priority_order = needed_idx[np.argsort(-gain[needed_idx])]
+    order = np.argsort(-gain)  # descending: highest-gain samples escalated first
+    sorted_gain = gain[order]
+    if clip_negative_gain:
+        # Samples with gain <= 0 are never worth escalating - clip their
+        # contribution to 0 so a budget large enough to reach them doesn't pull
+        # the oracle curve down below its own peak (matching compute_oracle_curve's
+        # old "never escalate gain<=0 regardless of leftover budget" behavior).
+        sorted_gain = np.clip(sorted_gain, 0, None)
 
-    base_acc = lf_pixel_acc.copy()  # everyone starts on their own LF accuracy
+    lf_acc = lf_pixel_acc.mean()  # usage=0 (k=0): nobody escalated, exactly LF-alone accuracy
+    cum_gain_mean = np.cumsum(sorted_gain) / n  # mean gain contributed by the top-k samples, k=1..N
+    oracle_acc_per_k = lf_acc + cum_gain_mean  # (N,), index k-1 = usage (k/n)
 
-    oracle_acc = []
-    for usage in usage_values:
-        budget = int(round(usage * n))
-        escalate = priority_order[:budget]
-        acc = base_acc.copy()
-        acc[escalate] = hf_pixel_acc[escalate]
-        oracle_acc.append(100 * acc.mean())
-    return np.array(oracle_acc)
+    # Prepend k=0 (usage=0, exactly lf_acc) so the curve starts at the true origin.
+    oracle_acc_per_k = np.concatenate([[lf_acc], oracle_acc_per_k])  # (N+1,)
+
+    # Dense, evenly-spaced plotting grid - nearest available k for each target.
+    grid_usage_pct = np.arange(0, 100 + grid_step_pct, grid_step_pct)
+    grid_k = np.clip(np.round(grid_usage_pct / 100 * n).astype(int), 0, n)
+    grid_oracle_acc_pct = oracle_acc_per_k[grid_k] * 100
+
+    return grid_usage_pct, grid_oracle_acc_pct
 
 
 def _style_axes(ax):
